@@ -1,0 +1,268 @@
+"""Builders and scopes. Builders are module-level functions (a class cannot
+take a trailing block) that emit fragment records into the current runtime;
+scopes are the receivers of content blocks and carry only the modifiers that
+are legal inside that container (`weight` in a `Row:`/`Column:`, `align` in a
+`Box:`), exactly like Compose's `RowScope`."""
+
+from array import array
+
+from . import modifier as _modifier
+from . import runtime as _runtime
+from .geometry import Dp, Size, Constraints, Color, ONE_DP
+from .modifier import Modifier, ModOp, Alignment, Arrangement, TextStyle
+from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError
+
+# imports are lazy proxies; the values used on every builder call are bound
+# to the real objects once, here, so a record never carries a proxy
+let NONE = _modifier.NONE
+let DEFAULT_TEXT_STYLE = _modifier.DEFAULT_TEXT_STYLE
+let R_END = _runtime.R_END
+let R_COLUMN = _runtime.R_COLUMN
+let R_ROW = _runtime.R_ROW
+let R_BOX = _runtime.R_BOX
+let R_TEXT = _runtime.R_TEXT
+let R_BUTTON = _runtime.R_BUTTON
+let R_TEXTFIELD = _runtime.R_TEXTFIELD
+let R_CHECKBOX = _runtime.R_CHECKBOX
+let R_SPACER = _runtime.R_SPACER
+let R_CANVAS = _runtime.R_CANVAS
+let R_LAYOUT = _runtime.R_LAYOUT
+
+
+class ColumnScope:
+    def weight(self, value: float) -> Modifier:
+        return Modifier((ModOp.Weight(value),))
+
+    def align(self, alignment: Alignment) -> Modifier:
+        return Modifier((ModOp.Align(alignment),))
+
+
+class RowScope:
+    def weight(self, value: float) -> Modifier:
+        return Modifier((ModOp.Weight(value),))
+
+    def align(self, alignment: Alignment) -> Modifier:
+        return Modifier((ModOp.Align(alignment),))
+
+
+class BoxScope:
+    def align(self, alignment: Alignment) -> Modifier:
+        return Modifier((ModOp.Align(alignment),))
+
+
+let _COLUMN_SCOPE = ColumnScope()
+let _ROW_SCOPE = RowScope()
+let _BOX_SCOPE = BoxScope()
+
+
+class DrawScope:
+    """The receiver of a `Canvas:` block. Drawing commands are recorded and
+    handed to the native painter in one batch."""
+
+    init(self, let size: Size, let recorder: CanvasRecorder)
+
+    def rect(self, x: float, y: float, width: float, height: float, color: Color):
+        self.recorder.floats.extend((1.0, x, y, width, height, float(color.argb())))
+
+    def circle(self, cx: float, cy: float, radius: float, color: Color):
+        self.recorder.floats.extend((2.0, cx, cy, radius, float(color.argb())))
+
+    def line(self, x1: float, y1: float, x2: float, y2: float, color: Color, stroke: Dp = ONE_DP):
+        self.recorder.floats.extend((3.0, x1, y1, x2, y2, float(color.argb()), stroke.value))
+
+    def text(self, text: str, x: float, y: float, style: TextStyle = DEFAULT_TEXT_STYLE):
+        idx = len(self.recorder.strs)
+        self.recorder.strs.append(text)
+        self.recorder.floats.extend((4.0, x, y, float(idx), float(_style_id(self.recorder.runtime, style))))
+
+
+class MeasureScope:
+    """What a custom `Layout` measure function sees: its children, measured
+    on demand, and placed by index."""
+
+    init(self, let child_count: int, let core: NativeCore)
+
+    def measure(self, index: int, constraints: Constraints) -> Size:
+        width, height = self.core.measure_child(index, constraints.min_width, constraints.max_width, constraints.min_height, constraints.max_height)
+        return Size(width, height)
+
+    def place(self, index: int, x: float, y: float):
+        self.core.place_child(index, x, y)
+
+
+# ------------------------------------------------------------ encoding
+
+
+def _encode_modifier(modifier: object, rt: Runtime) -> list[float]:
+    ops: list[float] = []
+    for op in (modifier cast! Modifier).ops:
+        match op:
+            case ModOp.Padding(left, top, right, bottom):
+                ops.extend((1.0, left.value, top.value, right.value, bottom.value))
+            case ModOp.Width(value):
+                ops.extend((2.0, value.value))
+            case ModOp.Height(value):
+                ops.extend((3.0, value.value))
+            case ModOp.FillMaxWidth:
+                ops.append(4.0)
+            case ModOp.FillMaxHeight:
+                ops.append(5.0)
+            case ModOp.Background(color):
+                ops.extend((6.0, float(color.argb())))
+            case ModOp.Weight(value):
+                ops.extend((7.0, value))
+            case ModOp.Align(alignment):
+                ops.extend((8.0, float(_alignment_code(alignment))))
+            case ModOp.Clickable(on_click):
+                ops.extend((9.0, float(rt.handler(on_click))))
+    return ops
+
+
+def _encode_style(style: object) -> tuple[float, float, int]:
+    s = style cast! TextStyle
+    return (s.size.value, float(s.color.argb()), 1 if s.bold else 0)
+
+
+def _alignment_code(alignment: Alignment) -> int:
+    match alignment:
+        case Alignment.Start:
+            return 0
+        case Alignment.Center:
+            return 1
+        case Alignment.End:
+            return 2
+
+
+def _arrangement_code(arrangement: Arrangement) -> int:
+    match arrangement:
+        case Arrangement.Start:
+            return 0
+        case Arrangement.Center:
+            return 1
+        case Arrangement.End:
+            return 2
+        case Arrangement.SpaceBetween:
+            return 3
+        case Arrangement.SpaceEvenly:
+            return 4
+
+
+def _modifier_id(rt: Runtime, modifier: Modifier) -> int:
+    if modifier === NONE or not modifier.ops:
+        return 0
+    # a clickable carries a handler index that is scope-owned, so the chain is
+    # interned by its encoded ops rather than by the modifier value
+    for op in modifier.ops:
+        if op is ModOp.Clickable:
+            return rt.modifier_id_for_ops(_encode_modifier(modifier, rt))
+    return rt.modifier_id(modifier, _encode_modifier)
+
+
+def _style_id(rt: Runtime, style: TextStyle) -> int:
+    return rt.style_id(style, _encode_style)
+
+
+def _composing() -> Runtime raises CompositionError:
+    rt = _runtime._current
+    if rt is None:
+        raise CompositionError("builders only run inside a composable")
+    return rt
+
+
+def _key(rt: Runtime) -> tuple[int, int]:
+    return rt.current_key_flags() if rt.key_stack else (0, 0)
+
+
+def _text(rt: Runtime, text: str) -> int:
+    idx = rt.str_index.get(text)
+    return idx if idx is not None else rt.intern(text)
+
+
+def _mod(rt: Runtime, modifier: Modifier) -> int:
+    return 0 if modifier === NONE else _modifier_id(rt, modifier)
+
+
+# ------------------------------------------------------------ builders
+
+
+let _END_RECORD = (R_END, 0, -1, 0, -1, 0, 0, 0)
+
+
+def Text(text: str, modifier: Modifier = NONE, style: TextStyle = DEFAULT_TEXT_STYLE, color: Color? = None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    if color is not None:
+        style = TextStyle(style.size, color, style.bold)
+    rt.ints.extend((R_TEXT, flags, _text(rt, text), _mod(rt, modifier), -1, _style_id(rt, style), k, 0))
+
+
+def Button(label: str, modifier: Modifier = NONE, enabled: bool = True, on_click: () -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_BUTTON, flags, _text(rt, label), _mod(rt, modifier), rt.handler(on_click), 1 if enabled else 0, k, _style_id(rt, DEFAULT_TEXT_STYLE)))
+
+
+def TextField(value: str, modifier: Modifier = NONE, placeholder: str = "", on_change: (str) -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_TEXTFIELD, flags, _text(rt, value), _mod(rt, modifier), rt.handler(on_change), 0, _text(rt, placeholder) if placeholder else -1, k))
+
+
+def Checkbox(checked: bool, modifier: Modifier = NONE, on_change: (bool) -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    # the core reports a click; the toggle is decided here from the committed value
+    rt.ints.extend((R_CHECKBOX, flags, -1, _mod(rt, modifier), rt.handler(lambda: on_change(not checked)), 1 if checked else 0, k, 0))
+
+
+def Spacer(modifier: Modifier = NONE) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_SPACER, flags, -1, _mod(rt, modifier), -1, 0, k, 0))
+
+
+def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: ColumnScope.() -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_COLUMN, flags, -1, _mod(rt, modifier), -1, _arrangement_code(arrangement), k, 0))
+    content(_COLUMN_SCOPE)
+    rt.ints.extend(_END_RECORD)
+
+
+def Row(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: RowScope.() -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_ROW, flags, -1, _mod(rt, modifier), -1, _arrangement_code(arrangement), k, 0))
+    content(_ROW_SCOPE)
+    rt.ints.extend(_END_RECORD)
+
+
+def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once content: BoxScope.() -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+    rt.ints.extend((R_BOX, flags, -1, _mod(rt, modifier), -1, _alignment_code(alignment), k, 0))
+    content(_BOX_SCOPE)
+    rt.ints.extend(_END_RECORD)
+
+
+def Canvas(modifier: Modifier = NONE, on_draw: DrawScope.() -> None) raises ...:
+    rt = _composing()
+    flags, k = _key(rt)
+
+    def draw(recorder: CanvasRecorder):
+        on_draw(DrawScope(Size(recorder.width, recorder.height), recorder))
+
+    rt.emit(R_CANVAS, flags, -1, _modifier_id(rt, modifier), rt.handler(draw), 0, k, 0)
+
+
+def Layout(measure: (MeasureScope, Constraints) -> Size, modifier: Modifier = NONE, once content: () -> None) raises ...:
+    rt = _composing()
+    flags, k = rt.current_key_flags()
+
+    def measure_callback(core: NativeCore, child_count: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+        size = measure(MeasureScope(child_count, core), Constraints(min_w, max_w, min_h, max_h))
+        return (size.width, size.height)
+
+    rt.emit(R_LAYOUT, flags, -1, _modifier_id(rt, modifier), rt.handler(measure_callback), 0, k, 0)
+    content()
+    rt.end()

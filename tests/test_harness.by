@@ -1,0 +1,104 @@
+"""The headless harness against the real native core: composition, commit,
+layout, hit testing and text editing end to end."""
+
+from basedpython_ui import (
+    composable, state, state_list, derived, Column, Row, Text, Button, TextField, Checkbox, Modifier, Canvas, Layout,
+    MeasureScope, Constraints, Size, compose_test,
+)
+from basedpython_ui.geometry import Dp, Color
+
+
+@composable
+def Counter(step: int = 1):
+    let count = state(0)
+    Column(Modifier().padding(8)):
+        Text(f"count = {count.value}")
+        Row:
+            Button("+"):
+                count.value += step
+            Button("reset", enabled=count.value != 0):
+                count.value = 0
+
+
+def test_counter_end_to_end():
+    let t = compose_test:
+        Counter(step=2)
+    assert t.find_text("count = 0")
+    t.click("+")
+    t.advance()
+    assert t.find_text("count = 2"), t.dump()
+    t.click("+")
+    t.advance()
+    assert t.find_text("count = 4"), t.dump()
+    assert t.recompositions(Counter) == 3
+    t.click("reset")
+    t.advance()
+    assert t.find_text("count = 0"), t.dump()
+    t.dispose()
+
+
+frozen data class Todo:
+    id: int
+    title: str
+    done: bool = False
+
+
+@composable
+def Todos():
+    let todos = state_list([Todo(1, "alpha"), Todo(2, "beta")])
+    let draft = state("")
+    let remaining = derived(lambda: sum(1 for t in todos if not t.done))
+    Column:
+        Text(f"{remaining.value} left")
+        TextField(draft.value, placeholder="what needs doing?"):
+            draft.value = it
+        Button("add", enabled=draft.value != ""):
+            todos.append(Todo(len(todos) + 1, draft.value))
+            draft.value = ""
+        todos.each_indexed(key=lambda todo: todo.id):
+            let row = it
+            Row:
+                Checkbox(row.item.done):
+                    todos[row.index] = Todo(row.item.id, row.item.title, it)
+                Text(row.item.title)
+
+
+def test_text_input_checkbox_and_keyed_rows():
+    let t = compose_test:
+        Todos()
+    assert t.find_text("2 left") and t.find_text("alpha") and t.find_text("beta")
+    t.type_into("what needs doing?", "gamma")
+    t.advance()
+    t.click("add")
+    t.advance()
+    assert t.find_text("gamma"), t.dump()
+    assert t.find_text("3 left"), t.dump()
+    t.dispose()
+
+
+def flow(scope: MeasureScope, constraints: Constraints) -> Size:
+    var x = 0.0
+    var tallest = 0.0
+    for i in range(scope.child_count):
+        let size = scope.measure(i, constraints.loose())
+        scope.place(i, x, 0.0)
+        x += size.width
+        tallest = max(tallest, size.height)
+    return Size(x, tallest)
+
+
+@composable
+def Custom():
+    Layout(flow):
+        Text("one")
+        Text("two")
+    Canvas(Modifier().size(50, 20)):
+        rect(0.0, 0.0, size.width, size.height, "#ff0000")
+
+
+def test_custom_layout_and_canvas_run_through_the_core():
+    let t = compose_test:
+        Custom()
+    assert t.find_text("one") and t.find_text("two"), t.dump()
+    assert "canvas" in t.dump().lower(), t.dump()
+    t.dispose()

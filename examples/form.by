@@ -1,0 +1,59 @@
+from basedpython_ui import composable, state, derived, Column, Row, Text, Button, TextField, Modifier, TextStyle, run_app
+
+
+let ERROR_STYLE = TextStyle(color="#b00020")
+
+
+frozen data class Signup:
+    name: str
+    email: str
+
+
+def validate_name(value: str) -> str?:
+    return "name is required" if value.strip() == "" else None
+
+
+def validate_email(value: str) -> str?:
+    if "@" not in value or value.startswith("@"):
+        return "enter a valid e-mail address"
+    return None
+
+
+@composable
+def Field(label: str, value: str, error: str?, on_change: (str) -> None):
+    Column(Modifier().padding(4)):
+        Text(label)
+        TextField(value, on_change=on_change)
+        if error is not None:
+            Text(error, style=ERROR_STYLE)
+
+
+@composable
+def SignupForm(on_submit: (Signup) -> None):
+    let name = state("")
+    let email = state("")
+    let submitted = state(False)
+    # derived values are recomputed only when a dependency changes, and never observed half-updated
+    let name_error = derived(lambda: validate_name(name.value))
+    let email_error = derived(lambda: validate_email(email.value))
+    let can_submit = derived(lambda: name_error.value is None and email_error.value is None)
+
+    Column(Modifier().padding(16)):
+        Field("name", name.value, name_error.value if submitted.value else None):
+            name.value = it
+        Field("e-mail", email.value, email_error.value if submitted.value else None):
+            email.value = it
+        Row:
+            Button("sign up", enabled=can_submit.value or not submitted.value):
+                submitted.value = True
+                if can_submit.value:
+                    on_submit(Signup(name.value, email.value))
+            Button("clear"):
+                name.value = ""
+                email.value = ""
+                submitted.value = False
+
+
+def main():
+    run_app("sign up"):
+        SignupForm(on_submit=lambda s: print("welcome", s.name, s.email))

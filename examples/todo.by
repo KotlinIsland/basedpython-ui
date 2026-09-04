@@ -1,0 +1,47 @@
+from basedpython_ui.app import f
+from basedpython_ui import (
+    composable, state, state_list, derived, Column, Row, Text, Button, Checkbox, TextField, Modifier, run_app,
+)
+
+
+frozen data class Todo:            # immutable: the only way to change a todo is to replace it in the list
+    id: int
+    title: str
+    done: bool = False
+
+
+@composable
+def TodoRow(todo: Todo, on_delete: () -> None, on_toggle: (bool) -> None):
+    Row(Modifier().padding(4)):
+        Checkbox(todo.done, on_change=on_toggle)
+        Text(todo.title, modifier=weight(1.0))
+        Button("x", on_click=on_delete)
+
+
+@composable
+def TodoApp():
+    let todos = state_list([Todo(1, "write the runtime"), Todo(2, "ship it")])   # StateList[Todo]: observable
+    let draft = state("")
+    let next_id = state(3)
+    let remaining = derived(lambda: sum(1 for t in todos if not t.done))        # ⟨depends on todos⟩
+
+    Column(Modifier().padding(12)):
+        Text(f"{remaining.value} of {len(todos)} remaining")
+        Row:
+            TextField(draft.value, placeholder="what needs doing?", modifier=weight(1.0)):
+                draft.value = it                                                # `it: str`, the new text
+            Button("add", enabled=draft.value != ""):
+                todos.append(Todo(next_id.value, draft.value))
+                next_id.value += 1
+                draft.value = ""
+        todos.each_indexed(key=lambda todo: todo.id):                          # keyed children; `it` is this row
+            let row = it                                                        # the inner block below has its own `it`
+            TodoRow(row.item, on_delete=lambda: todos.remove_at(row.index)):
+                todos[row.index] = Todo(row.item.id, row.item.title, it)        # `it: bool` from `on_toggle`
+        if len(todos) == 0:
+            Text("nothing to do")
+
+
+def main():
+    run_app("todos"):
+        TodoApp()

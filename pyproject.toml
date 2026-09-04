@@ -1,0 +1,20 @@
+[project]
+name = "basedpython-ui"
+version = "0.1.0"
+description = "a compose / swiftui / flutter inspired ui framework for basedpython"
+readme = "README.md"
+authors = [
+    { name = "Morgan Bartholomew", email = "morgan.bartholomew@jetbrains.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.15,<2"]
+
+[tool.basedpython.run]
+main = "examples.counter"
+
+[tool.basedpython.src]
+# `out/` is what `by build` writes; `native/` is the rust crate
+exclude = ["out", "native", "target"]

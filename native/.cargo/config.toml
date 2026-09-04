@@ -1,0 +1,7 @@
+# a pyo3 cdylib on macOS needs the python symbols resolved at load time by the interpreter
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[env]
+# the ambient `python3` on this machine is 3.9; the module is built for 3.14
+PYO3_PYTHON = "python3.14"

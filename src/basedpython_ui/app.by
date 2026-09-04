@@ -1,0 +1,179 @@
+"""Application entry points and the headless test harness."""
+
+import asyncio
+import threading
+from array import array
+from collections.abc import Coroutine
+
+from .runtime import Runtime, NativeCore, Task
+
+
+def _load_native() -> dynamic raises ImportError:
+    from . import _native   # the rust core; a typed stub sits beside it
+
+    return _native
+
+
+class _TaskThread:
+    """One asyncio loop on a background thread for `launched_effect` bodies.
+    Every state write made from a task is posted back to the ui thread."""
+
+    init(self):
+        self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self.thread: threading.Thread = threading.Thread(target=self.loop.run_forever, name="basedpython-ui tasks", daemon=True)
+        self.thread.start()
+
+    def run(self, coroutine: Task) -> object:
+        return asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+def _measure_dispatcher(rt: Runtime, core: NativeCore) -> object:
+    def measure(handler_idx: int, child_count: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+        callback = rt.handlers[handler_idx]
+        if callback is None:
+            return (0.0, 0.0)
+        size: dynamic = callback(core, child_count, min_w, max_w, min_h, max_h)
+        return size
+
+    return measure
+
+def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, root: () -> None) raises ...:
+    """Open a window, compose `root` into it and drive frames until the
+    window closes. Owns the main thread (the window system requires it)."""
+    native = _load_native()
+    window = native.Window(title, float(width), float(height))
+    tasks = _TaskThread()
+    rt: Runtime | None = None
+    measure: object = None
+    pressed: list[int] = [-1]
+
+    def on_events(events: list[tuple[int, float, float, int, str]]):
+        runtime = rt
+        if runtime is None:
+            return
+        for kind, x, y, handler_idx, text in events:
+            match kind:
+                case 1:
+                    pressed[0] = handler_idx
+                case 2:
+                    if handler_idx >= 0 and handler_idx == pressed[0]:
+                        _dispatch(runtime, handler_idx, None)
+                    pressed[0] = -1
+                case 4:
+                    if handler_idx >= 0:
+                        _dispatch(runtime, handler_idx, text)
+                case _:
+                    pass
+
+    def on_frame(core: NativeCore) -> bool:
+        nonlocal rt, measure
+        if rt is None:
+            rt = Runtime(core)
+            rt.task_runner = tasks.run
+            rt.wake = window.request_frame
+            measure = _measure_dispatcher(rt, core)
+            rt.set_root(root)
+        rt.frame(measure)
+        core.paint()
+        return not rt.is_idle()
+
+    try:
+        window.run(on_frame, on_events)
+    finally:
+        tasks.stop()
+
+
+def _dispatch(rt: Runtime, handler_idx: int, payload: object):
+    handler = rt.handlers[handler_idx]
+    if handler is None:
+        return
+    try:
+        if payload is None:
+            handler()
+        else:
+            handler(payload)
+    except BaseException as error:
+        rt.on_error(error, "handler")
+
+
+class TestComposition:
+    """A composition driven headlessly: the same runtime and the same native
+    layout, no window, deterministic frames."""
+
+    init(self, let runtime: Runtime, let core: NativeCore):
+        self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self.measure: object = _measure_dispatcher(runtime, core)
+        runtime.task_runner = self._run_task
+
+    def _run_task(self, coroutine: Task) -> object:
+        return self.loop.create_task(coroutine)
+
+    def advance(self, steps: int = 8):
+        """Run pending recompositions, commit, layout and effects until idle
+        (or `steps` frames), letting queued tasks make progress in between."""
+        for _ in range(steps):
+            self.runtime.frame(self.measure)
+            self.loop.run_until_complete(asyncio.sleep(0))
+            if self.runtime.is_idle():
+                return
+
+    def find_text(self, text: str) -> bool:
+        return self.core.find_text(text) is not None
+
+    def all_text(self) -> tuple[str, ...]:
+        return tuple(self.core.all_text())
+
+    def click(self, label: str):
+        """Press and release the pointer over the node showing `label`, through
+        the same hit test and event path a window uses."""
+        found = self.core.find_text(label)
+        if found is None:
+            raise AssertionError(f"no node showing {label!r}; tree:\n{self.dump()}")
+        _, x, y, w, h = found
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        down = self.core.pointer(1, cx, cy)
+        up = self.core.pointer(2, cx, cy)
+        handler_idx = up[3]
+        if handler_idx < 0 or handler_idx != down[3]:
+            raise AssertionError(f"{label!r} is not clickable; tree:\n{self.dump()}")
+        _dispatch(self.runtime, handler_idx, None)
+
+    def type_into(self, placeholder: str, text: str):
+        """Focus the field showing `placeholder` (or its current value) and type `text`."""
+        found = self.core.find_text(placeholder)
+        if found is None:
+            raise AssertionError(f"no text field showing {placeholder!r}; tree:\n{self.dump()}")
+        _, x, y, w, h = found
+        self.core.pointer(1, x + w / 2.0, y + h / 2.0)
+        self.core.pointer(2, x + w / 2.0, y + h / 2.0)
+        event = self.core.key_text(text)
+        if event is None or event[3] < 0:
+            raise AssertionError(f"{placeholder!r} did not take focus; tree:\n{self.dump()}")
+        _dispatch(self.runtime, event[3], event[4])
+
+    def recompositions(self, fn: object) -> int:
+        name = getattr(fn, "__name__", str(fn))
+        return self.runtime.recompositions.get(name, 0)
+
+    def dump(self) -> str:
+        return self.core.dump()
+
+    def dispose(self):
+        root = self.runtime.root
+        if root is not None:
+            self.runtime.dispose_scope(root)
+        self.loop.close()
+
+
+def compose_test(width: int = 400, height: int = 300, root: () -> None) -> TestComposition raises ...:
+    native = _load_native()
+    core: NativeCore = native.Core(float(width), float(height), 1.0)
+    rt = Runtime(core)
+    t = TestComposition(rt, core)
+    rt.set_root(root)
+    t.advance()
+    return t

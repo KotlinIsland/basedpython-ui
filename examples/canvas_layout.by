@@ -1,0 +1,56 @@
+import math
+from basedpython_ui import (
+    composable, state, keyed, Column, Text, Button, Canvas, Layout, MeasureScope, Constraints, Size, Modifier, run_app,
+)
+
+
+def flow_measure(scope: MeasureScope, constraints: Constraints) -> Size:
+    """A custom layout policy: lay children out left to right, wrapping at the max width.
+    Runs in the layout pass; constraints go down, sizes come back up."""
+    let child = constraints.loose()
+    var x = 0.0
+    var y = 0.0
+    var row_height = 0.0
+    for i in range(scope.child_count):
+        let size = scope.measure(i, child)
+        if x > 0.0 and x + size.width > constraints.max_width:
+            x = 0.0
+            y += row_height
+            row_height = 0.0
+        scope.place(i, x, y)
+        x += size.width
+        row_height = max(row_height, size.height)
+    return Size(constraints.max_width, y + row_height)
+
+
+@composable
+def FlowRow(labels: tuple[str, ...]):
+    Layout(flow_measure, Modifier().fill_max_width()):
+        keyed(labels).each(key=lambda s: s):
+            Text(it, Modifier().padding(4))
+
+
+@composable
+def Clock(seconds: int):
+    let angle = math.tau * (seconds % 60) / 60.0
+    # the draw block runs at paint time against a DrawScope: `size` and the primitives resolve unqualified
+    Canvas(Modifier().size(200, 200)):
+        let cx = size.width / 2.0
+        let cy = size.height / 2.0
+        circle(cx, cy, 90.0, "#222222")
+        line(cx, cy, cx + 80.0 * math.sin(angle), cy - 80.0 * math.cos(angle), "#ffffff", stroke=3)
+
+
+@composable
+def App():
+    let seconds = state(0)
+    Column(Modifier().padding(12)):
+        Clock(seconds.value)
+        Button("tick"):
+            seconds.value += 1
+        FlowRow(("alpha", "beta", "gamma", "delta", "epsilon"))
+
+
+def main():
+    run_app("canvas + custom layout"):
+        App()

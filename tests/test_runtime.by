@@ -1,0 +1,522 @@
+"""The composition runtime against a fake native core: no rust, no window.
+
+Run with `by build --soundness none` then `python3.14 -m pytest out/tests -q`."""
+
+import asyncio
+from array import array
+
+from basedpython_ui import (
+    composable, state, state_list, derived, key, launched_effect, disposable_effect, ambient, provide,
+    Column, Row, Text, Button, Modifier, StateList, State,
+)
+from basedpython_ui.geometry import Dp   # literal conversions need the declaring module
+from basedpython_ui.runtime import (
+    Runtime, CompositionError, Handler, R_END, R_SCOPE, R_SCOPE_REF, R_TEXT, R_BUTTON, R_TEXTFIELD, R_COLUMN, R_ROW, R_BOX, R_LAYOUT,
+)
+
+
+frozen data class Rec:
+    kind: int
+    text: str
+    handler: int
+    a: int
+
+
+class FakeCore:
+    """Keeps the retained tree as one record list per scope group, exactly as
+    the protocol describes; enough to answer `find_text` and to count what
+    each commit carried."""
+
+    init(self):
+        self.groups: dict[int, list[Rec]] = {}
+        self.commits: int = 0
+        self.last_ranges: list[tuple[int, int, int]] = []
+        self.last_refs: int = 0
+        self.disposed: list[int] = []
+
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]:
+        self.commits += 1
+        self.last_ranges = list(ranges)
+        self.last_refs = 0
+        seen: set[int] = set()
+        for scope_id, first, end in ranges:
+            self.groups[scope_id] = self._parse(ints, strs, first, end, seen)
+        # a group that no range mentions and that nothing references any more is gone
+        reachable: set[int] = set()
+        self._reach(0, reachable)
+        gone = [sid for sid in self.groups if sid not in reachable]
+        for sid in gone:
+            del self.groups[sid]
+        return gone
+
+    def _parse(self, ints: array[int], strs: list[str], first: int, end: int, seen: set[int]) -> list[Rec]:
+        stack: list[tuple[int, list[Rec]]] = [(-1, [])]
+        i = first * 8            # ranges are record indices; records are 8 ints wide
+        end_offset = end * 8
+        while i < end_offset:
+            kind = ints[i]
+            text_idx = ints[i + 2]
+            handler_idx = ints[i + 4]
+            a = ints[i + 5]
+            i += 8
+            text = strs[text_idx] if text_idx >= 0 else ""
+            match kind:
+                case 1:
+                    stack.append((a, []))
+                case 0:
+                    scope_id, records = stack.pop()
+                    if scope_id >= 0:
+                        self.groups[scope_id] = records
+                        seen.add(scope_id)
+                        stack[-1][1].append(Rec(R_SCOPE_REF, "", -1, scope_id))
+                    else:
+                        stack[-1][1].extend(records)
+                        stack[-1][1].append(Rec(R_END, "", -1, 0))
+                case 2:
+                    self.last_refs += 1
+                    stack[-1][1].append(Rec(R_SCOPE_REF, "", -1, a))
+                case _:
+                    if kind in (R_COLUMN, R_ROW, R_BOX, R_LAYOUT):
+                        stack.append((-1, [Rec(kind, "", handler_idx, a)]))
+                    else:
+                        stack[-1][1].append(Rec(kind, text, handler_idx, a))
+        while len(stack) > 1:
+            scope_id, records = stack.pop()
+            stack[-1][1].extend(records)
+        return stack[0][1]
+
+    def _reach(self, scope_id: int, out: set[int]):
+        if scope_id in out:
+            return
+        out.add(scope_id)
+        for rec in self.groups.get(scope_id, []):
+            if rec.kind == R_SCOPE_REF:
+                self._reach(rec.a, out)
+
+    def records(self) -> list[Rec]:
+        flat: list[Rec] = []
+        self._flatten(0, flat)
+        return flat
+
+    def _flatten(self, scope_id: int, out: list[Rec]):
+        for rec in self.groups.get(scope_id, []):
+            if rec.kind == R_SCOPE_REF:
+                self._flatten(rec.a, out)
+            else:
+                out.append(rec)
+
+    def layout(self, measure: object): ...
+    def paint(self): ...
+    def canvas_requests(self) -> list[tuple[int, int, float, float]]:
+        return []
+    def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+        return (0.0, 0.0)
+    def place_child(self, index: int, x: float, y: float): ...
+    def hit_test(self, x: float, y: float) -> int:
+        return -1
+    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]:
+        return (kind, x, y, -1, "")
+    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None:
+        return None
+    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None:
+        for rec in self.records():
+            if rec.text == text:
+                return (0, 0.0, 0.0, 0.0, 0.0)
+        return None
+    def all_text(self) -> list[str]:
+        return [rec.text for rec in self.records() if rec.text]
+    def field_handler(self, placeholder: str) -> int:
+        return -1
+    def dump(self) -> str:
+        return "\n".join(f"{rec.kind} {rec.text!r} h={rec.handler} a={rec.a}" for rec in self.records())
+    def node_count(self) -> int:
+        return len(self.records())
+
+    def handler_of(self, label: str) -> int:
+        for rec in self.records():
+            if rec.kind == R_BUTTON and rec.text == label:
+                return rec.handler
+        raise AssertionError(f"no button {label!r} in\n{self.dump()}")
+
+
+def click(rt: Runtime, core: FakeCore, label: str):
+    handler = rt.handlers[core.handler_of(label)]
+    assert handler is not None
+    handler()
+
+
+def compose(root: () -> None) -> tuple[Runtime, FakeCore]:
+    core = FakeCore()
+    errors: list[str] = []
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error!r}"))
+    rt.set_root(root)
+    rt.frame()
+    assert errors == [], errors
+    return (rt, core)
+
+
+# ------------------------------------------------------------------- tests
+
+
+@composable
+def Counter(step: int = 1):
+    let count = state(0)
+    Column(Modifier().padding(8)):
+        Text(f"count = {count.value}")
+        Row:
+            Button("+"):
+                count.value += step
+            Button("reset", enabled=count.value != 0):
+                count.value = 0
+
+
+def test_counter_composes_recomposes_and_skips_the_untouched():
+    rt, core = compose(lambda: Counter(2))  # ty: ignore[composable-outside-composition] -- the helper forwards the lambda to set_root
+    assert core.all_text() == ["count = 0", "+", "reset"]
+    assert rt.recompositions["Counter"] == 1
+    click(rt, core, "+")
+    assert not rt.is_idle()
+    rt.frame()
+    assert core.all_text() == ["count = 2", "+", "reset"]
+    assert rt.recompositions["Counter"] == 2
+    # only the counter's scope was re-emitted, and it is the only range
+    assert len(core.last_ranges) == 1 and core.last_ranges[0][0] != 0
+    rt.frame()
+    assert core.commits == 2, "an idle frame commits nothing"
+
+
+@composable
+def Leaf(label: str):
+    Text(label)
+
+
+@composable
+def Parent():
+    let n = state(0)
+    Column:
+        Text(f"n = {n.value}")
+        Leaf("a")
+        Leaf("b")
+        Button("bump"):
+            n.value += 1
+
+
+def test_stable_children_are_skipped():
+    rt, core = compose(Parent)
+    assert rt.recompositions["Leaf"] == 2
+    click(rt, core, "bump")
+    rt.frame()
+    assert rt.recompositions["Parent"] == 2
+    assert rt.recompositions["Leaf"] == 2, "equal, stable arguments: the leaves were skipped"
+    assert core.last_refs == 2, "the skipped leaves were emitted as SCOPE_REF"
+    assert core.all_text() == ["n = 1", "a", "b", "bump"]
+
+
+@composable
+def Cell(name: str):
+    let hits = state(0)
+    Text(f"{name}:{hits.value}")
+    Button(f"hit {name}"):
+        hits.value += 1
+
+
+@composable
+def Conditional():
+    let show = state(True)
+    Column:
+        if show.value:
+            Cell("first")
+        Cell("second")
+        Button("toggle"):
+            show.value = not show.value
+
+
+def test_conditional_sibling_keeps_its_own_state():
+    rt, core = compose(Conditional)
+    click(rt, core, "hit second")
+    rt.frame()
+    assert "second:1" in core.all_text()
+    click(rt, core, "toggle")
+    rt.frame()
+    assert core.all_text() == ["second:1", "hit second", "toggle"], "the surviving cell kept its state"
+    click(rt, core, "toggle")
+    rt.frame()
+    assert core.all_text() == ["first:0", "hit first", "second:1", "hit second", "toggle"], "the re-added cell starts fresh"
+
+
+frozen data class Item:
+    id: int
+    title: str
+
+
+@composable
+def ItemRow(item: Item):
+    let clicks = state(0)
+    Text(f"{item.title}#{clicks.value}")
+    Button(f"click {item.title}"):
+        clicks.value += 1
+
+
+@composable
+def Keyed():
+    let items = state_list([Item(1, "one"), Item(2, "two"), Item(3, "three")])
+    Column:
+        items.each(key=lambda item: item.id):
+            ItemRow(it)
+        Button("drop first"):
+            items.remove_at(0)
+
+
+def test_keyed_children_survive_removal_of_a_sibling():
+    rt, core = compose(Keyed)
+    click(rt, core, "click two")
+    rt.frame()
+    assert "two#1" in core.all_text()
+    click(rt, core, "drop first")
+    rt.frame()
+    assert core.all_text() == ["two#1", "click two", "three#0", "click three", "drop first"]
+    assert rt.recompositions["ItemRow"] == 4, "3 initial runs + the clicked row; the survivors were matched by key, not re-created"
+
+
+def test_derived_recomputes_once_per_change_and_only_notifies_on_change():
+    evaluations: list[int] = [0]
+    seen: list[str] = []
+
+    @composable
+    def Form():
+        let name = state("")
+        let email = state("")
+
+        def check() -> str:
+            evaluations[0] += 1  # ty: ignore[silent-mutation] -- deliberate in this test
+            n = name.value
+            e = email.value
+            return "ok" if "@" in e and n else "incomplete"
+
+        let status = derived(check)
+        seen.append(status.value)  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(status.value)
+        Button("name"):
+            name.value = "ada"
+        Button("email"):
+            email.value = "ada@x"
+        Button("email again"):
+            email.value = "ada@y"
+
+    rt, core = compose(Form)
+    assert evaluations[0] == 1
+    click(rt, core, "name")
+    rt.frame()
+    assert evaluations[0] == 2
+    assert rt.recompositions["Form"] == 1, "the status did not change, so the scope was not recomposed"
+    click(rt, core, "email")
+    rt.frame()
+    assert seen[-1] == "ok" and rt.recompositions["Form"] == 2
+    click(rt, core, "email again")
+    rt.frame()
+    assert evaluations[0] == 4 and rt.recompositions["Form"] == 2
+
+
+def test_a_write_during_composition_is_refused_and_the_tree_kept():
+    errors: list[str] = []
+
+    @composable
+    def Bad():
+        let n = state(0)
+        Text(f"n = {n.value}")
+        if n.value == 0:
+            Button("go"):
+                n.value = 1
+        else:
+            n.value = 2  # ty: ignore[state-write-in-composition] -- deliberate in this test
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(type(error).__name__))
+    rt.set_root(Bad)
+    rt.frame()
+    click(rt, core, "go")
+    rt.frame()
+    assert errors == ["CompositionError"]
+    assert core.all_text() == ["n = 0", "go"], "the previous subtree stays on screen"
+
+
+def test_state_refuses_a_mutable_value():
+    try:
+        State([1, 2])  # ty: ignore[mutable-state-value] -- the runtime half of the rule is under test
+    except TypeError as error:
+        assert "cannot be held in state" in str(error)
+    else:
+        raise AssertionError("a list must not be accepted")
+
+
+let theme = ambient("light")
+
+
+@composable
+def Themed(label: str):
+    Text(f"{label}:{theme.current}")
+
+
+@composable
+def Ambients():
+    let dark = state(False)
+    Column:
+        Themed("outer")
+        provide(theme, "dark" if dark.value else "light"):
+            Themed("inner")
+        Button("toggle"):
+            dark.value = not dark.value
+
+
+def test_ambient_readers_below_a_provider_recompose():
+    rt, core = compose(Ambients)
+    assert core.all_text() == ["outer:light", "inner:light", "toggle"]
+    click(rt, core, "toggle")
+    rt.frame()
+    assert core.all_text() == ["outer:dark" if False else "outer:light", "inner:dark", "toggle"]
+
+
+def test_effects_restart_on_key_change_and_dispose_with_the_scope():
+    log: list[str] = []
+    tasks: list[object] = []
+
+    @composable
+    def Loader(uid: int):
+        launched_effect(uid):
+            log.append(f"start {uid}")  # ty: ignore[silent-mutation] -- deliberate in this test
+            await asyncio.sleep(0)
+            if it.is_active:
+                log.append(f"done {uid}")  # ty: ignore[silent-mutation] -- deliberate in this test
+        disposable_effect(uid):
+            log.append(f"attach {uid}")  # ty: ignore[silent-mutation] -- deliberate in this test
+            it.on_dispose(lambda: log.append(f"detach {uid}"))  # ty: ignore[silent-mutation] -- deliberate in this test
+        Text(f"user {uid}")
+
+    @composable
+    def App():
+        let uid = state(1)
+        let shown = state(True)
+        Column:
+            if shown.value:
+                Loader(uid.value)
+            Button("next"):
+                uid.value += 1
+            Button("hide"):
+                shown.value = False
+
+    loop = asyncio.new_event_loop()
+    core = FakeCore()
+    rt = Runtime(core)
+    rt.task_runner = lambda coroutine: loop.create_task(coroutine)
+    rt.set_root(App)
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert log == ["attach 1", "start 1", "done 1"], "the task starts when the loop runs, after the synchronous effect"
+    click(rt, core, "next")
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert log[3:] == ["detach 1", "attach 2", "start 2", "done 2"]
+    click(rt, core, "hide")
+    rt.frame()
+    assert log[7:] == ["detach 2"]
+    assert "user 2" not in core.all_text()
+    loop.close()
+
+
+def test_a_write_from_another_thread_is_posted_to_the_ui_thread():
+    import threading
+
+    woken: list[int] = [0]
+    cells: dict[str, State[int]] = {}
+
+    @composable
+    def Shown():
+        let n = state(0)
+        cells["n"] = n  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"n = {n.value}")
+
+    core = FakeCore()
+    rt = Runtime(core)
+    rt.wake = lambda: woken.__setitem__(0, woken[0] + 1)
+    rt.set_root(Shown)
+    rt.frame()
+    n = cells["n"]
+
+    def worker():
+        n.value = 7
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert n.value == 0, "the write was not applied on the worker thread"
+    assert len(rt.posted) == 1 and woken[0] >= 1
+    rt.frame()
+    assert core.all_text() == ["n = 7"]
+
+
+def test_a_failing_child_keeps_its_previous_subtree_and_the_siblings_render():
+    errors: list[str] = []
+
+    @composable
+    def Flaky(step: int):
+        if step == 1:
+            raise ValueError("boom")
+        Text(f"flaky {step}")
+
+    @composable
+    def Root():
+        let step = state(0)
+        Column:
+            Text(f"step {step.value}")
+            Flaky(step.value)
+            Button("next"):
+                step.value += 1
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.set_root(Root)
+    rt.frame()
+    assert core.all_text() == ["step 0", "flaky 0", "next"]
+    click(rt, core, "next")
+    rt.frame()
+    assert errors == ["root > Root > Flaky: boom"]
+    assert core.all_text() == ["step 1", "flaky 0", "next"], "the failed scope keeps what was on screen"
+    click(rt, core, "next")
+    rt.frame()
+    assert core.all_text() == ["step 2", "flaky 2", "next"], "it recovers on the next run"
+
+
+def test_concurrent_writes_from_worker_threads_are_never_dropped():
+    import threading
+
+    lists: dict[str, StateList[int]] = {}
+
+    @composable
+    def Sink():
+        let items = state_list[int]()
+        lists["items"] = items  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"{len(items)} items")
+
+    core = FakeCore()
+    rt = Runtime(core)
+    rt.set_root(Sink)
+    rt.frame()
+    items = lists["items"]
+    threads = 8
+    per_thread = 250
+
+    def worker(offset: int):
+        for i in range(per_thread):
+            items.append(offset * per_thread + i)
+
+    workers = [threading.Thread(target=worker, args=(n,)) for n in range(threads)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert len(items) == 0, "nothing was applied on a worker thread"
+    rt.frame()
+    assert len(items) == threads * per_thread
+    assert sorted(items) == list(range(threads * per_thread))
+    assert core.all_text() == [f"{threads * per_thread} items"]

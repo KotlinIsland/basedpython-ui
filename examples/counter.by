@@ -1,0 +1,29 @@
+from basedpython_ui import composable, state, Column, Row, Text, Button, Modifier, Alignment, run_app
+
+
+@composable
+def Counter(step: int = 1):
+    let count = state(0)                        # State[int], remembered for this scope's lifetime
+    Column(Modifier().padding(16)):
+        Text(f"count = {count.value}")          # a tracked read: this scope now depends on `count`
+        Row:
+            Button("-", enabled=count.value > 0):
+                count.value -= step             # the block binds `on_click`; a write invalidates readers
+            Button("+"):
+                count.value += step
+            Button("reset", enabled=count.value != 0):
+                count.value = 0
+        if count.value > 9:
+            Text("that is a lot", modifier=align(Alignment.Center))   # `align` comes from the ColumnScope receiver
+
+
+@composable
+def App():
+    Column:
+        Counter()
+        Counter(step=5)
+
+
+def main():
+    run_app("counter"):
+        App()

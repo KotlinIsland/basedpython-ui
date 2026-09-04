@@ -1,0 +1,81 @@
+"""Every example composes through the runtime against the fake core."""
+
+from basedpython_ui.runtime import Runtime
+from examples import counter, todo, form, theming, async_load, canvas_layout
+from tests.test_runtime import FakeCore, click
+
+
+def compose_example(root: () -> None) -> tuple[Runtime, FakeCore]:
+    core = FakeCore()
+    errors: list[str] = []
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error!r}"))
+    rt.set_root(root)
+    rt.frame()
+    assert errors == [], errors
+    return (rt, core)
+
+
+def test_counter_example():
+    rt, core = compose_example(counter.App)
+    assert core.all_text()[:2] == ["count = 0", "-"]
+    click(rt, core, "+")
+    rt.frame()
+    assert "count = 1" in core.all_text() and "count = 0" in core.all_text(), "two independent counters"
+
+
+def test_todo_example():
+    rt, core = compose_example(todo.TodoApp)
+    assert "2 of 2 remaining" in core.all_text()
+    assert "write the runtime" in core.all_text()
+
+
+def test_form_example():
+    submitted: list[str] = []
+    rt, core = compose_example(lambda: form.SignupForm(on_submit=lambda s: submitted.append(s.email)))  # ty: ignore[composable-outside-composition] -- the helper forwards the lambda to set_root
+    assert "sign up" in core.all_text()
+    click(rt, core, "sign up")
+    rt.frame()
+    assert submitted == [], "an empty form does not submit"
+    assert "name is required" in core.all_text()
+
+
+def test_theming_example():
+    rt, core = compose_example(theming.App)
+    assert "themed app" in core.all_text()
+    assert "density 1.0" in core.all_text() and "density 2.0" in core.all_text()
+
+
+def test_canvas_layout_example():
+    rt, core = compose_example(canvas_layout.App)
+    assert "alpha" in core.all_text() and "tick" in core.all_text()
+    click(rt, core, "tick")
+    rt.frame()
+
+
+def test_async_example_loads_and_cancels():
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    core = FakeCore()
+    errors: list[str] = []
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error!r}"))
+    rt.task_runner = lambda coroutine: loop.create_task(coroutine)
+    rt.set_root(async_load.App)
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0))
+    rt.frame()
+    assert "loading user 1" in core.all_text()
+    loop.run_until_complete(asyncio.sleep(0.35))
+    rt.frame()
+    assert "hello, user-1" in core.all_text(), core.all_text()
+    click(rt, core, "next")
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0))
+    rt.frame()
+    assert "loading user 2" in core.all_text()
+    assert errors == [], errors
+    root = rt.root
+    assert root is not None
+    rt.dispose_scope(root)                          # cancels the running effect
+    loop.run_until_complete(asyncio.sleep(0))   # let the cancelled task finish
+    loop.close()

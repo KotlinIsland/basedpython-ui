@@ -1,0 +1,31 @@
+[package]
+name = "basedpython_ui_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "native core of basedpython-ui: element arena, reconciliation, layout, text, paint, hit testing, window"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[features]
+# `python` builds the pyo3 extension module and the winit/softbuffer window.
+# `cargo test --no-default-features` runs the pure-rust unit tests without linking libpython.
+default = ["python"]
+python = ["dep:pyo3", "dep:winit", "dep:softbuffer"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"], optional = true }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"], optional = true }
+softbuffer = { version = "0.4", default-features = false, optional = true }
+tiny-skia = "0.12"
+cosmic-text = "0.19"
+slotmap = "1.1"
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"

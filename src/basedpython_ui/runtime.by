@@ -1,0 +1,1222 @@
+"""The composition runtime: observable state, composition scopes, slots,
+effects and ambient values.
+
+The rules this module implements (see docs/design.md):
+
+- a value held in state is deeply immutable (or is itself observable), so the
+  only way to change what a render sees is a method on a `State`,
+  `StateList` or `StateDict`, and every such method notifies
+- reads of state during composition are tracked exactly; writes during
+  composition raise before mutating anything
+- a composable whose arguments are all stable and equal is skipped; a
+  composable handed a content block is never retained and re-runs with its
+  parent (this is what keeps `once` honest)
+- a user exception during composition never reaches the retained tree
+
+Identity is by call site: a composable call and every slot (`state`,
+`remember`, `derived`, effects) is keyed by the code object and instruction
+offset of the call, plus the enclosing `key(...)` and an ordinal, so a
+conditional call can never transplant another call's state."""
+
+import enum
+import heapq
+import sys
+import threading
+import types
+from array import array
+from collections import deque
+from collections.abc import Callable, Coroutine, Iterable, Iterator
+from dataclasses import is_dataclass
+
+# hot-path names bound once at import: basedpython imports are lazy proxies,
+# and a proxy costs a resolution on every call or isinstance
+let _getframe = sys._getframe
+let _heappush = heapq.heappush
+let _heappop = heapq.heappop
+let _FunctionType = types.FunctionType
+let _MethodType = types.MethodType
+let _Enum = enum.Enum
+let _NoneType = type(None)
+
+
+class CompositionError(RuntimeError):
+    """A composition invariant was violated by user code (a state write during
+    composition, a builder called outside composition, a slot mismatch)."""
+
+
+# record kinds — mirror docs/native-protocol.md
+let R_END = 0
+let R_SCOPE = 1
+let R_SCOPE_REF = 2
+let R_COLUMN = 3
+let R_ROW = 4
+let R_BOX = 5
+let R_TEXT = 6
+let R_BUTTON = 7
+let R_TEXTFIELD = 8
+let R_CHECKBOX = 9
+let R_SPACER = 10
+let R_CANVAS = 11
+let R_LAYOUT = 12
+
+let FLAG_KEYED = 1
+let FLAG_STR_KEY = 2
+
+# phases
+let IDLE = 0
+let COMPOSING = 1
+let COMMITTING = 2
+let EFFECTS = 3
+
+# slot kinds
+let SLOT_STATE = 1
+let SLOT_REMEMBER = 2
+let SLOT_DERIVED = 3
+let SLOT_LAUNCHED = 4
+let SLOT_DISPOSABLE = 5
+let SLOT_PROVIDE = 6
+
+type Site = tuple[object, int]
+type ChildKey = tuple[object, object, int]
+type Task = Coroutine[object, object, None]
+type Handler = (...) -> object
+
+
+# ------------------------------------------------------------ the current runtime
+
+var _current: Runtime | None = None
+var _ids: int = 0
+
+
+def _next_id() -> int:
+    global _ids
+    _ids += 1
+    return _ids
+
+
+def current_runtime() -> Runtime raises ...:
+    """The runtime composing right now; an error outside composition."""
+    rt = _current
+    if rt is None:
+        raise CompositionError("called outside of a composition: builders, `state()` and the other slot functions only run inside a composable")
+    return rt
+
+
+def _site(depth: int) -> Site:
+    """The call site `depth` frames above the caller of this function: the code
+    object and instruction offset, stable across runs of the same source."""
+    frame = _getframe(depth + 1)
+    return (frame.f_code, frame.f_lasti)
+
+
+# ------------------------------------------------------------ stability
+
+var _stable_cache: dict[type, bool] = {}
+let _SCALARS: frozenset[type] = frozenset((int, float, bool, str, bytes, _NoneType, complex, range))
+let _MUTABLE_BUILTINS: frozenset[type] = frozenset((list, dict, set, bytearray))
+
+
+def is_stable_type(t: type) -> bool:
+    """Whether values of `t` may be compared structurally to decide skipping and
+    may be held in state. Mirrors the checker's `is_deeply_immutable`."""
+    cached = _stable_cache.get(t)
+    if cached is not None:
+        return cached
+    if t in _SCALARS or issubclass(t, (tuple, frozenset, _Enum, Observable, _FunctionType, _MethodType)):
+        result = True
+    elif t in _MUTABLE_BUILTINS:
+        result = False
+    elif is_dataclass(t):
+        params = getattr(t, "__dataclass_params__", None)
+        result = params is not None and bool(getattr(params, "frozen", False))
+    elif t.__dict__.get("__slots__") == ():
+        # a payload-less `enum class` variant lowers to a singleton of a class
+        # that declares no storage at all; nothing about it can change
+        result = True
+    else:
+        result = False
+    _stable_cache[t] = result
+    return result
+
+
+def check_state_value(value: object) raises TypeError:
+    """The runtime half of `mutable-state-value`: refuse the values the lint
+    cannot see (from `.py` callers or `dynamic`)."""
+    if not is_stable_type(type(value)):
+        raise TypeError(
+            f"a {type(value).__name__} cannot be held in state: a change to it cannot be observed; "
+            "use a StateList / StateDict, a tuple, or a frozen data class"
+        )
+
+
+def _args_equal(old: tuple[object, ...], new: tuple[object, ...]) -> bool:
+    if len(old) != len(new):
+        return False
+    for a, b in zip(old, new):
+        if a === b:
+            continue
+        if not is_stable_type(type(b)) or a != b:
+            return False
+    return True
+
+
+def _kwargs_equal(old: dict[str, object], new: dict[str, object]) -> bool:
+    if len(old) != len(new):
+        return False
+    for name, b in new.items():
+        if name not in old:
+            return False
+        a = old[name]
+        if a === b:
+            continue
+        if not is_stable_type(type(b)) or a != b:
+            return False
+    return True
+
+
+def _is_block(value: object) -> bool:
+    """A trailing-lambda block the caller wrote for this call (never retained)."""
+    return type(value) === _FunctionType and value.__name__.startswith("_trailing_lambda")
+
+
+# ------------------------------------------------------------ trackers and cells
+
+
+class Tracker:
+    """Something that records what it reads: a scope or a derived value."""
+
+    init(self):
+        self.id: int = _next_id()
+        self.deps: dict[int, Observable] = {}
+
+    def unsubscribe(self):
+        for cell in self.deps.values():
+            cell.readers.pop(self.id, None)
+        self.deps = {}
+
+    def on_dep_changed(self, cell: Observable): ...
+
+
+class Observable:
+    """Something with a version and readers: state cells, collections, derived values.
+    A cell created while a runtime is composing belongs to that runtime, which is
+    what routes writes made between frames (from handlers, tasks, other threads)."""
+
+    init(self):
+        self.version: int = 0
+        self.readers: dict[int, Tracker] = {}
+        self.runtime: Runtime | None = _current
+
+    def _runtime(self) -> Runtime | None:
+        rt = self.runtime
+        return rt if rt is not None else _current
+
+    def _read(self):
+        rt = _current
+        if rt is not None and rt.tracker is not None:
+            rt.tracker.deps[self.id_of()] = self
+            self.readers[rt.tracker.id] = rt.tracker
+
+    def id_of(self) -> int:
+        return id(self)
+
+    def _changed(self):
+        self.version += 1
+        for tracker in tuple(self.readers.values()):
+            tracker.on_dep_changed(self)
+
+    def _guard_write(self) -> bool raises ...:
+        """Refuse a write during composition; report whether the caller is on
+        the ui thread (if not, it must post the write instead)."""
+        rt = self._runtime()
+        if rt is None:
+            return True
+        return rt.guard_write(self)
+
+    def _apply(self, write: () -> None) raises ...:
+        """Run `write` now on the ui thread, or post it there from any other
+        thread — a write is never dropped."""
+        if self._guard_write():
+            write()
+            return
+        rt = self._runtime()
+        if rt is not None:
+            rt.post(write)
+
+
+class State[T](Observable):
+    """An observable cell. Reading `.value` inside composition subscribes the
+    enclosing scope; writing it schedules a recomposition of every reader.
+    `T` must be deeply immutable — a `list` cannot be observed (see the
+    `mutable-state-value` diagnostic)."""
+
+    init(self, initial: T):
+        Observable.__init__(self)
+        check_state_value(initial)
+        self._value: T = initial
+
+    var value: T
+        get() = self._get()
+        set(new):
+            self._set(new)
+
+    def _get(self) -> T:
+        self._read()
+        return self._value
+
+    def _set(self, new: T) raises ...:
+        self._apply(lambda: self._store(new))
+
+    def _store(self, new: T) raises TypeError:
+        check_state_value(new)
+        if new === self._value or (is_stable_type(type(new)) and new == self._value):
+            return
+        self._value = new
+        self._changed()
+
+    def set(self, new: T) raises ...:
+        """`value = new` as a call, for use in a lambda."""
+        self._set(new)
+
+    def update(self, fn: (T) -> T) raises ...:
+        self._set(fn(self._value))
+
+
+class StateList[T](Observable):
+    """An observable list of immutable elements. Structural changes and
+    element replacements notify; there is no way to mutate an element in
+    place because elements are immutable."""
+
+    init(self, initial: Iterable[T] = ()):
+        Observable.__init__(self)
+        self._items: list[T] = list(initial)
+        for item in self._items:
+            check_state_value(item)
+
+    def __len__(self) -> int:
+        self._read()
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[T]:
+        self._read()
+        return iter(tuple(self._items))
+
+    def __getitem__(self, index: int) -> T:
+        self._read()
+        return self._items[index]
+
+    def __setitem__(self, index: int, value: T) raises ...:
+        check_state_value(value)
+        self._apply(lambda: self._replace(index, value))
+
+    def _replace(self, index: int, value: T):
+        if self._items[index] === value:
+            return
+        self._items[index] = value
+        self._changed()
+
+    def append(self, value: T) raises ...:
+        check_state_value(value)
+        self._apply(lambda: self._push(value))
+
+    def _push(self, value: T):
+        self._items.append(value)
+        self._changed()
+
+    def insert(self, index: int, value: T) raises ...:
+        check_state_value(value)
+        self._apply(lambda: self._insert(index, value))
+
+    def _insert(self, index: int, value: T):
+        self._items.insert(index, value)
+        self._changed()
+
+    def remove_at(self, index: int) raises ...:
+        self._apply(lambda: self._delete(index))
+
+    def _delete(self, index: int):
+        del self._items[index]
+        self._changed()
+
+    def remove(self, value: T) raises ...:
+        self._apply(lambda: self._drop(value))
+
+    def _drop(self, value: T):
+        self._items.remove(value)
+        self._changed()
+
+    def pop(self, index: int = -1) -> T raises ...:
+        """Remove and return an element; only meaningful on the ui thread, where
+        the removal happens before this returns."""
+        if not self._guard_write():
+            raise CompositionError("StateList.pop needs the ui thread; use remove_at from another thread")
+        item = self._items.pop(index)
+        self._changed()
+        return item
+
+    def clear(self) raises ...:
+        self._apply(self._wipe)
+
+    def _wipe(self):
+        if self._items:
+            self._items.clear()
+            self._changed()
+
+    def index_where(self, predicate: (T) -> bool) -> int?:
+        self._read()
+        for i, item in enumerate(self._items):
+            if predicate(item):
+                return i
+        return None
+
+    def snapshot(self) -> tuple[T, ...]:
+        self._read()
+        return tuple(self._items)
+
+    def each(self, key: (T) -> object, local content: (T) -> None) raises ...:
+        """Keyed iteration for composition: `content` runs once per element in
+        a group keyed by `key(element)`, and receives the element as `it` —
+        a parameter of its own activation, so a handler block written inside
+        it captures *this* element and never the loop's last value."""
+        self._read()
+        rt = current_runtime()
+        for item in tuple(self._items):
+            rt.keyed(key(item), lambda: content(item))
+
+    def each_indexed(self, key: (T) -> object, local content: (Indexed[T]) -> None) raises ...:
+        self._read()
+        rt = current_runtime()
+        for index, item in enumerate(tuple(self._items)):
+            row = Indexed(index, item)
+            rt.keyed(key(item), lambda: content(row))
+
+
+frozen data class Indexed[T]:
+    index: int
+    item: T
+
+
+class StateDict[K, V](Observable):
+    """An observable mapping; keys and values are immutable."""
+
+    init(self):
+        Observable.__init__(self)
+        self._items: dict[K, V] = {}
+
+    def __len__(self) -> int:
+        self._read()
+        return len(self._items)
+
+    def __contains__(self, key: K) -> bool:
+        self._read()
+        return key in self._items
+
+    def __getitem__(self, key: K) -> V:
+        self._read()
+        return self._items[key]
+
+    def __setitem__(self, key: K, value: V) raises ...:
+        check_state_value(value)
+        self._apply(lambda: self._put(key, value))
+
+    def _put(self, key: K, value: V):
+        if key in self._items and self._items[key] === value:
+            return
+        self._items[key] = value
+        self._changed()
+
+    def get(self, key: K) -> V | None:
+        self._read()
+        return self._items.get(key)
+
+    def remove(self, key: K) raises ...:
+        self._apply(lambda: self._delete(key))
+
+    def _delete(self, key: K):
+        del self._items[key]
+        self._changed()
+
+    def keys(self) -> tuple[K, ...]:
+        self._read()
+        return tuple(self._items)
+
+    def items(self) -> tuple[tuple[K, V], ...]:
+        self._read()
+        return tuple(self._items.items())
+
+
+class Derived[T](Observable, Tracker):
+    """A memoised computation over state. Re-evaluated at most once per change
+    of its dependencies, and glitch-free: it is recomputed when a dependency
+    is written, before any scope can read it, and its readers are invalidated
+    only when the value actually changed."""
+
+    init(self, compute: () -> T):
+        Observable.__init__(self)
+        Tracker.__init__(self)
+        self._compute: () -> T = compute
+        self._valid: bool = False
+        self._cache: T = self._evaluate()
+
+    let value: T
+        get() = self._get()
+
+    def _get(self) -> T:
+        if not self._valid:
+            self._cache = self._evaluate()
+        self._read()
+        return self._cache
+
+    def _evaluate(self) -> T:
+        global _current
+        rt = self._runtime()
+        self.unsubscribe()
+        if rt is None:
+            value = self._compute()
+        else:
+            previous = _current
+            outer = rt.tracker
+            _current = rt
+            rt.tracker = self
+            try:
+                value = self._compute()
+            finally:
+                rt.tracker = outer
+                _current = previous
+        self._valid = True
+        return value
+
+    override def on_dep_changed(self, cell: Observable):
+        old = self._cache
+        new = self._evaluate()
+        if new === old or (is_stable_type(type(new)) and new == old):
+            self._cache = new
+            return
+        self._cache = new
+        self._changed()
+
+    override def id_of(self) -> int:
+        return self.id
+
+
+def state[T](initial: T) -> State[T] raises ...:
+    """Remember an observable cell for the lifetime of the enclosing scope."""
+    return current_runtime().slot(SLOT_STATE, 1, lambda: State(initial))
+
+
+def state_list[T](initial: Iterable[T] = ()) -> StateList[T] raises ...:
+    items = tuple(initial)
+    return current_runtime().slot(SLOT_STATE, 1, lambda: StateList(items))
+
+
+def state_dict[K, V]() -> StateDict[K, V] raises ...:
+    return current_runtime().slot(SLOT_STATE, 1, lambda: StateDict())
+
+
+def derived[T](compute: () -> T) -> Derived[T] raises ...:
+    return current_runtime().slot(SLOT_DERIVED, 1, lambda: Derived(compute))
+
+
+def remember[T](compute: () -> T) -> T raises ...:
+    """Compute a value once per scope lifetime and hand it back on every
+    recomposition (slot-memoised by call site)."""
+    return current_runtime().slot(SLOT_REMEMBER, 1, compute)
+
+
+# ------------------------------------------------------------ scopes
+
+
+final class Scope(Tracker):
+    """One execution unit of composition: a composable call. Holds the slots,
+    the child scopes and the dependencies of its last run."""
+
+    init(self, let runtime: Runtime, let fn: Handler, let parent: Scope | None, let depth: int, let site: Site, let key: object):
+        Tracker.__init__(self)
+        self.args: tuple[object, ...] = ()
+        self.kwargs: dict[str, object] = {}
+        self.slots: dict[ChildKey, tuple[int, object]] = {}
+        self.old_slots: dict[ChildKey, tuple[int, object]] = {}
+        self.children: dict[ChildKey, Scope] = {}
+        self.old_children: dict[ChildKey, Scope] = {}
+        self.site_counts: dict[tuple[object, object], int] = {}
+        self.handlers: list[int] = []
+        self.dirty: bool = False
+        self.alive: bool = True
+        self.inline: bool = False
+        self.restart: Scope = self
+        self.runs: int = 0
+        self.committed: bool = False
+        self.errored: bool = False
+        self.start: int = 0
+        self.end: int = 0
+        self.ambients: tuple[tuple[object, ProvidedCell], ...] = ()
+        self.name: str = getattr(fn, "__name__", "root")
+
+    override def on_dep_changed(self, cell: Observable):
+        self.runtime.invalidate(self)
+
+    def path(self) -> str:
+        parts: list[str] = []
+        var scope: Scope | None = self
+        while scope is not None:
+            parts.append(scope.name)
+            scope = scope.parent
+        return " > ".join(reversed(parts))
+
+
+class Composable:
+    """The runtime side of `@composable`: a callable that opens a scope."""
+
+    init(self, let fn: Handler):
+        self.__name__: str = getattr(fn, "__name__", "composable")
+        self.__qualname__: str = getattr(fn, "__qualname__", self.__name__)
+        self.__doc__: str? = getattr(fn, "__doc__", None)
+        self.__wrapped__: object = fn
+
+    def __call__(self, *args: object, **kwargs: object) raises ...:
+        rt = _current
+        if rt is None:
+            raise CompositionError(f"{self.__qualname__} called outside of a composition")
+        frame = _getframe(1)
+        rt.call_composable(self, args, kwargs, (frame.f_code, frame.f_lasti))
+
+    override def __repr__(self) -> str:
+        return f"<composable {self.__qualname__}>"
+
+
+def composable[F](fn: F) -> F:
+    """Mark a function as a composable — a recomposition scope. The decorator
+    is identity-typed on purpose: the decorated name keeps its exact function
+    type, so `once` content blocks, keyword block binding and `context`
+    parameters all keep working through it. At runtime the name is bound to
+    a `Composable` wrapper that opens a scope per call."""
+    target: dynamic = fn
+    wrapper: dynamic = Composable(target)
+    return wrapper
+
+
+def key(k: object, once content: () -> None) raises ...:
+    """Open a child group identified by `k` rather than by position."""
+    current_runtime().keyed(k, content)
+
+
+class Keyed[T]:
+    init(self, items: Iterable[T]):
+        self._items: tuple[T, ...] = tuple(items)
+
+    def each(self, key: (T) -> object, local content: (T) -> None) raises ...:
+        rt = current_runtime()
+        for item in self._items:
+            rt.keyed(key(item), lambda: content(item))
+
+
+def keyed[T](items: Iterable[T]) -> Keyed[T]:
+    """Keyed iteration over any iterable of immutable items."""
+    return Keyed(items)
+
+
+# ------------------------------------------------------------ effects
+
+
+class Job:
+    """The handle a `launched_effect` body receives: `is_active` turns false
+    when the effect is cancelled (its key changed or its scope left)."""
+
+    init(self):
+        self._active: bool = True
+        self.task: object = None
+
+    let is_active: bool
+        get() = self._active
+
+    def cancel(self):
+        self._active = False
+        task = self.task
+        if task is not None:
+            cancel = getattr(task, "cancel", None)
+            if cancel is not None:
+                cancel()
+
+
+class DisposeScope:
+    init(self):
+        self._disposers: list[() -> None] = []
+
+    def on_dispose(self, cleanup: () -> None):
+        self._disposers.append(cleanup)
+
+    def dispose(self):
+        disposers = self._disposers
+        self._disposers = []
+        for cleanup in reversed(disposers):
+            cleanup()
+
+
+final class _Unset:
+    override def __repr__(self) -> str:
+        return "UNSET"
+
+
+let UNSET = _Unset()
+
+
+class EffectSlot:
+    init(self, let kind: int):
+        self.key: object = UNSET
+        self.job: Job | None = None
+        self.scope: DisposeScope | None = None
+
+    def dispose(self):
+        job = self.job
+        if job is not None:
+            job.cancel()
+            self.job = None
+        scope = self.scope
+        if scope is not None:
+            scope.dispose()
+            self.scope = None
+
+
+def launched_effect(key: object, block: (Job) -> Task) raises ...:
+    """Start `block` as a task after the frame commits. Restarted (the running
+    task cancelled first) whenever `key` changes; cancelled when the scope
+    leaves the composition."""
+    rt = current_runtime()
+    slot = rt.slot(SLOT_LAUNCHED, 1, lambda: EffectSlot(SLOT_LAUNCHED))
+    if slot.key === UNSET or slot.key != key:
+        slot.key = key
+        slot.dispose()
+        job = Job()
+        slot.job = job
+        rt.after_commit(lambda: rt.start_task(job, block))
+
+
+def disposable_effect(key: object, block: (DisposeScope) -> None) raises ...:
+    """Run `block` after commit whenever `key` changes; its registered
+    cleanups run before the next run and when the scope leaves."""
+    rt = current_runtime()
+    slot = rt.slot(SLOT_DISPOSABLE, 1, lambda: EffectSlot(SLOT_DISPOSABLE))
+    if slot.key === UNSET or slot.key != key:
+        slot.key = key
+        slot.dispose()
+        scope = DisposeScope()
+        slot.scope = scope
+        rt.after_commit(lambda: block(scope))
+
+
+def side_effect(block: () -> None) raises ...:
+    """Run `block` after every successful commit of the enclosing scope."""
+    current_runtime().after_commit(block)
+
+
+# ------------------------------------------------------------ ambients
+
+
+class ProvidedCell(Observable):
+    """The cell behind a `provide` call site: readers of the ambient below it subscribe here."""
+
+    init(self, value: object):
+        Observable.__init__(self)
+        self.value: object = value
+
+    def read(self) -> object:
+        self._read()
+        return self.value
+
+
+class Ambient[T]:
+    """A tree-scoped value with a default (Compose's CompositionLocal).
+    `current` reads the nearest `provide` up the composition tree and is
+    tracked like state."""
+
+    init(self, default: T):
+        self._default: T = default
+
+    let current: T
+        get() = self._current()
+
+    def _current(self) -> T:
+        rt = _current
+        if rt is not None:
+            for which, cell in reversed(rt.ambient_stack):
+                if which === self:
+                    provided: dynamic = cell.read()
+                    return provided
+        return self._default
+
+
+def ambient[T](default: T) -> Ambient[T]:
+    return Ambient(default)
+
+
+def provide[T](which: Ambient[T], value: T, once content: () -> None) raises ...:
+    rt = current_runtime()
+    cell = rt.slot(SLOT_PROVIDE, 1, lambda: ProvidedCell(value))
+    rt.set_provided(cell, value)
+    rt.ambient_stack.append((which, cell))
+    try:
+        content()
+    finally:
+        rt.ambient_stack.pop()
+
+
+# ------------------------------------------------------------ the runtime
+
+
+protocol NativeCore:
+    """What the runtime needs from `basedpython_ui._native.Core` (or a fake in tests);
+    see docs/native-protocol.md."""
+
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]
+    def layout(self, measure: object)
+    def paint(self)
+    def canvas_requests(self) -> list[tuple[int, int, float, float]]
+    def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str])
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]
+    def place_child(self, index: int, x: float, y: float)
+    def hit_test(self, x: float, y: float) -> int
+    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]
+    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None
+    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None
+    def all_text(self) -> list[str]
+    def field_handler(self, placeholder: str) -> int
+    def dump(self) -> str
+    def node_count(self) -> int
+
+
+final class Runtime:
+    """One composition: the root scope, the dirty set, the frame buffers and
+    the handler table. Exactly one runtime composes at a time (`_current`)."""
+
+    init(self, let core: NativeCore, on_error: ((BaseException, str) -> None) | None = None):
+        self.phase: int = IDLE
+        self.scope: Scope | None = None
+        self.tracker: Tracker | None = None
+        self.root: Scope | None = None
+        self.scopes: dict[int, Scope] = {}
+        self.dirty_heap: list[tuple[int, int]] = []
+        self.key_stack: list[object] = []
+        self.ambient_stack: list[tuple[object, ProvidedCell]] = []
+        self.ints: list[int] = []
+        self.floats: list[float] = []
+        self.strs: list[str] = []
+        self.str_index: dict[str, int] = {}
+        self.handlers: list[Handler | None] = []
+        self.free_handlers: list[int] = []
+        self.modifier_ids: dict[object, int] = {}
+        self.modifiers_by_identity: dict[int, tuple[object, int]] = {}
+        self.new_modifiers: list[tuple[int, list[float]]] = []
+        self.style_ids: dict[object, int] = {}
+        self.styles_by_identity: dict[int, tuple[object, int]] = {}
+        self.new_styles: list[tuple[int, float, float, int]] = []
+        self.post_commit: list[() -> None] = []
+        self.posted: deque[() -> None] = deque()
+        self.ui_thread: int = threading.get_ident()
+        self.on_error: (BaseException, str) -> None = on_error if on_error is not None else _default_on_error
+        self.recompositions: dict[str, int] = {}
+        self.frames: int = 0
+        self.wake: (() -> None) | None = None
+        self.task_runner: ((Task) -> object) | None = None
+
+    # ---- composition entry points
+
+    def set_root(self, root: () -> None):
+        scope = self.new_scope(root, None, _site(0), None)
+        # the protocol names the root group scope 0; tracker ids start at 1
+        del self.scopes[scope.id]
+        scope.id = 0
+        self.scopes[0] = scope
+        scope.name = "root"
+        self.root = scope
+        self.invalidate(scope)
+
+    def new_scope(self, fn: Handler, parent: Scope | None, site: Site, k: object) -> Scope:
+        depth = 0 if parent is None else parent.depth + 1
+        scope = Scope(self, fn, parent, depth, site, k)
+        self.scopes[scope.id] = scope
+        return scope
+
+    def invalidate(self, scope: Scope):
+        target = scope.restart
+        if target.dirty or not target.alive:
+            return
+        target.dirty = True
+        _heappush(self.dirty_heap, (target.depth, target.id))
+        wake = self.wake
+        if wake is not None:
+            wake()
+
+    def guard_write(self, cell: Observable) -> bool raises CompositionError:
+        if self.phase == COMPOSING:
+            scope = self.scope
+            where = scope.path() if scope is not None else "?"
+            raise CompositionError(
+                f"state written while composing {where}; move the write into an event handler or an effect"
+            )
+        if threading.get_ident() != self.ui_thread:
+            return False
+        return True
+
+    def post(self, fn: () -> None):
+        """Run `fn` on the ui thread before the next frame (thread-safe)."""
+        self.posted.append(fn)
+        wake = self.wake
+        if wake is not None:
+            wake()
+
+    def set_provided(self, cell: ProvidedCell, value: object) raises TypeError:
+        # a provider's cell is written during composition on purpose: readers
+        # below it are invalidated and recompose later in this frame
+        if value === cell.value or (is_stable_type(type(value)) and value == cell.value):
+            return
+        check_state_value(value)
+        cell.value = value
+        cell._changed()
+
+    # ---- slots, keys, children
+
+    def slot[T](self, kind: int, depth: int, factory: () -> T) -> T raises ...:
+        scope = self.scope
+        if scope is None or self.phase != COMPOSING:
+            raise CompositionError("`state()` / `remember()` / effects only run while a composable is composing")
+        site = _site(depth + 1)
+        k = self.key_stack[-1] if self.key_stack else None
+        n = scope.site_counts.get((site, k), 0)
+        scope.site_counts[(site, k)] = n + 1
+        ck = (site, k, n)
+        old = scope.old_slots.pop(ck, None)
+        if old is not None:
+            old_kind, value = old
+            if old_kind != kind:
+                raise CompositionError(f"slot kind changed between compositions in {scope.path()}")
+            scope.slots[ck] = old
+            reused: dynamic = value
+            return reused
+        value = factory()
+        scope.slots[ck] = (kind, value)
+        return value
+
+    def keyed(self, k: object, once content: () -> None) raises ...:
+        if not isinstance(k, (int, str)):
+            raise CompositionError(f"a key must be an int or a str, not {type(k).__name__}")
+        self.key_stack.append(k)
+        try:
+            content()
+        finally:
+            self.key_stack.pop()
+
+    def call_composable(self, composable: Composable, args: tuple[object, ...], kwargs: dict[str, object], site: Site) raises ...:
+        parent = self.scope
+        if parent is None or self.phase != COMPOSING:
+            raise CompositionError(f"{composable.__qualname__} called outside composition")
+        k = self.key_stack[-1] if self.key_stack else None
+        n = parent.site_counts.get((site, k), 0)
+        parent.site_counts[(site, k)] = n + 1
+        ck = (site, k, n)
+        child = parent.old_children.pop(ck, None)
+        if child is None:
+            child = self.new_scope(composable.fn, parent, site, k)
+        parent.children[ck] = child
+        inline = False
+        for value in args:
+            if _is_block(value):
+                inline = True
+                break
+        if kwargs and not inline:
+            for value in kwargs.values():
+                if _is_block(value):
+                    inline = True
+                    break
+        if (
+            not inline
+            and child.committed
+            and not child.dirty
+            and not child.errored
+            and _args_equal(child.args, args)
+            and ((len(kwargs) == 0 and len(child.kwargs) == 0) or _kwargs_equal(child.kwargs, kwargs))
+        ):
+            self.ints.extend((R_SCOPE_REF, 0, -1, 0, -1, child.id, 0, 0))
+            return
+        child.args = args
+        child.kwargs = kwargs
+        child.inline = inline
+        child.restart = parent.restart if inline else child
+        self.run_scope(child)
+
+    # ---- running a scope
+
+    def run_scope(self, scope: Scope) raises ...:
+        """Run `scope.fn` with its retained arguments, emitting its fragment;
+        a user exception discards everything the run produced."""
+        outer_scope = self.scope
+        outer_tracker = self.tracker
+        outer_keys = self.key_stack
+        outer_ambients = self.ambient_stack
+        self.scope = scope
+        self.tracker = scope.restart
+        self.key_stack = []
+        if outer_scope is None:
+            self.ambient_stack = list(scope.ambients)
+        scope.ambients = tuple(self.ambient_stack) if self.ambient_stack else ()
+        scope.runs += 1
+        scope.dirty = False
+        self.recompositions[scope.name] = self.recompositions.get(scope.name, 0) + 1
+        scope.old_children = scope.children
+        scope.children = {}
+        scope.old_slots = scope.slots
+        scope.slots = {}
+        scope.site_counts = {}
+        if not scope.inline:
+            scope.unsubscribe()
+        for h in scope.handlers:
+            self.release_handler(h)
+        scope.handlers = []
+        start = len(self.ints)
+        float_start = len(self.floats)
+        scope.start = start
+        self.emit(R_SCOPE, 0, -1, 0, -1, scope.id, 0, 0)
+        try:
+            scope.fn(*scope.args, **scope.kwargs)
+        except BaseException as error:
+            self.rollback(scope, start, float_start, error)
+        else:
+            self.emit(R_END, 0, -1, 0, -1, 0, 0, 0)
+            scope.end = len(self.ints)
+            scope.errored = False
+            for stale in scope.old_children.values():
+                self.dispose_scope(stale)
+            for old_kind, value in scope.old_slots.values():
+                _dispose_slot(old_kind, value)
+        scope.old_children = {}
+        scope.old_slots = {}
+        self.scope = outer_scope
+        self.tracker = outer_tracker
+        self.key_stack = outer_keys
+        self.ambient_stack = outer_ambients
+
+    def rollback(self, scope: Scope, start: int, float_start: int, error: BaseException):
+        del self.ints[start:]
+        del self.floats[float_start:]
+        for h in scope.handlers:
+            self.release_handler(h)
+        scope.handlers = []
+        for created in scope.children.values():
+            self.dispose_scope(created)
+        scope.children = scope.old_children
+        scope.slots = scope.old_slots
+        scope.errored = True
+        if scope.committed:
+            # keep what is on screen for this scope
+            self.emit(R_SCOPE_REF, 0, -1, 0, -1, scope.id, 0, 0)
+        scope.start = start
+        scope.end = len(self.ints)
+        self.on_error(error, scope.path())
+
+    def dispose_scope(self, scope: Scope):
+        if not scope.alive:
+            return
+        scope.alive = False
+        for child in scope.children.values():
+            self.dispose_scope(child)
+        for child in scope.old_children.values():
+            self.dispose_scope(child)
+        for kind, value in scope.slots.values():
+            _dispose_slot(kind, value)
+        scope.unsubscribe()
+        for h in scope.handlers:
+            self.release_handler(h)
+        scope.handlers = []
+        self.scopes.pop(scope.id, None)
+
+    # ---- emission
+
+    def emit(self, kind: int, flags: int, text_idx: int, modifier_id: int, handler_idx: int, a: int, b: int, c: int):
+        self.ints.extend((kind, flags, text_idx, modifier_id, handler_idx, a, b, c))
+
+    def end(self):
+        self.emit(R_END, 0, -1, 0, -1, 0, 0, 0)
+
+    def intern(self, text: str) -> int:
+        idx = self.str_index.get(text)
+        if idx is None:
+            idx = len(self.strs)
+            self.strs.append(text)
+            self.str_index[text] = idx
+        return idx
+
+    def handler(self, fn: Handler) -> int raises CompositionError:
+        scope = self.scope
+        if scope is None:
+            raise CompositionError("a handler can only be registered while composing")
+        if self.free_handlers:
+            idx = self.free_handlers.pop()
+            self.handlers[idx] = fn
+        else:
+            idx = len(self.handlers)
+            self.handlers.append(fn)
+        scope.handlers.append(idx)
+        return idx
+
+    def release_handler(self, idx: int):
+        self.handlers[idx] = None
+        self.free_handlers.append(idx)
+
+    def current_key_flags(self) -> tuple[int, int]:
+        """The key flags and key payload for a record emitted under `key(...)`."""
+        if not self.key_stack:
+            return (0, 0)
+        k = self.key_stack[-1]
+        if isinstance(k, str):
+            return (FLAG_KEYED | FLAG_STR_KEY, self.intern(k))
+        return (FLAG_KEYED, k cast! int)
+
+    def after_commit(self, fn: () -> None):
+        self.post_commit.append(fn)
+
+    def start_task(self, job: Job, block: (Job) -> Task) raises CompositionError:
+        runner = self.task_runner
+        if runner is None:
+            raise CompositionError("launched_effect needs a task runner (run_app or compose_test provide one)")
+        job.task = runner(block(job))
+
+    # ---- frames
+
+    def frame(self, measure: object = None) -> bool raises ...:
+        """Compose every dirty scope, commit, layout, run effects. Returns
+        whether anything changed."""
+        global _current
+        if _current is not None and _current !== self:
+            raise CompositionError("another runtime is already composing on this thread")
+        _current = self
+        try:
+            while self.posted:
+                self.posted.popleft()()
+            ranges: list[tuple[int, int, int]] = []
+            self.phase = COMPOSING
+            try:
+                while self.dirty_heap:
+                    _, sid = _heappop(self.dirty_heap)
+                    scope = self.scopes.get(sid)
+                    if scope is None or not scope.dirty or not scope.alive:
+                        continue
+                    self.run_scope(scope)
+                    if not scope.errored:
+                        # record indices: the scope's own SCOPE / END records are excluded
+                        ranges.append((scope.id, scope.start // 8 + 1, scope.end // 8 - 1))
+            finally:
+                self.phase = IDLE
+            changed = bool(ranges)
+            if changed:
+                self.phase = COMMITTING
+                try:
+                    disposed = self.core.commit(
+                        array("i", self.ints), array("d", self.floats), self.strs, ranges, self.new_modifiers, self.new_styles,
+                    )
+                finally:
+                    self.phase = IDLE
+                for scope in self.scopes.values():
+                    if scope.runs and not scope.errored:
+                        scope.committed = True
+                for sid in disposed:
+                    stale = self.scopes.get(sid)
+                    if stale is not None:
+                        self.dispose_scope(stale)
+                self.ints = []
+                self.floats = []
+                self.strs = []
+                self.str_index = {}
+                self.new_modifiers = []
+                self.new_styles = []
+                self.core.layout(measure)
+                self.draw_canvases()
+            self.phase = EFFECTS
+            try:
+                effects = self.post_commit
+                self.post_commit = []
+                for effect in effects:
+                    try:
+                        effect()
+                    except BaseException as error:
+                        self.on_error(error, "effect")
+            finally:
+                self.phase = IDLE
+            self.frames += 1
+            return changed
+        finally:
+            _current = None
+
+    def draw_canvases(self):
+        for node_id, handler_idx, width, height in self.core.canvas_requests():
+            draw = self.handlers[handler_idx]
+            if draw is None:
+                continue
+            recorder = CanvasRecorder(width, height, self)
+            try:
+                draw(recorder)
+            except BaseException as error:
+                self.on_error(error, "canvas")
+                continue
+            self.core.set_canvas_commands(node_id, array("d", recorder.floats), recorder.strs)
+
+    def is_idle(self) -> bool:
+        return not self.dirty_heap and not self.posted and not self.post_commit
+
+    # ---- modifiers and styles
+
+    def modifier_id(self, modifier: object, encode: (object, Runtime) -> list[float]) -> int:
+        # identity first: a hoisted modifier costs one dict probe, not a structural hash
+        by_identity = self.modifiers_by_identity.get(id(modifier))
+        if by_identity is not None and by_identity[0] === modifier:
+            return by_identity[1]
+        idx = self.modifier_ids.get(modifier)
+        if idx is None:
+            idx = len(self.modifier_ids) + 1
+            self.modifier_ids[modifier] = idx
+            self.new_modifiers.append((idx, encode(modifier, self)))
+        self.modifiers_by_identity[id(modifier)] = (modifier, idx)
+        return idx
+
+    def modifier_id_for_ops(self, ops: list[float]) -> int:
+        """Intern an already-encoded modifier (one carrying a handler index): the
+        same ops always map to the same id, so the core never sees an id whose
+        content changed."""
+        key = tuple(ops)
+        idx = self.modifier_ids.get(key)
+        if idx is None:
+            idx = len(self.modifier_ids) + 1
+            self.modifier_ids[key] = idx
+            self.new_modifiers.append((idx, ops))
+        return idx
+
+    def style_id(self, style: object, encode: (object) -> tuple[float, float, int]) -> int:
+        by_identity = self.styles_by_identity.get(id(style))
+        if by_identity is not None and by_identity[0] === style:
+            return by_identity[1]
+        idx = self.style_ids.get(style)
+        if idx is None:
+            idx = len(self.style_ids) + 1
+            self.style_ids[style] = idx
+            size, argb, bold = encode(style)
+            self.new_styles.append((idx, size, argb, bold))
+        self.styles_by_identity[id(style)] = (style, idx)
+        return idx
+
+
+class CanvasRecorder:
+    """Records a canvas draw block's commands in the protocol's float format."""
+
+    init(self, let width: float, let height: float, let runtime: Runtime):
+        self.floats: list[float] = []
+        self.strs: list[str] = []
+
+
+def _dispose_slot(kind: int, value: object):
+    if kind == SLOT_LAUNCHED or kind == SLOT_DISPOSABLE:
+        (value cast! EffectSlot).dispose()
+
+
+def _default_on_error(error: BaseException, where: str):
+    import traceback
+
+    print(f"basedpython-ui: error in {where}", file=sys.stderr)
+    traceback.print_exception(error)

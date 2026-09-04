@@ -1,0 +1,25 @@
+from basedpython_ui import composable, state, Column, Text, Button, compose_test
+
+
+@composable
+def Counter(step: int = 1):
+    let count = state(0)
+    Column:
+        Text(f"count = {count.value}")
+        Button("+"):
+            count.value += step
+
+
+def test_counter_increments():
+    let t = compose_test:                       # headless: same runtime, same native layout, no window
+        Counter(step=2)
+    assert t.find_text("count = 0")
+    t.click("+")
+    t.advance()                                 # run pending recompositions, commit, layout, effects
+    assert t.find_text("count = 2")
+    assert t.recompositions(Counter) == 2       # the initial composition and exactly one recomposition
+
+
+def main() raises AssertionError:
+    test_counter_increments()
+    print("ok")

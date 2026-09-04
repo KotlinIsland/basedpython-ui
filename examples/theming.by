@@ -1,0 +1,52 @@
+from basedpython_ui import composable, state, ambient, provide, Column, Row, Text, Button, Modifier, Color, Dp, run_app
+
+
+frozen data class Theme:
+    primary: Color
+    on_primary: Color
+    spacing: Dp
+
+
+let LIGHT = Theme("#3366ff", "#ffffff", 8)      # literals convert through `Color.__of__` / `Dp.__of__`
+let DARK = Theme("#99bbff", "#000000", 12)
+
+# a runtime ambient: any descendant reads it without explicit threading; reads are tracked,
+# so re-providing a value recomposes exactly the readers below the provider
+let density = ambient(1.0)
+
+
+# a static ambient: `context theme` is filled at every call site by the checker
+# (the IDE shows `Toolbar(⟨theme=theme⟩)`); it costs nothing at runtime and a missing
+# value is a compile error, not a runtime surprise
+@composable
+def PrimaryButton(label: str, on_click: () -> None, context theme: Theme):
+    Button(label, modifier=Modifier().padding(theme.spacing).background(theme.primary), on_click=on_click)
+
+
+@composable
+def Toolbar(on_toggle: () -> None, context theme: Theme):
+    Row(Modifier().background(theme.primary)):
+        Text("themed app", color=theme.on_primary)
+        PrimaryButton("toggle theme", on_click=on_toggle)          # `theme` forwarded implicitly
+
+
+@composable
+def Body():
+    let scale = density.current                                     # runtime ambient read
+    Text(f"density {scale}")
+
+
+@composable
+def App():
+    let dark = state(False)
+    context theme = DARK if dark.value else LIGHT                   # re-declared on every composition
+    Column:
+        Toolbar(on_toggle=lambda: dark.set(not dark.value))
+        Body()
+        provide(density, 2.0):                                      # overrides the ambient for this subtree
+            Body()
+
+
+def main():
+    run_app("theming"):
+        App()

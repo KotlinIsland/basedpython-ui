@@ -1,0 +1,103 @@
+"""Value types: every one of these is a `frozen data class`, so it is deeply
+immutable, hashable and stable — it may be held in state and compared
+structurally when a composable decides whether it can be skipped."""
+
+
+frozen data class Dp:
+    """A density-independent length. `padding(8)` is accepted through `__of__`."""
+
+    value: float
+
+    class def __of__(cls, value: int | float) -> Dp:
+        return Dp(float(value))
+
+    def __add__(self, other: Dp) -> Dp:
+        return Dp(self.value + other.value)
+
+    def __mul__(self, factor: float) -> Dp:
+        return Dp(self.value * factor)
+
+
+let ZERO_DP = Dp(0.0)
+let ONE_DP = Dp(1.0)
+
+
+frozen data class Size:
+    width: float
+    height: float
+
+
+let ZERO_SIZE = Size(0.0, 0.0)
+
+
+frozen data class Offset:
+    x: float
+    y: float
+
+
+frozen data class Rect:
+    x: float
+    y: float
+    width: float
+    height: float
+
+    def contains(self, x: float, y: float) -> bool:
+        return self.x <= x < self.x + self.width and self.y <= y < self.y + self.height
+
+
+frozen data class Constraints:
+    """Layout constraints, passed down; sizes come back up (Flutter / Compose)."""
+
+    min_width: float
+    max_width: float
+    min_height: float
+    max_height: float
+
+    def loose(self) -> Constraints:
+        return Constraints(0.0, self.max_width, 0.0, self.max_height)
+
+    def tight(self, size: Size) -> Constraints:
+        return Constraints(size.width, size.width, size.height, size.height)
+
+    def constrain(self, size: Size) -> Size:
+        return Size(
+            min(max(size.width, self.min_width), self.max_width),
+            min(max(size.height, self.min_height), self.max_height),
+        )
+
+
+frozen data class Color:
+    """An sRGB colour with 8-bit channels. A literal `"#rrggbb"` or
+    `"#rrggbbaa"` is accepted anywhere a `Color` is expected."""
+
+    r: int
+    g: int
+    b: int
+    a: int = 255
+
+    class def __of__(cls, value: str) -> Color:
+        return parse_color(value)
+
+    def argb(self) -> int:
+        return (self.a << 24) | (self.r << 16) | (self.g << 8) | self.b
+
+    def with_alpha(self, alpha: int) -> Color:
+        return Color(self.r, self.g, self.b, alpha)
+
+
+def parse_color(text: str) -> Color raises ValueError:
+    let digits = text.removeprefix("#")
+    match len(digits):
+        case 3:
+            return Color(int(digits[0] * 2, 16), int(digits[1] * 2, 16), int(digits[2] * 2, 16))
+        case 6:
+            return Color(int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16))
+        case 8:
+            return Color(int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16), int(digits[6:8], 16))
+        case _:
+            raise ValueError(f"not a colour: {text!r}")
+
+
+let BLACK = Color(0, 0, 0)
+let WHITE = Color(255, 255, 255)
+let TRANSPARENT = Color(0, 0, 0, 0)

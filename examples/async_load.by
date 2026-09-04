@@ -1,0 +1,65 @@
+import asyncio
+from basedpython_ui import composable, state, launched_effect, disposable_effect, Column, Row, Text, Button, run_app
+
+
+frozen data class User:
+    id: int
+    name: str
+
+
+enum class Load:
+    case Idle
+    case Loading
+    case Ready(user: User)
+    case Failed(reason: str)
+
+
+async def fetch_user(uid: int) -> User raises ValueError:
+    await asyncio.sleep(0.3)
+    if uid % 5 == 0:
+        raise ValueError(f"user {uid} does not exist")
+    return User(uid, f"user-{uid}")
+
+
+@composable
+def Profile(uid: int):
+    let status = state(Load.Idle)
+    # keyed on `uid`: a change cancels the running task and starts a new one; leaving the tree cancels it.
+    # the block awaits, so it is a coroutine; `it` is the Job whose `is_active` flips on cancellation
+    launched_effect(uid):
+        status.value = Load.Loading                    # writes from an effect run between frames: fine
+        try:
+            let fetched = await fetch_user(uid)
+            if it.is_active:
+                status.value = Load.Ready(fetched)
+        except ValueError as e:
+            status.value = Load.Failed(str(e))
+    disposable_effect(uid):
+        it.on_dispose(lambda: print("profile", uid, "left the tree"))
+    match status.value:                                # exhaustive over the enum
+        case Load.Idle:
+            Text("…")
+        case Load.Loading:
+            Text(f"loading user {uid}")
+        case Load.Ready(user):
+            Text(f"hello, {user.name}")
+        case Load.Failed(reason):
+            Text(f"error: {reason}", color="#cc0000")
+
+
+@composable
+def App():
+    let uid = state(1)
+    Column:
+        Row:
+            Button("previous", enabled=uid.value > 1):
+                uid.value -= 1
+            Text(f"#{uid.value}")
+            Button("next"):
+                uid.value += 1
+        Profile(uid.value)
+
+
+def main():
+    run_app("async loading"):
+        App()

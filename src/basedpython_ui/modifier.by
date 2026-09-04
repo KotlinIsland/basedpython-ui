@@ -1,0 +1,74 @@
+"""Modifiers: an immutable, ordered chain of layout / draw / input operations
+(Compose's `Modifier`). Chains are values — equal chains compare equal, so a
+composable receiving the same chain twice can be skipped."""
+
+from .geometry import Dp, Color, ZERO_DP, BLACK
+
+
+enum class Alignment:
+    case Start, Center, End
+
+
+enum class Arrangement:
+    case Start, Center, End, SpaceBetween, SpaceEvenly
+
+
+frozen data class TextStyle:
+    size: Dp = Dp(14.0)
+    color: Color = Color(32, 32, 32)
+    bold: bool = False
+
+
+let DEFAULT_TEXT_STYLE = TextStyle()
+
+
+enum class ModOp:
+    case Padding(left: Dp, top: Dp, right: Dp, bottom: Dp)
+    case Width(value: Dp)
+    case Height(value: Dp)
+    case FillMaxWidth
+    case FillMaxHeight
+    case Background(color: Color)
+    case Weight(value: float)
+    case Align(alignment: Alignment)
+    case Clickable(on_click: () -> None)
+
+
+frozen data class Modifier:
+    ops: tuple[ModOp, ...] = ()
+
+    def then(self, op: ModOp) -> Modifier:
+        return Modifier(self.ops + (op,))
+
+    def padding(self, all: Dp) -> Modifier:
+        return self.then(ModOp.Padding(all, all, all, all))
+
+    def padding_hv(self, horizontal: Dp, vertical: Dp) -> Modifier:
+        return self.then(ModOp.Padding(horizontal, vertical, horizontal, vertical))
+
+    def width(self, value: Dp) -> Modifier:
+        return self.then(ModOp.Width(value))
+
+    def height(self, value: Dp) -> Modifier:
+        return self.then(ModOp.Height(value))
+
+    def size(self, width: Dp, height: Dp) -> Modifier:
+        return self.then(ModOp.Width(width)).then(ModOp.Height(height))
+
+    def fill_max_width(self) -> Modifier:
+        return self.then(ModOp.FillMaxWidth)
+
+    def fill_max_height(self) -> Modifier:
+        return self.then(ModOp.FillMaxHeight)
+
+    def fill_max_size(self) -> Modifier:
+        return self.then(ModOp.FillMaxWidth).then(ModOp.FillMaxHeight)
+
+    def background(self, color: Color) -> Modifier:
+        return self.then(ModOp.Background(color))
+
+    def clickable(self, on_click: () -> None) -> Modifier:
+        return self.then(ModOp.Clickable(on_click))
+
+
+let NONE = Modifier()

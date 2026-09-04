@@ -1,0 +1,127 @@
+"""Composition cost in isolation (a null core that only counts records):
+node emission inside few scopes, scope-per-leaf, targeted recomposition and
+the skip path. Run with `by build --soundness none` then
+`.venv/bin/python -m bench.compose_bench` from `out/`."""
+
+import cProfile
+import pstats
+import time
+from array import array
+
+from basedpython_ui import composable, state, Column, Row, Text, Button
+from basedpython_ui.runtime import Runtime
+
+let ROWS = 100
+let COLS = 100
+
+
+class NullCore:
+    init(self):
+        self.records: int = 0
+        self.commits: int = 0
+        self.handlers: dict[str, int] = {}
+        self.strs: list[str] = []
+
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]:
+        self.commits += 1
+        self.records += len(ints) // 8
+        # remember button handlers so the bench can click
+        for i in range(0, len(ints), 8):
+            if ints[i] == 7:
+                self.handlers[strs[ints[i + 2]]] = ints[i + 4]
+        return []
+
+    def layout(self, measure: object): ...
+    def paint(self): ...
+    def canvas_requests(self) -> list[tuple[int, int, float, float]]:
+        return []
+    def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+        return (0.0, 0.0)
+    def place_child(self, index: int, x: float, y: float): ...
+    def hit_test(self, x: float, y: float) -> int:
+        return -1
+    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]:
+        return (kind, x, y, -1, "")
+    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None:
+        return None
+    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None:
+        return None
+    def all_text(self) -> list[str]:
+        return []
+    def field_handler(self, placeholder: str) -> int:
+        return -1
+    def dump(self) -> str:
+        return ""
+    def node_count(self) -> int:
+        return self.records
+
+
+@composable
+def LeafScope(row: int, col: int):
+    Text(f"{row},{col}")
+
+
+@composable
+def LineOfScopes(row: int):
+    Row:
+        for col in range(COLS):
+            LeafScope(row, col)
+
+
+@composable
+def LineOfNodes(row: int):
+    Row:
+        for col in range(COLS):
+            Text(f"{row},{col}")
+
+
+@composable
+def Grid(scopes: bool):
+    let bump = state(0)
+    Column:
+        Text(f"bump {bump.value}")
+        Button("bump"):
+            bump.value += 1
+        for row in range(ROWS):
+            if scopes:
+                LineOfScopes(row)
+            else:
+                LineOfNodes(row)
+
+
+def timed(label: str, fn: () -> None, units: int, unit: str):
+    t = time.perf_counter()
+    fn()
+    dt = time.perf_counter() - t
+    print(f"{label:<52} {dt * 1000:8.2f} ms   {dt / units * 1e9:7.0f} ns per {unit}")
+
+
+def bench(scopes: bool):
+    core = NullCore()
+    rt = Runtime(core)
+    rt.set_root(lambda: Grid(scopes))
+    nodes = ROWS * COLS + ROWS + 2
+    kind = "scope per leaf" if scopes else "nodes in 100 scopes"
+    timed(f"[{kind}] first composition, {nodes} nodes", lambda: rt.frame(), nodes, "node")
+    handler = rt.handlers[core.handlers["bump"]]
+    assert handler is not None
+    handler()
+    timed(f"[{kind}] recompose Grid, skip {ROWS} line scopes", lambda: rt.frame(), ROWS, "skipped scope")
+    for scope in list(rt.scopes.values()):
+        rt.invalidate(scope)
+    timed(f"[{kind}] recompose everything, {nodes} nodes", lambda: rt.frame(), nodes, "node")
+    return rt
+
+
+def main() raises AssertionError:
+    bench(False)
+    rt = bench(True)
+    for scope in list(rt.scopes.values()):
+        rt.invalidate(scope)
+    profiler = cProfile.Profile()
+    profiler.enable()
+    rt.frame()
+    profiler.disable()
+    stats = pstats.Stats(profiler)
+    stats.sort_stats("tottime").print_stats(12)
