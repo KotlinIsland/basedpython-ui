@@ -470,6 +470,84 @@ def test_a_right_click_opens_a_popup_that_is_hit_before_what_it_covers():
     t.dispose()
 
 
+@composable
+def KeyedPopups():
+    """a keyed menu holding a group of its own. the key belongs to the popup: a popup opens a
+    container like every other one, and a key marks a group's own children and nothing nested
+    in them"""
+    let open = state("a")
+    Column(Modifier().size(300, 200)):
+        Text(f"open {open.value}")
+        Button("swap", on_click=lambda: open.set("b" if open.value == "a" else "a"))
+        keyed((open.value,)).each(key=lambda name: name):
+            let name = it
+            Popup(Dp(10.0), Dp(50.0)):
+                Column():
+                    Text(f"{name} first")
+                    Text(f"{name} second")
+
+
+def test_a_keyed_popup_does_not_key_its_own_children():
+    let t = compose_test(width=300, height=200):
+        KeyedPopups()
+    assert t.find_text("a first") and t.find_text("a second"), t.dump()
+    let keyed_lines = [line.strip() for line in t.dump().splitlines() if "key=" in line]
+    assert keyed_lines == ['Popup key="a" [10,50 57x36] at=10,50'], \
+        f"the key is the popup's alone; the group inside it is not keyed:\n{t.dump()}"
+    t.click("swap")
+    t.advance()
+    assert t.find_text("b first") and t.find_text("b second"), t.dump()
+    assert not t.find_text("a first") and not t.find_text("a second"), t.dump()
+    t.dispose()
+
+
+private def chain_of(which: str) -> Modifier:
+    """a chain of `which`, built fresh — the closure inside it is a new object every call,
+    which is exactly the case interning has to survive"""
+    match which:
+        case "clickable":
+            return Modifier().clickable(lambda: None)
+        case "secondary":
+            return Modifier().on_secondary(lambda: None)
+        case "hoverable":
+            return Modifier().hoverable(lambda (over: bool): None)
+        case "draggable":
+            return Modifier().draggable(lambda (phase: str): None)
+        case "dismiss":
+            return Modifier().dismiss(lambda: None)
+        case "drop_target":
+            return Modifier().drop_target(lambda (what: str): None)
+        case _:
+            return Modifier().focus_region(lambda: None)
+
+
+def test_a_chain_carrying_a_handler_is_interned_once_however_often_it_recomposes():
+    """a modifier holding a handler index is interned by its encoded ops: the index is
+    recycled, so the ops repeat where the value — a new closure every recomposition — does
+    not. interning one by value mints an id per frame, here and in the core, and neither
+    table is ever pruned"""
+    for which in ("clickable", "secondary", "hoverable", "draggable", "dismiss", "drop_target", "focus_region"):
+        let name = which
+        let t = compose_test(width=200, height=100):
+            let n = state(0)
+            Column():
+                Text(f"n = {n.value}")
+                Text("marked", chain_of(name))
+                Button("bump", on_click=lambda: n.set(n.value + 1))
+        # a few runs to settle: handler indices are handed back and taken again, so the
+        # first recomposition can pick up a different one and intern a second chain
+        for _ in range(4):
+            t.click("bump")
+            t.advance()
+        let settled = len(t.runtime.modifier_ids)
+        for _ in range(8):
+            t.click("bump")
+            t.advance()
+        let minted = len(t.runtime.modifier_ids) - settled
+        assert minted == 0, f"{name}: {minted} more ids over eight further recompositions"
+        t.dispose()
+
+
 def test_hovering_reports_entering_and_leaving():
     let t = compose_test(width=300, height=200):
         Menus()

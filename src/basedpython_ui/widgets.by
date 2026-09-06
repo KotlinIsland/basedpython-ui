@@ -225,10 +225,14 @@ private def arrangement_code(arrangement: Arrangement) -> int:
 private def intern_modifier(rt: Runtime, modifier: Modifier) -> int:
     if modifier === NONE or not modifier.ops:
         return 0
-    # a clickable carries a handler index that is scope-owned, so the chain is
-    # interned by its encoded ops rather than by the modifier value
+    # a chain carrying a handler index is interned by its encoded ops rather than by its
+    # value: the index is scope-owned and recycled, so the ops are stable across
+    # recompositions where the value — a fresh closure every time — is not. interning one of
+    # these by value mints an id per recomposition, in this table and in the core's, and
+    # neither is ever pruned
     for op in modifier.ops:
-        if op is ModOp.Clickable or op is ModOp.Secondary or op is ModOp.Hoverable or op is ModOp.Drag:
+        if op is ModOp.Clickable or op is ModOp.Secondary or op is ModOp.Hoverable or op is ModOp.Drag \
+                or op is ModOp.Dismiss or op is ModOp.DropTarget or op is ModOp.FocusRegion:
             return rt.modifier_id_for_ops(encode_modifier(modifier, rt))
     return rt.modifier_id(modifier, encode_modifier)
 
@@ -384,7 +388,9 @@ def Popup(x: Dp, y: Dp, modifier: Modifier = NONE, once content: ColumnScope.() 
     rt = composing()
     flags, k = key_flags(rt)
     rt.ints.extend((R_POPUP, flags, -1, optional_modifier(rt, modifier), -1, int(x.value), k, int(y.value)))
+    rt.depth += 1
     content(_COLUMN_SCOPE)
+    rt.depth -= 1
     rt.ints.extend(_END_RECORD)
 
 
