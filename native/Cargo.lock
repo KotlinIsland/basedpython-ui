@@ -56,6 +56,10 @@ name = "basedpython_ui_native"
 version = "0.1.0"
 dependencies = [
  "cosmic-text",
+ "objc2 0.5.2",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
+ "png",
  "pyo3",
  "slotmap",
  "softbuffer",

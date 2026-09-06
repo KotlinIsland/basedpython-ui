@@ -537,10 +537,10 @@ impl Core {
         self.with_state(true, |inner| Ok(input::key_named(inner, name).map(|e| e.tuple())))
     }
 
-    /// The enter / leave events queued by the pointer since the last call: kind 11 tuples
-    /// whose `text` is "1" for an enter and "" for a leave.
-    fn take_hover_events(&self) -> PyResult<Vec<EventTuple>> {
-        self.with_state(true, |inner| Ok(input::take_hover_events(inner).iter().map(|e| e.tuple()).collect()))
+    /// The events the pointer produced since the last call: kind 11 hover enters ("1") and
+    /// leaves (""), and kind 12 drags ("start" / "move" / "end").
+    fn take_events(&self) -> PyResult<Vec<EventTuple>> {
+        self.with_state(true, |inner| Ok(input::take_events(inner).iter().map(|e| e.tuple()).collect()))
     }
 
     /// The `hoverable` handler the pointer is over, or -1.

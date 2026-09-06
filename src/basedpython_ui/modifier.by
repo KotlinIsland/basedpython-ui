@@ -52,6 +52,10 @@ enum class ModOp:
     case Secondary(on_click: () -> None)
     # told when the pointer enters and leaves this layer
     case Hoverable(on_change: (bool) -> None)
+    # the colour of a scroll container's thumb
+    case Scrollbar(color: Color)
+    # told when the pointer is pressed here and dragged, wherever it then goes
+    case Drag(on_drag: (str) -> None)
 
 
 frozen data class Modifier:
@@ -130,6 +134,16 @@ frozen data class Modifier:
         """Called with True when the pointer enters this layer and False when it leaves —
         what a tooltip hangs off. `input_position()` says where the pointer is."""
         return self.then(ModOp.Hoverable(on_change))
+
+    def scrollbar(self, color: Color) -> Modifier:
+        """The colour of this `Scroll`'s thumb, for a theme the default does not suit."""
+        return self.then(ModOp.Scrollbar(color))
+
+    def draggable(self, on_drag: (str) -> None) -> Modifier:
+        """Called with "start", then "move" for every step, then "end". The pointer belongs
+        to this layer for the whole drag, however far it travels, so a handle keeps following
+        it once it has left; `input_position()` says where it is."""
+        return self.then(ModOp.Drag(on_drag))
 
 
 let NONE = Modifier()

@@ -120,12 +120,15 @@ impl Node {
         self.text.as_deref().unwrap_or("")
     }
 
-    /// The handler of the first layer of a kind, as of the last layout.
-    pub fn layer_handler(&self, hoverable: bool) -> i32 {
+    /// The handler of this node's outermost layer of a kind, as of the last layout.
+    pub fn layer_handler(&self, which: crate::input::Which) -> i32 {
+        use crate::input::Which;
         for layer in self.layers.iter().rev() {
-            match layer {
-                Layer::Hoverable { handler, .. } if hoverable => return *handler,
-                Layer::Click { handler, .. } if !hoverable => return *handler,
+            match (which, layer) {
+                (Which::Hover, Layer::Hoverable { handler, .. }) => return *handler,
+                (Which::Primary, Layer::Click { handler, .. }) => return *handler,
+                (Which::Secondary, Layer::Secondary { handler, .. }) => return *handler,
+                (Which::Drag, Layer::Drag { handler, .. }) => return *handler,
                 _ => {}
             }
         }
@@ -179,8 +182,11 @@ pub struct Inner {
     /// scope that recomposes while the pointer rests on it keeps its hover.
     pub hover_node: Option<NodeId>,
     pub hover_target_node: Option<NodeId>,
-    /// The enter / leave events not yet taken.
-    pub hover_pending: Vec<Event>,
+    /// The node a drag started on, while the pointer is still down: until it comes up, every
+    /// move belongs to that node however far the pointer travels.
+    pub drag_node: Option<NodeId>,
+    /// The enter / leave and drag events not yet taken.
+    pub pending_events: Vec<Event>,
     /// commit, layout, paint durations of the last calls, in milliseconds.
     pub timings: [f64; 3],
     pub commit_serial: u32,
@@ -220,7 +226,8 @@ impl Inner {
             reveal_pending: Vec::new(),
             hover_node: None,
             hover_target_node: None,
-            hover_pending: Vec::new(),
+            drag_node: None,
+            pending_events: Vec::new(),
             timings: [0.0; 3],
             commit_serial: 0,
             layout_epoch: 0,
@@ -350,6 +357,9 @@ impl Inner {
             }
             if self.hover_target_node == Some(n) {
                 self.hover_target_node = None;
+            }
+            if self.drag_node == Some(n) {
+                self.drag_node = None;
             }
             self.reveal_pending.retain(|&c| c != n);
             if node.kind == Kind::Popup {

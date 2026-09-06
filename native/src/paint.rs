@@ -26,6 +26,7 @@ const FIELD_BORDER_FOCUS: u32 = 0xFF3B_82F6;
 const FIELD_RADIUS: Corners = Corners::uniform(6.0);
 const PLACEHOLDER: u32 = 0xFF9C_A3AF;
 const ACCENT: u32 = 0xFF3B_82F6;
+/// The thumb's colour when a scroll container does not name one (`Modifier.scrollbar`).
 const SCROLLBAR: u32 = 0x5A00_0000;
 const SCROLLBAR_MIN: f32 = 16.0;
 
@@ -347,6 +348,7 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
 /// A thin thumb at the right edge of a scroll container whose content overflows it.
 fn paint_scrollbar(inner: &Inner, id: NodeId, painter: &mut Painter, clip: &Rect) {
     let node = &inner.nodes[id];
+    let colour = node.modifier.scrollbar.unwrap_or(SCROLLBAR);
     let limit = node.scroll_limit();
     if limit <= 0.0 {
         return;
@@ -359,7 +361,7 @@ fn paint_scrollbar(inner: &Inner, id: NodeId, painter: &mut Painter, clip: &Rect
     let thumb_h = (track * viewport.h / node.content_len).clamp(SCROLLBAR_MIN.min(track), track);
     let thumb_y = viewport.y + SCROLLBAR_INSET + (track - thumb_h) * (node.scroll / limit);
     let rect = Rect::new(viewport.x + viewport.w - SCROLLBAR_WIDTH - SCROLLBAR_INSET, thumb_y, SCROLLBAR_WIDTH, thumb_h);
-    painter.fill_rect(rect, SCROLLBAR, Corners::uniform(SCROLLBAR_WIDTH / 2.0), clip);
+    painter.fill_rect(rect, colour, Corners::uniform(SCROLLBAR_WIDTH / 2.0), clip);
 }
 
 fn paint_canvas_cmd(inner: &mut Inner, painter: &mut Painter, cmd: &CanvasCmd, origin: (f32, f32), clip: &Rect) {

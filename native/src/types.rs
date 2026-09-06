@@ -249,6 +249,11 @@ pub enum ModOp {
     Secondary(i32),
     /// A handler told when the pointer enters and leaves the layer.
     Hoverable(i32),
+    /// The colour of a scroll container's thumb.
+    Scrollbar(u32),
+    /// A handler told when the pointer is pressed on the layer and dragged, wherever it
+    /// then goes: the core holds the pointer for the duration.
+    Drag(i32),
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -260,6 +265,7 @@ pub struct Modifier {
     pub weight: f32,
     pub align: Option<u8>,
     pub hover: Option<u32>,
+    pub scrollbar: Option<u32>,
     pub reveal: bool,
     pub clip: bool,
 }
@@ -272,6 +278,7 @@ impl Modifier {
         let mut weight = 0.0f32;
         let mut align = None;
         let mut hover = None;
+        let mut scrollbar = None;
         let mut reveal = false;
         let mut clip = false;
         while i < raw.len() {
@@ -389,10 +396,22 @@ impl Modifier {
                     ops.push(ModOp::Hoverable(handler_index(a[0], "hoverable")?));
                     i += 2;
                 }
+                x if x == 18.0 => {
+                    let a = take(1)?;
+                    let argb = argb_from_f64(a[0])?;
+                    scrollbar = Some(argb);
+                    ops.push(ModOp::Scrollbar(argb));
+                    i += 2;
+                }
+                x if x == 19.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Drag(handler_index(a[0], "draggable")?));
+                    i += 2;
+                }
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, reveal, clip })
+        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip })
     }
 }
 
@@ -479,6 +498,8 @@ pub enum Layer {
     Secondary { rect: Rect, handler: i32 },
     /// Told when the pointer enters and leaves this rect.
     Hoverable { rect: Rect, handler: i32 },
+    /// Told when the pointer is pressed here and dragged.
+    Drag { rect: Rect, handler: i32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.

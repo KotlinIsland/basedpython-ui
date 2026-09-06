@@ -4,7 +4,7 @@ layout, hit testing and text editing end to end."""
 from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
-    chord_of_text, system_theme, WindowEvents, Popup, input_position,
+    chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -480,4 +480,56 @@ def test_hovering_reports_entering_and_leaving():
     t.advance()
     assert not t.find_text("a tooltip"), "leaving takes it away"
     assert t.hover_target() == -1
+    t.dispose()
+
+
+@composable
+def Splitter():
+    let width = state(120.0)
+    let phase = state("")
+    let start = state(0.0)
+
+    def drag(step: str):
+        if step == "start":
+            start.value = input_position().0 - width.value
+        elif step == "move":
+            width.value = max(40.0, input_position().0 - start.value)
+        phase.value = step
+
+    Column:
+        Text(f"width {int(width.value)} {phase.value}")
+        Row:
+            Spacer(Modifier().width(Dp(width.value)).height(20).background(Color(230, 230, 230)))
+            Text("handle", Modifier().width(10).height(20).draggable(drag))
+
+
+def test_a_drag_follows_the_pointer_and_reports_its_steps():
+    let t = compose_test(width=400, height=200):
+        Splitter()
+    assert t.find_text("width 120 "), t.dump()
+    t.drag("handle", 60.0, 0.0)
+    t.advance()
+    assert t.find_text("width 180 end"), f"the handle followed the pointer: {t.dump()}"
+    # dragging back past the minimum stops there
+    t.drag("handle", -400.0, 0.0)
+    t.advance()
+    assert t.find_text("width 40 end"), t.dump()
+    t.dispose()
+
+
+@composable
+def Sized():
+    let size = window_size.value
+    Text(f"window {int(size.0)}x{int(size.1)}")
+
+
+def test_the_window_size_is_state_the_layout_can_read():
+    let t = compose_test(width=640, height=480):
+        Sized()
+    assert t.find_text("window 640x480"), t.dump()
+    let events = WindowEvents()
+    events.runtime = t.runtime
+    events.handle([(5, 900.0, 700.0, -1, "")])
+    t.advance()
+    assert t.find_text("window 900x700"), t.dump()
     t.dispose()

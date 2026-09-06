@@ -13,6 +13,11 @@ from .runtime import Runtime, NativeCore, Task, State, Recomposition
 # compositions leave it at "light" unless a test sets it
 let system_theme: State[str] = State("light")
 
+# the size of the window this composition is in, in logical pixels: set when the window opens
+# and on every resize, and by `compose_test` for a headless one. a layout that has to be
+# decided rather than measured — how wide a resizable pane may be — reads it
+let window_size: State[tuple[float, float]] = State((0.0, 0.0))
+
 
 private def load_native() -> dynamic raises ImportError:
     from . import _native   # the rust core; a typed stub sits beside it
@@ -77,6 +82,9 @@ class WindowEvents:
             if kind == 8:
                 system_theme.value = text
                 continue
+            if kind == 5:
+                window_size.value = (x, y)
+                continue
             if runtime is None:
                 continue
             match kind:
@@ -101,16 +109,21 @@ class WindowEvents:
                     self.pressed_secondary = -1
                 case 11:
                     runtime.dispatch(handler_idx, text == "1", "", (x, y))
+                case 12:
+                    runtime.dispatch(handler_idx, text, "", (x, y))
                 case _:
                     pass
 
 
-def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, trace: bool = True, root: () -> None) raises ...:
+def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, icon: bytes? = None, trace: bool = True, root: () -> None) raises ...:
     """Open a window, compose `root` into it and drive frames until the
     window closes. Owns the main thread (the window system requires it).
-    `trace=False` turns the recomposition trace off for this runtime."""
+
+    `icon` is an 8-bit rgba png: the window's icon where the platform has one, and the
+    application's icon (the dock) on macos. `trace=False` turns the recomposition trace
+    off for this runtime."""
     native = load_native()
-    window = native.Window(title, float(width), float(height))
+    window = native.Window(title, float(width), float(height), icon)
     tasks = _TaskThread()
     events = WindowEvents()
     measure: object = None
@@ -181,7 +194,7 @@ class TestComposition:
         cx, cy = self._centre(label)
         down = self.core.pointer(1, cx, cy)
         up = self.core.pointer(2, cx, cy)
-        self._deliver_hover()
+        self._deliver()
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
             raise AssertionError(f"{label!r} is not clickable; tree:\n{self.dump()}")
@@ -192,16 +205,29 @@ class TestComposition:
         cx, cy = self._centre(label)
         down = self.core.pointer(9, cx, cy)
         up = self.core.pointer(10, cx, cy)
-        self._deliver_hover()
+        self._deliver()
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
             raise AssertionError(f"{label!r} offers no menu; tree:\n{self.dump()}")
         self.runtime.dispatch(handler_idx, None, "", (cx, cy))
 
-    def _deliver_hover(self):
-        """Dispatch the enter / leave events the last pointer move produced."""
-        for kind, x, y, handler_idx, text in self.core.take_hover_events():
-            self.runtime.dispatch(handler_idx, text == "1", "", (x, y))
+    def _deliver(self):
+        """Dispatch what the last pointer event produced: hover enters and leaves, and the
+        steps of a drag."""
+        for kind, x, y, handler_idx, text in self.core.take_events():
+            self.runtime.dispatch(handler_idx, text == "1" if kind == 11 else text, "", (x, y))
+
+    def drag(self, label: str, dx: float, dy: float, steps: int = 2):
+        """Press the node showing `label`, move by `(dx, dy)` and release: the whole drag,
+        through the same capture a window goes through."""
+        cx, cy = self._centre(label)
+        self.core.pointer(1, cx, cy)
+        self._deliver()
+        for step in range(1, steps + 1):
+            self.core.pointer(3, cx + dx * step / steps, cy + dy * step / steps)
+            self._deliver()
+        self.core.pointer(2, cx + dx, cy + dy)
+        self._deliver()
 
     def press(self, chord: str) -> bool:
         """Offer a key chord ("cmd+x", "down", "shift+up", "enter") to the composition's
@@ -213,12 +239,12 @@ class TestComposition:
         that produces."""
         cx, cy = self._centre(label)
         self.core.pointer(3, cx, cy)
-        self._deliver_hover()
+        self._deliver()
 
     def hover_at(self, x: float, y: float):
         """Move the pointer to a point rather than to a node — how a hover is ended."""
         self.core.pointer(3, x, y)
-        self._deliver_hover()
+        self._deliver()
 
     def hover_target(self) -> int:
         return self.core.hover_target()
@@ -282,6 +308,7 @@ class TestComposition:
 
 def compose_test(width: int = 400, height: int = 300, trace: bool = True, root: () -> None) -> TestComposition raises ...:
     native = load_native()
+    window_size.value = (float(width), float(height))
     core: NativeCore = native.Core(float(width), float(height), 1.0)
     rt = Runtime(core, trace=trace)
     t = TestComposition(rt, core)

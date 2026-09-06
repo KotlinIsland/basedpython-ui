@@ -17,7 +17,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Theme, Window as WinitWindow, WindowId};
+use winit::window::{Icon, Theme, Window as WinitWindow, WindowId};
 
 use crate::input::{
     self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, EV_SECONDARY_DOWN,
@@ -41,23 +41,78 @@ thread_local! {
     static RAN: RefCell<HashMap<u64, ()>> = RefCell::new(HashMap::new());
 }
 
+/// The application's icon, as a png. The window system wants it in two places: the window
+/// itself (windows, x11) and the application (the dock, on macos).
+struct AppIcon {
+    png: Vec<u8>,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl AppIcon {
+    fn decode(png: Vec<u8>) -> Result<AppIcon, String> {
+        let decoder = png::Decoder::new(std::io::Cursor::new(png.as_slice()));
+        let mut reader = decoder.read_info().map_err(|e| format!("the icon is not a readable png: {}", e))?;
+        let mut buffer = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+        let info = reader.next_frame(&mut buffer).map_err(|e| format!("the icon could not be decoded: {}", e))?;
+        if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+            return Err("the icon must be an 8-bit rgba png".to_string());
+        }
+        buffer.truncate(info.buffer_size());
+        Ok(AppIcon { png, rgba: buffer, width: info.width, height: info.height })
+    }
+
+    fn window_icon(&self) -> Option<Icon> {
+        Icon::from_rgba(self.rgba.clone(), self.width, self.height).ok()
+    }
+}
+
+/// The dock icon is the *application's*, so winit's per-window icon (a no-op here) is not
+/// what shows: AppKit is asked directly, once the event loop is running on the main thread.
+#[cfg(target_os = "macos")]
+fn set_application_icon(icon: &AppIcon) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(&icon.png);
+    // SAFETY: an NSImage built from png bytes, handed to the shared application on the main
+    // thread — both are what these methods are for, and neither escapes this call
+    unsafe {
+        if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+            NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_application_icon(_icon: &AppIcon) {}
+
 #[pyclass(name = "Window", module = "basedpython_ui._native")]
 pub struct Window {
     id: u64,
     title: String,
     width: f64,
     height: f64,
+    icon: Option<AppIcon>,
     proxy: Mutex<Option<EventLoopProxy<UserEvent>>>,
 }
 
 #[pymethods]
 impl Window {
     #[new]
-    fn new(title: String, width: f64, height: f64) -> PyResult<Window> {
+    #[pyo3(signature = (title, width, height, icon = None))]
+    fn new(title: String, width: f64, height: f64, icon: Option<Vec<u8>>) -> PyResult<Window> {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Err(PyValueError::new_err("width and height must be positive"));
         }
-        Ok(Window { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), title, width, height, proxy: Mutex::new(None) })
+        let icon = match icon {
+            Some(png) => Some(AppIcon::decode(png).map_err(PyValueError::new_err)?),
+            None => None,
+        };
+        Ok(Window { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), title, width, height, icon, proxy: Mutex::new(None) })
     }
 
     /// Run the event loop until the window closes. `on_events(events)` receives pending input
@@ -81,7 +136,10 @@ impl Window {
                 if let Ok(mut p) = self.proxy.lock() {
                     *p = Some(event_loop.create_proxy());
                 }
-                let mut app = App::new(self.title.clone(), self.width, self.height, on_frame, on_events);
+                if let Some(icon) = &self.icon {
+                    set_application_icon(icon);
+                }
+                let mut app = App::new(self.title.clone(), self.width, self.height, self.icon.as_ref().and_then(|i| i.window_icon()), on_frame, on_events);
                 let run = event_loop.run_app(&mut app);
                 if let Ok(mut p) = self.proxy.lock() {
                     *p = None;
@@ -135,6 +193,7 @@ struct App {
     title: String,
     width: f64,
     height: f64,
+    icon: Option<Icon>,
     on_frame: Py<PyAny>,
     on_events: Py<PyAny>,
     window: Option<Arc<WinitWindow>>,
@@ -148,11 +207,12 @@ struct App {
 }
 
 impl App {
-    fn new(title: String, width: f64, height: f64, on_frame: Py<PyAny>, on_events: Py<PyAny>) -> App {
+    fn new(title: String, width: f64, height: f64, icon: Option<Icon>, on_frame: Py<PyAny>, on_events: Py<PyAny>) -> App {
         App {
             title,
             width,
             height,
+            icon,
             on_frame,
             on_events,
             window: None,
@@ -184,9 +244,9 @@ impl App {
         }
     }
 
-    /// Queue the enter / leave events the last pointer event produced.
+    /// Queue the hover and drag events the last pointer event produced.
     fn push_hover(&mut self) {
-        if let Ok(events) = self.with_core(input::take_hover_events) {
+        if let Ok(events) = self.with_core(input::take_events) {
             for ev in events {
                 self.push(ev);
             }
@@ -413,6 +473,7 @@ impl ApplicationHandler<UserEvent> for App {
         event_loop.set_control_flow(ControlFlow::Wait);
         let attrs = WinitWindow::default_attributes()
             .with_title(self.title.clone())
+            .with_window_icon(self.icon.clone())
             .with_inner_size(LogicalSize::new(self.width, self.height));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),

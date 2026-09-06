@@ -63,7 +63,7 @@ class NullCore:
         return -1
     def hover_target(self) -> int:
         return -1
-    def take_hover_events(self) -> list[tuple[int, float, float, int, str]]:
+    def take_events(self) -> list[tuple[int, float, float, int, str]]:
         return []
     def first_scroll(self) -> tuple[int, float, float, float] | None:
         return None

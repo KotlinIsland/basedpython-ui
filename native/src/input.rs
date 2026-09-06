@@ -21,6 +21,9 @@ pub const EV_SECONDARY_UP: i32 = 10;
 /// The pointer entered (`text` = "1") or left (`text` = "") a node carrying a `hoverable`
 /// modifier; `handler` is that handler, `x` / `y` where the pointer is.
 pub const EV_HOVER: i32 = 11;
+/// A drag on a node carrying a `draggable` modifier: `text` is "start", "move" or "end",
+/// `x` / `y` where the pointer is, `handler` that node's drag handler.
+pub const EV_DRAG: i32 = 12;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;
@@ -53,6 +56,8 @@ pub enum Which {
     Secondary,
     /// `hoverable` layers only.
     Hover,
+    /// `draggable` layers only.
+    Drag,
 }
 
 /// The result of a hit test.
@@ -140,6 +145,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
                 (Which::Primary, Layer::Click { rect, handler, .. }) => Some((rect, *handler)),
                 (Which::Secondary, Layer::Secondary { rect, handler }) => Some((rect, *handler)),
                 (Which::Hover, Layer::Hoverable { rect, handler }) => Some((rect, *handler)),
+                (Which::Drag, Layer::Drag { rect, handler }) => Some((rect, *handler)),
                 _ => None,
             };
             if let Some((rect, handler)) = found {
@@ -157,8 +163,11 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
 /// hover paint and for the enter / leave events `take_hover_events` hands back.
 pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
     let secondary = kind == EV_SECONDARY_DOWN || kind == EV_SECONDARY_UP;
+    // a drag owns the pointer while it lasts, so the press that started it, the moves and
+    // the release are the drag's rather than anything else's
+    let dragging = !secondary && update_drag(inner, kind, x, y);
     let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
-    if kind == EV_POINTER_DOWN {
+    if kind == EV_POINTER_DOWN && !dragging {
         match hit.focus {
             Some(field) => focus_field(inner, field),
             None => inner.focus = None,
@@ -168,17 +177,63 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
         inner.hover_node = hit.node;
     }
     update_hover_target(inner, x, y);
-    Event::new(kind, x, y, hit.handler, String::new())
+    Event::new(kind, x, y, if dragging { -1 } else { hit.handler }, String::new())
+}
+
+/// Start, continue or end a drag. A press over a `draggable` layer takes the pointer: until
+/// it comes up every move belongs to that node, wherever it has moved to — which is what
+/// lets a splitter follow the pointer past its own few pixels.
+fn update_drag(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
+    match kind {
+        EV_POINTER_DOWN => {
+            let hit = hit_for(inner, x, y, Which::Drag);
+            match (hit.node, hit.handler >= 0) {
+                (Some(node), true) => {
+                    inner.drag_node = Some(node);
+                    inner.pending_events.push(Event::new(EV_DRAG, x, y, hit.handler, "start".to_string()));
+                    true
+                }
+                _ => false,
+            }
+        }
+        EV_POINTER_MOVE => match dragging_handler(inner) {
+            Some(handler) => {
+                inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "move".to_string()));
+                true
+            }
+            None => false,
+        },
+        EV_POINTER_UP => {
+            let handler = dragging_handler(inner);
+            let dragging = inner.drag_node.is_some();
+            if let Some(handler) = handler {
+                inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "end".to_string()));
+            }
+            inner.drag_node = None;
+            dragging
+        }
+        _ => false,
+    }
+}
+
+fn dragging_handler(inner: &Inner) -> Option<i32> {
+    let node = inner.drag_node?;
+    let handler = inner.nodes.get(node)?.layer_handler(Which::Drag);
+    if handler >= 0 {
+        Some(handler)
+    } else {
+        None
+    }
 }
 
 /// The `hoverable` handler of a node as of the last layout, or -1.
 fn hover_handler_of(inner: &Inner, node: Option<NodeId>) -> i32 {
-    node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(true)).unwrap_or(-1)
+    node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(Which::Hover)).unwrap_or(-1)
 }
 
 /// The handler the pointer is over, for the python side (`hovered_handler`).
 pub fn hovered_handler(inner: &Inner) -> i32 {
-    inner.hover_node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(false)).unwrap_or(-1)
+    inner.hover_node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(Which::Primary)).unwrap_or(-1)
 }
 
 /// The `hoverable` handler the pointer is over, or -1.
@@ -198,16 +253,16 @@ pub fn update_hover_target(inner: &mut Inner, x: f32, y: f32) {
     inner.hover_target_node = target;
     let entering = hover_handler_of(inner, target);
     if leaving >= 0 {
-        inner.hover_pending.push(Event::new(EV_HOVER, x, y, leaving, String::new()));
+        inner.pending_events.push(Event::new(EV_HOVER, x, y, leaving, String::new()));
     }
     if entering >= 0 {
-        inner.hover_pending.push(Event::new(EV_HOVER, x, y, entering, "1".to_string()));
+        inner.pending_events.push(Event::new(EV_HOVER, x, y, entering, "1".to_string()));
     }
 }
 
-/// The enter / leave events queued since the last call.
-pub fn take_hover_events(inner: &mut Inner) -> Vec<Event> {
-    std::mem::take(&mut inner.hover_pending)
+/// The hover and drag events queued since the last call.
+pub fn take_events(inner: &mut Inner) -> Vec<Event> {
+    std::mem::take(&mut inner.pending_events)
 }
 
 /// The pointer left the window: nothing is hovered any more.
@@ -216,7 +271,7 @@ pub fn pointer_left(inner: &mut Inner) {
     let leaving = hover_handler_of(inner, inner.hover_target_node);
     inner.hover_target_node = None;
     if leaving >= 0 {
-        inner.hover_pending.push(Event::new(EV_HOVER, 0.0, 0.0, leaving, String::new()));
+        inner.pending_events.push(Event::new(EV_HOVER, 0.0, 0.0, leaving, String::new()));
     }
 }
 
@@ -599,28 +654,74 @@ mod tests {
     #[test]
     fn entering_and_leaving_a_hoverable_is_reported_once_each() {
         let mut inner = popup_tree();
-        assert!(take_hover_events(&mut inner).is_empty());
+        assert!(take_events(&mut inner).is_empty());
         pointer(&mut inner, EV_POINTER_MOVE, 10.0, 10.0);
-        let events = take_hover_events(&mut inner);
+        let events = take_events(&mut inner);
         assert_eq!(events.len(), 1);
         assert_eq!((events[0].kind, events[0].handler, events[0].text.as_str()), (EV_HOVER, 4, "1"));
         assert_eq!(hover_target(&inner), 4);
         // moving within it says nothing more
         pointer(&mut inner, EV_POINTER_MOVE, 12.0, 12.0);
-        assert!(take_hover_events(&mut inner).is_empty());
+        assert!(take_events(&mut inner).is_empty());
         // moving out reports the leave
         pointer(&mut inner, EV_POINTER_MOVE, 150.0, 150.0);
-        let events = take_hover_events(&mut inner);
+        let events = take_events(&mut inner);
         assert_eq!(events.len(), 1);
         assert_eq!((events[0].handler, events[0].text.as_str()), (4, ""));
         assert_eq!(hover_target(&inner), -1);
         // and leaving the window entirely reports it too
         pointer(&mut inner, EV_POINTER_MOVE, 10.0, 10.0);
-        take_hover_events(&mut inner);
+        take_events(&mut inner);
         pointer_left(&mut inner);
-        let events = take_hover_events(&mut inner);
+        let events = take_events(&mut inner);
         assert_eq!(events.len(), 1);
         assert_eq!((events[0].handler, events[0].text.as_str()), (4, ""));
+    }
+
+    #[test]
+    fn a_drag_follows_the_pointer_off_the_node_it_started_on() {
+        let mut inner = Inner::new(200.0, 200.0, 1.0, TextSystem::monospace_only());
+        // a 20x200 draggable strip (handler 7) beside a 180x200 clickable one (handler 1)
+        let mods = vec![
+            (1, vec![2.0, 20.0, 3.0, 200.0, 19.0, 7.0]),
+            (2, vec![2.0, 180.0, 3.0, 200.0, 9.0, 1.0]),
+        ];
+        let ints: Vec<i32> = [
+            [4, 0, -1, 0, -1, 0, 0, 0],
+            [10, 0, -1, 1, -1, 0, 0, 0],
+            [10, 0, -1, 2, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 4)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+
+        // pressing the strip starts a drag rather than a click
+        let down = pointer(&mut inner, EV_POINTER_DOWN, 10.0, 100.0);
+        assert_eq!(down.handler, -1, "the press belongs to the drag, not to a click");
+        let events = take_events(&mut inner);
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind, events[0].handler, events[0].text.as_str()), (EV_DRAG, 7, "start"));
+
+        // the pointer moves far away, over the other strip: the drag still owns it
+        pointer(&mut inner, EV_POINTER_MOVE, 150.0, 40.0);
+        let events = take_events(&mut inner);
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].handler, events[0].text.as_str(), events[0].x), (7, "move", 150.0));
+
+        // and releasing ends it, without clicking what is under the pointer
+        let up = pointer(&mut inner, EV_POINTER_UP, 150.0, 40.0);
+        assert_eq!(up.handler, -1);
+        let events = take_events(&mut inner);
+        assert_eq!((events[0].handler, events[0].text.as_str()), (7, "end"));
+        assert!(inner.drag_node.is_none());
+
+        // afterwards the other strip clicks again
+        assert_eq!(pointer(&mut inner, EV_POINTER_DOWN, 150.0, 40.0).handler, 1);
+        assert!(take_events(&mut inner).is_empty());
     }
 
     #[test]

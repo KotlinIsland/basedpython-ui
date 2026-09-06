@@ -1285,7 +1285,7 @@ protocol NativeCore:
     def hovered_handler(self) -> int
     def first_scroll(self) -> tuple[int, float, float, float] | None
     def resize(self, width: float, height: float, scale: float)
-    def take_hover_events(self) -> list[tuple[int, float, float, int, str]]
+    def take_events(self) -> list[tuple[int, float, float, int, str]]
     def hover_target(self) -> int
 
 

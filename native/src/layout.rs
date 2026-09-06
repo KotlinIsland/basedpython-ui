@@ -287,7 +287,12 @@ fn layout_layer<H: MeasureHost>(
             inner.nodes[id].layers.push(Layer::Hoverable { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
             s
         }
-        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Reveal | ModOp::Clip => {
+        ModOp::Drag(handler) => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Drag { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
+            s
+        }
+        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Scrollbar(_) | ModOp::Reveal | ModOp::Clip => {
             layout_layer(inner, id, m, i + 1, c, origin, corners, host)
         }
     }

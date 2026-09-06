@@ -133,6 +133,10 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((16.0, float(rt.handler(on_click))))
             case ModOp.Hoverable(on_change):
                 ops.extend((17.0, float(rt.handler(on_change))))
+            case ModOp.Scrollbar(color):
+                ops.extend((18.0, float(color.argb())))
+            case ModOp.Drag(on_drag):
+                ops.extend((19.0, float(rt.handler(on_drag))))
     return ops
 
 
@@ -172,9 +176,9 @@ private def intern_modifier(rt: Runtime, modifier: Modifier) -> int:
     # a clickable carries a handler index that is scope-owned, so the chain is
     # interned by its encoded ops rather than by the modifier value
     for op in modifier.ops:
-        if op is ModOp.Clickable or op is ModOp.Secondary or op is ModOp.Hoverable:
+        if op is ModOp.Clickable or op is ModOp.Secondary or op is ModOp.Hoverable or op is ModOp.Drag:
             return rt.modifier_id_for_ops(encode_modifier(modifier, rt))
-    return rt.modifier_id(modifier, _encode_modifier)
+    return rt.modifier_id(modifier, encode_modifier)
 
 
 private def intern_style(rt: Runtime, style: TextStyle) -> int:

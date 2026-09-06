@@ -26,7 +26,10 @@ class Core:
     def last_frame_ms(self) -> tuple[float, float, float]    # commit, layout, paint
 
 class Window:
-    def __new__(cls, title: str, width: float, height: float) -> Window
+    def __new__(cls, title: str, width: float, height: float, icon: bytes | None = None) -> Window
+        # `icon` is an 8-bit rgba png. it becomes the window's icon where the platform has
+        # one, and on macos the *application's* icon (what the dock shows), which is set
+        # through AppKit because it does not belong to a window at all
     def run(self, on_frame, on_events) -> None
         # runs the winit event loop on the calling (main) thread.
         # on_events(events: list[tuple]) is called with pending input events before a frame;
@@ -353,6 +356,8 @@ taller, so the second measuring pass is always the last. `dump()` shows `scroll=
 | 15 clip | | the node's own painting and its children are clipped to the node's rect |
 | 16 secondary | handler index | the right button over this layer |
 | 17 hoverable | handler index | told when the pointer enters and leaves this layer |
+| 18 scrollbar | argb | the colour of this scroll container's thumb (the default is a translucent black) |
+| 19 draggable | handler index | told when the pointer is pressed here and dragged; the core holds the pointer until it comes up |
 
 ### style flags
 
@@ -381,8 +386,16 @@ index.
 a node carrying op 17 also gets **enter / leave events**: when the hovered node changes, the
 core queues a kind-11 event for the node being left (`text` = "") and one for the node being
 entered (`text` = "1"), each carrying that node's current hoverable handler and the pointer
-position. `Core.take_hover_events()` drains the queue (the `Window` does this after every
-pointer event); `Core.hover_target()` is the hoverable handler under the pointer, or -1.
+position. `Core.take_events()` drains the queue (the `Window` does this after every pointer event);
+`Core.hover_target()` is the hoverable handler under the pointer, or -1.
+
+### dragging
+
+a press over an op-19 layer **captures the pointer**: the core remembers the node, and every
+move until the release belongs to it however far the pointer has travelled — which is what a
+splitter needs, since the pointer leaves its few pixels immediately. the captured press, the
+moves and the release are queued as kind-12 events (`text` = "start" / "move" / "end") and the
+ordinary pointer events for them report handler -1, so nothing else reads them as a click.
 
 ### events
 
@@ -399,17 +412,18 @@ pointer event); `Core.hover_target()` is the hoverable handler under the pointer
   falling through buttons, checkboxes and text fields, so a row can offer a menu without every
   widget on it forwarding one. python dispatches on the up when it lands on the same handler
   as the down, exactly as it does for the left button.
-- kind **11** is a hover enter or leave (see above).
+- kind **11** is a hover enter or leave, and kind **12** a drag step (see above).
 - kind **8 THEME**: `(8, 0, 0, -1, "light" | "dark")`, the appearance the window follows,
   sent when the window opens (when the platform reports one) and on every change; the
-  python side keeps it in `basedpython_ui.app.system_theme`, a `State[str]`.
+  python side keeps it in `basedpython_ui.app.system_theme`, a `State[str]`; the resize
+  event (kind 5) likewise reaches `basedpython_ui.app.window_size`, a `State[(w, h)]`.
 
 ### extra `Core` methods
 
 ```
 def hovered_handler(self) -> int
 def hover_target(self) -> int
-def take_hover_events(self) -> list[tuple]                   # kind 11 events since the last call
+def take_events(self) -> list[tuple]                         # kind 11 and 12 events since the last call
 def scroll(self, x: float, y: float, dy: float) -> bool
 def scroll_offset(self, node_id: int) -> float | None          # SCROLL nodes only
 def first_scroll(self) -> tuple[int, float, float, float] | None   # (node id, offset, content, viewport), tests

@@ -33,14 +33,14 @@ class Core:
     def focused_handler(self) -> int
     def hovered_handler(self) -> int
     def hover_target(self) -> int
-    def take_hover_events(self) -> list[tuple[int, float, float, int, str]]
+    def take_events(self) -> list[tuple[int, float, float, int, str]]
     def scroll(self, x: float, y: float, dy: float) -> bool
     def scroll_offset(self, node_id: int) -> float | None
     def first_scroll(self) -> tuple[int, float, float, float] | None
 
 
 class Window:
-    def __init__(self, title: str, width: float, height: float)
+    def __init__(self, title: str, width: float, height: float, icon: bytes? = None)
     def run(self, on_frame: (Core) -> bool, on_events: (list[(int, float, float, int, str)]) -> None)
     def request_frame(self)
     def close(self)
