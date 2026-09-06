@@ -6,6 +6,7 @@ from basedpython_ui import (
     MeasureScope, Constraints, Size, compose_test,
 )
 from basedpython_ui.geometry import Dp, Color
+from basedpython_ui.runtime import live_runtimes
 
 
 @composable
@@ -101,4 +102,65 @@ def test_custom_layout_and_canvas_run_through_the_core():
         Custom()
     assert t.find_text("one") and t.find_text("two"), t.dump()
     assert "canvas" in t.dump().lower(), t.dump()
+    t.dispose()
+
+
+private def line_of_text(path: str, needle: str) -> int:
+    """The 1-based line of the one line containing `needle` in the file at `path`."""
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    hits = [index + 1 for index, line in enumerate(lines) if needle in line]
+    assert len(hits) == 1, f"{needle!r} must appear exactly once in {path}, found it on lines {hits}"
+    return hits[0]
+
+
+def test_why_explains_the_counter_recomposition():
+    let t = compose_test:
+        Counter(step=2)
+    runtime = t.runtime
+    assert any(other === runtime for other in live_runtimes)
+    t.click("+")
+    t.advance()
+    runs = t.why(Counter)
+    assert [run.origin for run in runs] == ["first", "self"]
+    reruns = [run for run in runs if run.origin != "first"]
+    assert len(reruns) == 1 and len(reruns[0].causes) == 1
+    run = reruns[0]
+    cause = run.causes[0]
+    assert cause.kind == "state" and cause.name == "count" and cause.old == 0 and cause.new == 2 and not cause.posted
+    raw: dynamic = cause.raw
+    generated: dynamic = run.raw[5]
+    # the needles are spelled in two parts so that these lines do not match themselves
+    assert raw[10] == generated and raw[11] == line_of_text(generated, "count.value" + " += step")
+    by_file = cause.file
+    by_line = cause.line
+    assert by_file is not None and by_line is not None and by_file.endswith("tests/test_harness.by")
+    # the .by line comes from out/_by_sourcemap.py: the lines of a hoisted handler block map
+    # back to the handler's own lines, so the write is located on the line that wrote it
+    assert by_line == line_of_text(by_file, "count.value" + " += step")
+    # `co_firstlineno` of a decorated function is the line of its first decorator
+    assert run.defined[0] == by_file and run.defined[1] == line_of_text(by_file, "def Counter" + "(step: int = 1):") - 1
+    text = t.explain(since_frame=runtime.frames - 1)
+    assert "count (state) set 0 → 2 at " in text and "Counter#" in text
+    t.dispose()
+    assert all(other !== runtime for other in live_runtimes)
+
+
+def test_compose_test_is_a_context_manager():
+    with compose_test(root=Counter) as t:
+        runtime = t.runtime
+        assert any(other === runtime for other in live_runtimes)
+        t.click("+")
+        t.advance()
+        assert t.find_text("count = 1"), t.dump()
+    assert all(other !== runtime for other in live_runtimes), "leaving the block disposed it"
+
+
+def test_compose_test_without_tracing():
+    let t = compose_test(trace=False):
+        Counter(step=2)
+    t.click("+")
+    t.advance()
+    assert t.find_text("count = 2"), t.dump()
+    assert t.why(Counter) == () and t.runtime.trace is None
     t.dispose()

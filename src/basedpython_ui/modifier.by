@@ -35,7 +35,7 @@ enum class ModOp:
 
 
 frozen data class Modifier:
-    ops: tuple[ModOp, ...] = ()
+    ops: (*: ModOp) = ()
 
     def then(self, op: ModOp) -> Modifier:
         return Modifier(self.ops + (op,))

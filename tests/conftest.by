@@ -1,0 +1,25 @@
+"""Fixtures shared by the suite: every runtime a test leaves behind is disposed
+after it, and the suite ends with `live_runtimes` empty."""
+
+import pytest
+
+from basedpython_ui.runtime import live_runtimes
+
+
+@pytest.fixture(autouse=True)
+def disposed_runtimes():
+    """Dispose the runtimes a test made and did not dispose itself (the
+    `compose()` helpers hand their runtime back undisposed), so
+    `live_runtimes` never accumulates across the suite."""
+    before = len(live_runtimes)
+    yield
+    for runtime in list(live_runtimes[before:]):
+        runtime.dispose()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def every_runtime_disposed():
+    """`live_runtimes` holds strong references by contract: at the end of the
+    suite nothing may be left in it."""
+    yield
+    assert live_runtimes == [], f"runtimes left alive at the end of the suite: {live_runtimes}"

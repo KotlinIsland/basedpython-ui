@@ -1,10 +1,13 @@
 """Composition cost in isolation (a null core that only counts records):
 node emission inside few scopes, scope-per-leaf, targeted recomposition and
 the skip path. Run with `by build --soundness none` then
-`.venv/bin/python -m bench.compose_bench` from `out/`."""
+`.venv/bin/python -m bench.compose_bench [on|off|both]` from `out/`: the
+argument chooses whether the runtime's trace is on, off, or measured both
+ways (the default). Each mode ends with a profile of a full recomposition."""
 
 import cProfile
 import pstats
+import sys
 import time
 from array import array
 
@@ -22,7 +25,7 @@ class NullCore:
         self.handlers: dict[str, int] = {}
         self.strs: list[str] = []
 
-    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]:
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[(int, int, int)], new_modifiers: list[(int, list[float])], new_styles: list[(int, float, float, int)]) -> list[int]:
         self.commits += 1
         self.records += len(ints) // 8
         # remember button handlers so the bench can click
@@ -33,19 +36,21 @@ class NullCore:
 
     def layout(self, measure: object): ...
     def paint(self): ...
-    def canvas_requests(self) -> list[tuple[int, int, float, float]]:
+    def canvas_requests(self) -> list[(int, int, float, float)]:
         return []
     def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
-    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> (float, float):
         return (0.0, 0.0)
     def place_child(self, index: int, x: float, y: float): ...
     def hit_test(self, x: float, y: float) -> int:
         return -1
-    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]:
+    @ignorable_return_value
+    def pointer(self, kind: int, x: float, y: float) -> (int, float, float, int, str):
         return (kind, x, y, -1, "")
-    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None:
+    @ignorable_return_value
+    def key_text(self, text: str) -> (int, float, float, int, str)?:
         return None
-    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None:
+    def find_text(self, text: str) -> (int, float, float, float, float)?:
         return None
     def all_text(self) -> list[str]:
         return []
@@ -97,16 +102,16 @@ def timed(label: str, fn: () -> None, units: int, unit: str):
     print(f"{label:<52} {dt * 1000:8.2f} ms   {dt / units * 1e9:7.0f} ns per {unit}")
 
 
-def bench(scopes: bool):
+def bench(scopes: bool, trace: bool) -> Runtime:
     core = NullCore()
-    rt = Runtime(core)
+    rt = Runtime(core, trace=trace)
     rt.set_root(lambda: Grid(scopes))
     nodes = ROWS * COLS + ROWS + 2
     kind = "scope per leaf" if scopes else "nodes in 100 scopes"
     timed(f"[{kind}] first composition, {nodes} nodes", lambda: rt.frame(), nodes, "node")
     handler = rt.handlers[core.handlers["bump"]]
     assert handler is not None
-    handler()
+    _ = handler()
     timed(f"[{kind}] recompose Grid, skip {ROWS} line scopes", lambda: rt.frame(), ROWS, "skipped scope")
     for scope in list(rt.scopes.values()):
         rt.invalidate(scope)
@@ -114,9 +119,7 @@ def bench(scopes: bool):
     return rt
 
 
-def main() raises AssertionError:
-    bench(False)
-    rt = bench(True)
+def profile_full_recomposition(rt: Runtime):
     for scope in list(rt.scopes.values()):
         rt.invalidate(scope)
     profiler = cProfile.Profile()
@@ -124,4 +127,20 @@ def main() raises AssertionError:
     rt.frame()
     profiler.disable()
     stats = pstats.Stats(profiler)
-    stats.sort_stats("tottime").print_stats(12)
+    _ = stats.sort_stats("tottime").print_stats(12)
+
+
+def main() raises AssertionError:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "both"
+    if mode not in ("on", "off", "both"):
+        print(f"usage: python -m bench.compose_bench [on|off|both], not {mode!r}")
+        return
+    modes = (False, True) if mode == "both" else (mode == "on",)
+    for trace in modes:
+        print(f"=== trace {'on' if trace else 'off'}")
+        # a runtime stays registered in `live_runtimes` until disposed; leaving
+        # 10k scopes alive would tax every later measurement's garbage collection
+        bench(False, trace).dispose()
+        rt = bench(True, trace)
+        profile_full_recomposition(rt)
+        rt.dispose()

@@ -1,4 +1,3 @@
-from basedpython_ui.app import f
 from basedpython_ui import (
     composable, state, state_list, derived, Column, Row, Text, Button, Checkbox, TextField, Modifier, run_app,
 )

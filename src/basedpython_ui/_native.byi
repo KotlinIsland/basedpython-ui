@@ -5,33 +5,36 @@ from array import array
 
 class Core:
     def __init__(self, width: float, height: float, scale: float = 1.0)
-    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[(int, int, int)], new_modifiers: list[(int, list[float])], new_styles: list[(int, float, float, int)]) -> list[int]
     def layout(self, measure: object = None)
     def paint(self)
     def resize(self, width: float, height: float, scale: float)
-    def canvas_requests(self) -> list[tuple[int, int, float, float]]
+    def canvas_requests(self) -> list[(int, int, float, float)]
     def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str])
-    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> (float, float)
     def place_child(self, index: int, x: float, y: float)
     def hit_test(self, x: float, y: float) -> int
-    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None
+    def find_text(self, text: str) -> (int, float, float, float, float)?
     def all_text(self) -> list[str]
     def field_handler(self, placeholder: str) -> int
-    def node_rect(self, node_id: int) -> tuple[float, float, float, float] | None
+    def node_rect(self, node_id: int) -> (float, float, float, float)?
     def dump(self) -> str
     def node_count(self) -> int
     def pixels(self) -> bytes
-    def last_frame_ms(self) -> tuple[float, float, float]
-    def size(self) -> tuple[float, float, float]
-    def pixel_size(self) -> tuple[int, int]
-    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]
-    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None
-    def key_named(self, name: str) -> tuple[int, float, float, int, str] | None
+    def last_frame_ms(self) -> (float, float, float)
+    def size(self) -> (float, float, float)
+    def pixel_size(self) -> (int, int)
+    @ignorable_return_value
+    def pointer(self, kind: int, x: float, y: float) -> (int, float, float, int, str)
+    @ignorable_return_value
+    def key_text(self, text: str) -> (int, float, float, int, str)?
+    @ignorable_return_value
+    def key_named(self, name: str) -> (int, float, float, int, str)?
     def focused_handler(self) -> int
 
 
 class Window:
     def __init__(self, title: str, width: float, height: float)
-    def run(self, on_frame: (Core) -> bool, on_events: (list[tuple[int, float, float, int, str]]) -> None)
+    def run(self, on_frame: (Core) -> bool, on_events: (list[(int, float, float, int, str)]) -> None)
     def request_frame(self)
     def close(self)

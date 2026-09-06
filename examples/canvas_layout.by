@@ -24,7 +24,7 @@ def flow_measure(scope: MeasureScope, constraints: Constraints) -> Size:
 
 
 @composable
-def FlowRow(labels: tuple[str, ...]):
+def FlowRow(labels: (*: str)):
     Layout(flow_measure, Modifier().fill_max_width()):
         keyed(labels).each(key=lambda s: s):
             Text(it, Modifier().padding(4))

@@ -10,7 +10,7 @@ from . import modifier as _modifier
 from . import runtime as _runtime
 from .geometry import Dp, Size, Constraints, Color, ONE_DP
 from .modifier import Modifier, ModOp, Alignment, Arrangement, TextStyle
-from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError
+from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError, builder
 
 # imports are lazy proxies; the values used on every builder call are bound
 # to the real objects once, here, so a record never carries a proxy
@@ -73,7 +73,7 @@ class DrawScope:
     def text(self, text: str, x: float, y: float, style: TextStyle = DEFAULT_TEXT_STYLE):
         idx = len(self.recorder.strs)
         self.recorder.strs.append(text)
-        self.recorder.floats.extend((4.0, x, y, float(idx), float(_style_id(self.recorder.runtime, style))))
+        self.recorder.floats.extend((4.0, x, y, float(idx), float(intern_style(self.recorder.runtime, style))))
 
 
 class MeasureScope:
@@ -93,7 +93,7 @@ class MeasureScope:
 # ------------------------------------------------------------ encoding
 
 
-def _encode_modifier(modifier: object, rt: Runtime) -> list[float]:
+private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
     ops: list[float] = []
     for op in (modifier cast! Modifier).ops:
         match op:
@@ -112,18 +112,18 @@ def _encode_modifier(modifier: object, rt: Runtime) -> list[float]:
             case ModOp.Weight(value):
                 ops.extend((7.0, value))
             case ModOp.Align(alignment):
-                ops.extend((8.0, float(_alignment_code(alignment))))
+                ops.extend((8.0, float(alignment_code(alignment))))
             case ModOp.Clickable(on_click):
                 ops.extend((9.0, float(rt.handler(on_click))))
     return ops
 
 
-def _encode_style(style: object) -> tuple[float, float, int]:
+private def encode_style(style: object) -> (float, float, int):
     s = style cast! TextStyle
     return (s.size.value, float(s.color.argb()), 1 if s.bold else 0)
 
 
-def _alignment_code(alignment: Alignment) -> int:
+private def alignment_code(alignment: Alignment) -> int:
     match alignment:
         case Alignment.Start:
             return 0
@@ -133,7 +133,7 @@ def _alignment_code(alignment: Alignment) -> int:
             return 2
 
 
-def _arrangement_code(arrangement: Arrangement) -> int:
+private def arrangement_code(arrangement: Arrangement) -> int:
     match arrangement:
         case Arrangement.Start:
             return 0
@@ -147,39 +147,39 @@ def _arrangement_code(arrangement: Arrangement) -> int:
             return 4
 
 
-def _modifier_id(rt: Runtime, modifier: Modifier) -> int:
+private def intern_modifier(rt: Runtime, modifier: Modifier) -> int:
     if modifier === NONE or not modifier.ops:
         return 0
     # a clickable carries a handler index that is scope-owned, so the chain is
     # interned by its encoded ops rather than by the modifier value
     for op in modifier.ops:
         if op is ModOp.Clickable:
-            return rt.modifier_id_for_ops(_encode_modifier(modifier, rt))
-    return rt.modifier_id(modifier, _encode_modifier)
+            return rt.modifier_id_for_ops(encode_modifier(modifier, rt))
+    return rt.modifier_id(modifier, encode_modifier)
 
 
-def _style_id(rt: Runtime, style: TextStyle) -> int:
-    return rt.style_id(style, _encode_style)
+private def intern_style(rt: Runtime, style: TextStyle) -> int:
+    return rt.style_id(style, encode_style)
 
 
-def _composing() -> Runtime raises CompositionError:
+private def composing() -> Runtime raises CompositionError:
     rt = _runtime._current
     if rt is None:
         raise CompositionError("builders only run inside a composable")
     return rt
 
 
-def _key(rt: Runtime) -> tuple[int, int]:
+private def key_flags(rt: Runtime) -> (int, int):
     return rt.current_key_flags() if rt.key_stack else (0, 0)
 
 
-def _text(rt: Runtime, text: str) -> int:
+private def intern_text(rt: Runtime, text: str) -> int:
     idx = rt.str_index.get(text)
     return idx if idx is not None else rt.intern(text)
 
 
-def _mod(rt: Runtime, modifier: Modifier) -> int:
-    return 0 if modifier === NONE else _modifier_id(rt, modifier)
+private def optional_modifier(rt: Runtime, modifier: Modifier) -> int:
+    return 0 if modifier === NONE else intern_modifier(rt, modifier)
 
 
 # ------------------------------------------------------------ builders
@@ -188,81 +188,91 @@ def _mod(rt: Runtime, modifier: Modifier) -> int:
 let _END_RECORD = (R_END, 0, -1, 0, -1, 0, 0, 0)
 
 
+@builder
 def Text(text: str, modifier: Modifier = NONE, style: TextStyle = DEFAULT_TEXT_STYLE, color: Color? = None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
+    rt = composing()
+    flags, k = key_flags(rt)
     if color is not None:
         style = TextStyle(style.size, color, style.bold)
-    rt.ints.extend((R_TEXT, flags, _text(rt, text), _mod(rt, modifier), -1, _style_id(rt, style), k, 0))
+    rt.ints.extend((R_TEXT, flags, intern_text(rt, text), optional_modifier(rt, modifier), -1, intern_style(rt, style), k, 0))
 
 
+@builder
 def Button(label: str, modifier: Modifier = NONE, enabled: bool = True, on_click: () -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_BUTTON, flags, _text(rt, label), _mod(rt, modifier), rt.handler(on_click), 1 if enabled else 0, k, _style_id(rt, DEFAULT_TEXT_STYLE)))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_BUTTON, flags, intern_text(rt, label), optional_modifier(rt, modifier), rt.handler(on_click), 1 if enabled else 0, k, intern_style(rt, DEFAULT_TEXT_STYLE)))
 
 
+@builder
 def TextField(value: str, modifier: Modifier = NONE, placeholder: str = "", on_change: (str) -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_TEXTFIELD, flags, _text(rt, value), _mod(rt, modifier), rt.handler(on_change), 0, _text(rt, placeholder) if placeholder else -1, k))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_TEXTFIELD, flags, intern_text(rt, value), optional_modifier(rt, modifier), rt.handler(on_change), 0, intern_text(rt, placeholder) if placeholder else -1, k))
 
 
+@builder
 def Checkbox(checked: bool, modifier: Modifier = NONE, on_change: (bool) -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
+    rt = composing()
+    flags, k = key_flags(rt)
     # the core reports a click; the toggle is decided here from the committed value
-    rt.ints.extend((R_CHECKBOX, flags, -1, _mod(rt, modifier), rt.handler(lambda: on_change(not checked)), 1 if checked else 0, k, 0))
+    rt.ints.extend((R_CHECKBOX, flags, -1, optional_modifier(rt, modifier), rt.handler(lambda: on_change(not checked)), 1 if checked else 0, k, 0))
 
 
+@builder
 def Spacer(modifier: Modifier = NONE) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_SPACER, flags, -1, _mod(rt, modifier), -1, 0, k, 0))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_SPACER, flags, -1, optional_modifier(rt, modifier), -1, 0, k, 0))
 
 
+@builder
 def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: ColumnScope.() -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_COLUMN, flags, -1, _mod(rt, modifier), -1, _arrangement_code(arrangement), k, 0))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_COLUMN, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
     content(_COLUMN_SCOPE)
     rt.ints.extend(_END_RECORD)
 
 
+@builder
 def Row(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: RowScope.() -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_ROW, flags, -1, _mod(rt, modifier), -1, _arrangement_code(arrangement), k, 0))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_ROW, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
     content(_ROW_SCOPE)
     rt.ints.extend(_END_RECORD)
 
 
+@builder
 def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once content: BoxScope.() -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
-    rt.ints.extend((R_BOX, flags, -1, _mod(rt, modifier), -1, _alignment_code(alignment), k, 0))
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_BOX, flags, -1, optional_modifier(rt, modifier), -1, alignment_code(alignment), k, 0))
     content(_BOX_SCOPE)
     rt.ints.extend(_END_RECORD)
 
 
+@builder
 def Canvas(modifier: Modifier = NONE, on_draw: DrawScope.() -> None) raises ...:
-    rt = _composing()
-    flags, k = _key(rt)
+    rt = composing()
+    flags, k = key_flags(rt)
 
     def draw(recorder: CanvasRecorder):
         on_draw(DrawScope(Size(recorder.width, recorder.height), recorder))
 
-    rt.emit(R_CANVAS, flags, -1, _modifier_id(rt, modifier), rt.handler(draw), 0, k, 0)
+    rt.emit(R_CANVAS, flags, -1, intern_modifier(rt, modifier), rt.handler(draw), 0, k, 0)
 
 
+@builder
 def Layout(measure: (MeasureScope, Constraints) -> Size, modifier: Modifier = NONE, once content: () -> None) raises ...:
-    rt = _composing()
+    rt = composing()
     flags, k = rt.current_key_flags()
 
-    def measure_callback(core: NativeCore, child_count: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+    def measure_callback(core: NativeCore, child_count: int, min_w: float, max_w: float, min_h: float, max_h: float) -> (float, float):
         size = measure(MeasureScope(child_count, core), Constraints(min_w, max_w, min_h, max_h))
         return (size.width, size.height)
 
-    rt.emit(R_LAYOUT, flags, -1, _modifier_id(rt, modifier), rt.handler(measure_callback), 0, k, 0)
+    rt.emit(R_LAYOUT, flags, -1, intern_modifier(rt, modifier), rt.handler(measure_callback), 0, k, 0)
     content()
     rt.end()

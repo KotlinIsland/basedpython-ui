@@ -3,15 +3,18 @@
 Run with `by build --soundness none` then `python3.14 -m pytest out/tests -q`."""
 
 import asyncio
+import sys
+import threading
 from array import array
 
 from basedpython_ui import (
-    composable, state, state_list, derived, key, launched_effect, disposable_effect, ambient, provide,
-    Column, Row, Text, Button, Modifier, StateList, State,
+    composable, state, state_list, state_dict, derived, key, keyed, launched_effect, disposable_effect, side_effect,
+    ambient, provide, Column, Row, Text, Button, Modifier, StateList, StateDict, State, Derived, Job,
 )
 from basedpython_ui.geometry import Dp   # literal conversions need the declaring module
 from basedpython_ui.runtime import (
     Runtime, CompositionError, Handler, R_END, R_SCOPE, R_SCOPE_REF, R_TEXT, R_BUTTON, R_TEXTFIELD, R_COLUMN, R_ROW, R_BOX, R_LAYOUT,
+    Trace, T_RUN, T_WRITE, T_FRAME, T_ERROR, T_REFUSED, live_runtimes, EffectSlot, Restart, SLOT_LAUNCHED,
 )
 
 
@@ -30,27 +33,27 @@ class FakeCore:
     init(self):
         self.groups: dict[int, list[Rec]] = {}
         self.commits: int = 0
-        self.last_ranges: list[tuple[int, int, int]] = []
+        self.last_ranges: list[(int, int, int)] = []
         self.last_refs: int = 0
         self.disposed: list[int] = []
 
-    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[tuple[int, int, int]], new_modifiers: list[tuple[int, list[float]]], new_styles: list[tuple[int, float, float, int]]) -> list[int]:
+    def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[(int, int, int)], new_modifiers: list[(int, list[float])], new_styles: list[(int, float, float, int)]) -> list[int]:
         self.commits += 1
         self.last_ranges = list(ranges)
         self.last_refs = 0
         seen: set[int] = set()
         for scope_id, first, end in ranges:
-            self.groups[scope_id] = self._parse(ints, strs, first, end, seen)
+            self.groups[scope_id] = self.parse(ints, strs, first, end, seen)
         # a group that no range mentions and that nothing references any more is gone
         reachable: set[int] = set()
-        self._reach(0, reachable)
+        self.reach(0, reachable)
         gone = [sid for sid in self.groups if sid not in reachable]
         for sid in gone:
             del self.groups[sid]
         return gone
 
-    def _parse(self, ints: array[int], strs: list[str], first: int, end: int, seen: set[int]) -> list[Rec]:
-        stack: list[tuple[int, list[Rec]]] = [(-1, [])]
+    private def parse(self, ints: array[int], strs: list[str], first: int, end: int, seen: set[int]) -> list[Rec]:
+        stack: list[(int, list[Rec])] = [(-1, [])]
         i = first * 8            # ranges are record indices; records are 8 ints wide
         end_offset = end * 8
         while i < end_offset:
@@ -85,41 +88,43 @@ class FakeCore:
             stack[-1][1].extend(records)
         return stack[0][1]
 
-    def _reach(self, scope_id: int, out: set[int]):
+    private def reach(self, scope_id: int, out: set[int]):
         if scope_id in out:
             return
         out.add(scope_id)
         for rec in self.groups.get(scope_id, []):
             if rec.kind == R_SCOPE_REF:
-                self._reach(rec.a, out)
+                self.reach(rec.a, out)
 
     def records(self) -> list[Rec]:
         flat: list[Rec] = []
-        self._flatten(0, flat)
+        self.flatten(0, flat)
         return flat
 
-    def _flatten(self, scope_id: int, out: list[Rec]):
+    private def flatten(self, scope_id: int, out: list[Rec]):
         for rec in self.groups.get(scope_id, []):
             if rec.kind == R_SCOPE_REF:
-                self._flatten(rec.a, out)
+                self.flatten(rec.a, out)
             else:
                 out.append(rec)
 
     def layout(self, measure: object): ...
     def paint(self): ...
-    def canvas_requests(self) -> list[tuple[int, int, float, float]]:
+    def canvas_requests(self) -> list[(int, int, float, float)]:
         return []
     def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
-    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> tuple[float, float]:
+    def measure_child(self, index: int, min_w: float, max_w: float, min_h: float, max_h: float) -> (float, float):
         return (0.0, 0.0)
     def place_child(self, index: int, x: float, y: float): ...
     def hit_test(self, x: float, y: float) -> int:
         return -1
-    def pointer(self, kind: int, x: float, y: float) -> tuple[int, float, float, int, str]:
+    @ignorable_return_value
+    def pointer(self, kind: int, x: float, y: float) -> (int, float, float, int, str):
         return (kind, x, y, -1, "")
-    def key_text(self, text: str) -> tuple[int, float, float, int, str] | None:
+    @ignorable_return_value
+    def key_text(self, text: str) -> (int, float, float, int, str)?:
         return None
-    def find_text(self, text: str) -> tuple[int, float, float, float, float] | None:
+    def find_text(self, text: str) -> (int, float, float, float, float)?:
         for rec in self.records():
             if rec.text == text:
                 return (0, 0.0, 0.0, 0.0, 0.0)
@@ -143,10 +148,10 @@ class FakeCore:
 def click(rt: Runtime, core: FakeCore, label: str):
     handler = rt.handlers[core.handler_of(label)]
     assert handler is not None
-    handler()
+    _ = handler()
 
 
-def compose(root: () -> None) -> tuple[Runtime, FakeCore]:
+def compose(root: () -> None) -> (Runtime, FakeCore):
     core = FakeCore()
     errors: list[str] = []
     rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error!r}"))
@@ -343,7 +348,7 @@ def test_a_write_during_composition_is_refused_and_the_tree_kept():
 
 def test_state_refuses_a_mutable_value():
     try:
-        State([1, 2])  # ty: ignore[mutable-state-value] -- the runtime half of the rule is under test
+        _ = State([1, 2])  # ty: ignore[mutable-state-value] -- the runtime half of the rule is under test
     except TypeError as error:
         assert "cannot be held in state" in str(error)
     else:
@@ -520,3 +525,1048 @@ def test_concurrent_writes_from_worker_threads_are_never_dropped():
     assert len(items) == threads * per_thread
     assert sorted(items) == list(range(threads * per_thread))
     assert core.all_text() == [f"{threads * per_thread} items"]
+
+
+# ------------------------------------------------------------------- the trace
+
+
+private def trace_of(rt: Runtime) -> Trace:
+    trace = rt.trace
+    assert trace is not None, "tracing is on by default"
+    return trace
+
+
+private def runs_named(rt: Runtime, name: str) -> list[dynamic]:
+    """The run records of every scope called `name`, oldest first."""
+    found: list[dynamic] = []
+    for record in trace_of(rt).records:
+        r: dynamic = record
+        if r[0] == T_RUN and r[4] == name:
+            found.append(r)
+    return found
+
+
+private def reruns_named(rt: Runtime, name: str) -> list[dynamic]:
+    return [r for r in runs_named(rt, name) if r[10] != "first"]
+
+
+private def writes(rt: Runtime) -> list[dynamic]:
+    """The cause of every write record, oldest first."""
+    found: list[dynamic] = []
+    for record in trace_of(rt).records:
+        r: dynamic = record
+        if r[0] == T_WRITE:
+            found.append(r[2])
+    return found
+
+
+private def only(items: list[dynamic]) -> dynamic:
+    assert len(items) == 1, f"expected exactly one, got {items}"
+    return items[0]
+
+
+private def pair(items: list[dynamic]) -> (dynamic, dynamic):
+    assert len(items) == 2, f"expected exactly two, got {items}"
+    return (items[0], items[1])
+
+
+private def records_of_kind(rt: Runtime, kind: int) -> list[dynamic]:
+    found: list[dynamic] = []
+    for record in trace_of(rt).records:
+        r: dynamic = record
+        if r[0] == kind:
+            found.append(r)
+    return found
+
+
+private def line_of_text(path: str, needle: str) -> int:
+    """The 1-based line of the one line containing `needle` in the file at `path`."""
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    hits = [index + 1 for index, line in enumerate(lines) if needle in line]
+    assert len(hits) == 1, f"{needle!r} must appear exactly once in {path}, found it on lines {hits}"
+    return hits[0]
+
+
+def test_trace_state_cause_names_the_cell_and_the_writer():
+    rt, core = compose(lambda: Counter(2))  # ty: ignore[composable-outside-composition] -- the helper forwards the lambda to set_root
+    click(rt, core, "+")
+    rt.frame()
+    first, second = pair(runs_named(rt, "Counter"))
+    assert first[10] == "first" and first[11] == (("created",),)
+    assert second[10] == "self", "popped from the dirty heap"
+    (cause,) = second[11]
+    assert cause[0] == "state" and cause[2] == "state" and cause[3] == "set" and cause[4] is None
+    assert cause[5] == 0 and cause[6] == 2, "old and new"
+    generated = second[5]                       # where Counter is defined: this module, as generated
+    # the needles are spelled in two parts so that these lines do not match themselves
+    assert cause[7] == generated and cause[8] == line_of_text(generated, "count: Final" + " = state(0)")
+    assert cause[9] == "count", "the name the slot was bound to, recovered from the bytecode"
+    assert cause[10] == generated and cause[11] == line_of_text(generated, "count.value" + " += step")
+    assert cause[12] == threading.get_ident() and cause[13] is False and cause[14] == 1
+    assert writes(rt) == [cause], "one write record, carrying the same cause"
+
+
+@composable
+def Triple():
+    let a = state(0)
+    let b = state(0)
+    let c = state(0)
+    Text(f"{a.value} {b.value} {c.value}")
+    Button("all"):
+        a.value += 1
+        b.value += 1
+        c.value += 1
+
+
+def test_trace_three_writes_in_one_handler_are_three_causes_on_one_run():
+    rt, core = compose(Triple)
+    click(rt, core, "all")
+    rt.frame()
+    rerun = only(reruns_named(rt, "Triple"))
+    causes = rerun[11]
+    assert [cause[0] for cause in causes] == ["state", "state", "state"]
+    assert [cause[9] for cause in causes] == ["a", "b", "c"], "in the order the writes happened"
+    assert len(writes(rt)) == 3
+    assert rt.recompositions["Triple"] == 2, "three causes, one recomposition"
+
+
+@composable
+def Shows(step: int):
+    Text(f"shows {step}")
+
+
+@composable
+def Passes():
+    let step = state(0)
+    Column:
+        Shows(step.value)
+        Button("step"):
+            step.value += 1
+
+
+def test_trace_args_cause_names_the_parameter():
+    rt, core = compose(Passes)
+    click(rt, core, "step")
+    rt.frame()
+    rerun = only(reruns_named(rt, "Shows"))
+    assert rerun[10] == "parent"
+    assert rerun[11] == (("args", "step", 0, 1, True),)
+    assert rerun[3] == runs_named(rt, "Passes")[0][2], "its parent is the Passes scope"
+
+
+@composable
+def TakesList(items: list[int]):  # ty: ignore[unstable-parameter] -- deliberate: an unstable argument is never compared
+    Text(f"{len(items)} items")  # ty: ignore[unobservable-dependency] -- deliberate in this test
+
+
+@composable
+def PassesList():
+    let n = state(1)
+    Column:
+        TakesList([1] * n.value)
+        Button("more"):
+            n.value += 1
+
+
+def test_trace_unstable_argument_is_never_compared():
+    rt, core = compose(PassesList)
+    click(rt, core, "more")
+    rt.frame()
+    rerun = only(reruns_named(rt, "TakesList"))
+    (cause,) = rerun[11]
+    assert cause[0] == "args" and cause[1] == "items" and cause[4] is False
+    assert cause[2] == [1] and cause[3] == [1, 1]
+
+
+@composable
+def Frame(once content: () -> None):
+    Column:
+        content()
+
+
+@composable
+def Framed():
+    let n = state(0)
+    Text(f"n {n.value}")
+    Frame:
+        Text("inside")
+    Button("go"):
+        n.value += 1
+
+
+def test_trace_inline_cause():
+    rt, core = compose(Framed)
+    click(rt, core, "go")
+    rt.frame()
+    rerun = only(reruns_named(rt, "Frame"))
+    assert rerun[10] == "parent" and rerun[11] == (("inline",),)
+
+
+@composable
+def Brittle(step: int):
+    if step == 1:
+        raise ValueError("boom")
+    Text(f"brittle {step}")
+
+
+@composable
+def Holder():
+    let step = state(0)
+    Column:
+        Text(f"step {step.value}")
+        Brittle(step.value)
+        Button("next"):
+            step.value += 1
+
+
+def test_trace_error_record_then_recovery_cause():
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: None)
+    rt.set_root(Holder)
+    rt.frame()
+    click(rt, core, "next")
+    rt.frame()
+    click(rt, core, "next")
+    rt.frame()
+    records = trace_of(rt).records
+    error = only(records_of_kind(rt, T_ERROR))
+    brittle = runs_named(rt, "Brittle")
+    assert len(brittle) == 3
+    assert error[1] == 1 and error[2] == brittle[1][2] and error[3] == "Brittle"
+    assert error[4] == "boom" and error[5] is True, "the committed subtree stayed on screen"
+    assert records.index(error) < records.index(brittle[1]), "the error is recorded as it happens, before the run's record"
+    assert brittle[1][11] == (("args", "step", 0, 1, True),)
+    assert brittle[2][11] == (("recovery", "boom"),)
+
+
+@composable
+def BrittleAtFirst(step: int):
+    if step == 0:
+        raise ValueError("boom")
+    Text(f"brittle {step}")
+
+
+@composable
+def HolderAtFirst():
+    let step = state(0)
+    Column:
+        Text(f"step {step.value}")
+        BrittleAtFirst(step.value)
+        Button("next"):
+            step.value += 1
+
+
+def test_trace_a_scope_whose_first_run_raised_recovers_with_a_recovery_cause():
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: None)
+    rt.set_root(HolderAtFirst)
+    rt.frame()
+    click(rt, core, "next")
+    rt.frame()
+    first, second = pair(runs_named(rt, "BrittleAtFirst"))
+    error = only(records_of_kind(rt, T_ERROR))
+    assert error[2] == first[2] and error[5] is False, "nothing of it was on screen"
+    assert first[11] == (("created",),)
+    assert second[10] == "parent" and second[11] == (("recovery", "boom"),), "never committed, but recovery is the reason"
+    assert core.all_text() == ["step 1", "brittle 1", "next"]
+
+
+@composable
+def SkipsThenRaises():
+    let step = state(0)
+    Column:
+        Leaf("kept")
+        Text(f"step {step.value}")
+        if step.value == 1:
+            raise ValueError("after the skip")
+        Button("next"):
+            step.value += 1
+
+
+def test_trace_a_run_that_raises_after_skipping_a_child_reports_no_skips():
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: None)
+    rt.set_root(SkipsThenRaises)
+    rt.frame()
+    click(rt, core, "next")
+    rt.frame()
+    rerun = only(reruns_named(rt, "SkipsThenRaises"))
+    assert rerun[12] == () and rerun[13] == (), "the reference it emitted was discarded with its fragment"
+    frame = records_of_kind(rt, T_FRAME)[-1]
+    assert frame[1] == 1 and frame[2] == 1 and frame[3] == 0, "one run, no skips, in the second frame"
+    assert core.all_text() == ["kept", "step 0", "next"], "the previous subtree stays on screen"
+
+
+@composable
+def Named(label: str):
+    Text(label)
+
+
+@composable
+def Swapper():
+    let which = state(1)
+    Column:
+        key(which.value):
+            Named("keyed")
+        Button("swap"):
+            which.value = 2
+
+
+def test_trace_key_change_creates_a_scope_and_the_parent_disposes_the_old_key():
+    rt, core = compose(Swapper)
+    click(rt, core, "swap")
+    rt.frame()
+    old, new = pair(runs_named(rt, "Named"))
+    assert old[2] != new[2], "a new scope"
+    assert old[9] == 1 and new[9] == 2
+    assert new[10] == "first" and new[11] == (("created",),), "a key change has no cause of its own"
+    rerun = only(reruns_named(rt, "Swapper"))
+    assert rerun[13] == ((old[2], "Named", 1),), "the parent's run record names the old key under `disposed`"
+    assert old[2] not in rt.scopes and new[2] in rt.scopes
+
+
+@composable
+def Entry(n: int):
+    Text(f"entry {n}")
+
+
+@composable
+def Prepends():
+    let items = state_list([1, 2, 3])
+    Column:
+        items.each(key=lambda item: item):
+            Entry(it)
+        Button("prepend"):
+            items.insert(0, 0)
+
+
+def test_trace_a_new_key_at_the_front_is_created_and_nothing_is_disposed():
+    rt, core = compose(Prepends)
+    click(rt, core, "prepend")
+    rt.frame()
+    entries = runs_named(rt, "Entry")
+    assert [r[9] for r in entries] == [1, 2, 3, 0]
+    new = entries[3]
+    assert new[10] == "first" and new[11] == (("created",),), "key 1 was reused, not given up: nothing but `created`"
+    rerun = only(reruns_named(rt, "Prepends"))
+    assert rerun[13] == (), "no false disposal"
+    assert rerun[12] == tuple(r[2] for r in entries[:3]), "the three old keys were skipped"
+    assert core.all_text() == ["entry 0", "entry 1", "entry 2", "entry 3", "prepend"]
+
+
+@composable
+def Replaces():
+    let items = state[(*: int)]((1,))
+    Column:
+        keyed(items.value).each(key=lambda item: item):
+            Entry(it)
+        Button("replace"):
+            items.value = (2, 3)
+
+
+def test_trace_replacing_a_keyed_list_creates_each_new_key_and_disposes_the_old_one():
+    rt, core = compose(Replaces)
+    click(rt, core, "replace")
+    rt.frame()
+    entries = runs_named(rt, "Entry")
+    assert [(r[9], r[10], r[11]) for r in entries] == [
+        (1, "first", (("created",),)),
+        (2, "first", (("created",),)),
+        (3, "first", (("created",),)),
+    ]
+    rerun = only(reruns_named(rt, "Replaces"))
+    assert rerun[13] == ((entries[0][2], "Entry", 1),), "one disposal, on the parent, naming key 1"
+    assert core.all_text() == ["entry 2", "entry 3", "replace"]
+
+
+def test_trace_skipped_children_and_frame_counts():
+    rt, core = compose(Parent)
+    click(rt, core, "bump")
+    rt.frame()
+    leaves = [r[2] for r in runs_named(rt, "Leaf")]
+    rerun = only(reruns_named(rt, "Parent"))
+    assert rerun[12] == tuple(leaves), "the two leaves were emitted as references"
+    frames = records_of_kind(rt, T_FRAME)
+    assert [f[1] for f in frames] == [0, 1]
+    assert frames[0][2] == 4 and frames[0][3] == 0, "root, Parent and the two leaves ran in the first frame"
+    assert frames[1][2] == 1 and frames[1][3] == 2
+    assert frames[1][4] > 0 and frames[1][5] > 0, "compose and commit took time"
+    assert trace_of(rt).records[-1] === frames[1], "the frame record is the last of its frame"
+    assert trace_of(rt).frames == 1
+
+
+def test_trace_derived_chain_records_unchanged_and_changed_recomputes():
+    @composable
+    def Form():
+        let name = state("")
+        let email = state("")
+
+        def check() -> str:
+            n = name.value
+            e = email.value
+            return "ok" if "@" in e and n else "incomplete"
+
+        let status = derived(check)
+        Text(status.value)
+        Button("name"):
+            name.value = "ada"
+        Button("email"):
+            email.value = "ada@x"
+
+    rt, core = compose(Form)
+    click(rt, core, "name")
+    rt.frame()
+    state_write, derived_write = pair(writes(rt))
+    assert state_write[0] == "state" and state_write[9] == "name" and state_write[14] == 1, "only the derived reads `name`"
+    assert derived_write[0] == "derived" and derived_write[4] == "status"
+    assert derived_write[5] == "incomplete" and derived_write[6] == "incomplete" and derived_write[7] is False
+    assert derived_write[8] == state_write, "the derived cause carries the state cause that made it recompute"
+    assert derived_write[2] == state_write[7], "declared in the same composable"
+    assert len(runs_named(rt, "Form")) == 1, "unchanged: nothing ran"
+    click(rt, core, "email")
+    rt.frame()
+    changed = writes(rt)[-1]
+    assert changed[0] == "derived" and changed[7] is True and changed[6] == "ok" and changed[8][9] == "email"
+    rerun = only(reruns_named(rt, "Form"))
+    assert rerun[11] == (changed,), "the scope's cause is the derived cause, with the state cause inside"
+
+
+def test_trace_posted_write_carries_the_writer_thread():
+    cells: dict[str, State[int]] = {}
+
+    @composable
+    def Shown():
+        let n = state(0)
+        cells["n"] = n  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"n = {n.value}")
+
+    core = FakeCore()
+    rt = Runtime(core)
+    rt.set_root(Shown)
+    rt.frame()
+    n = cells["n"]
+    ident: list[int] = [0]
+
+    def worker():
+        ident[0] = threading.get_ident()
+        n.value = 7
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert writes(rt) == [], "nothing is recorded until the ui thread applies the write"
+    rt.frame()
+    cause = only(writes(rt))
+    assert cause[13] is True and cause[12] == ident[0] and cause[12] != threading.get_ident()
+    assert cause[9] == "n" and cause[5] == 0 and cause[6] == 7
+    rerun = only(reruns_named(rt, "Shown"))
+    assert rerun[11] == (cause,)
+
+
+def test_trace_a_write_nobody_reads_has_no_readers():
+    cells: dict[str, State[int]] = {}
+
+    @composable
+    def Quiet():
+        let unread = state(0)
+        cells["unread"] = unread  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text("quiet")
+
+    rt, core = compose(Quiet)
+    cells["unread"].value = 5
+    cause = only(writes(rt))
+    assert cause[9] == "unread" and cause[14] == 0
+    assert rt.is_idle(), "nothing was invalidated"
+    assert "nothing depends on" in rt.explain(since_frame=1)
+
+
+def test_trace_collection_ops_name_the_index_or_key():
+    lists: dict[str, StateList[int]] = {}
+    dicts: dict[str, StateDict[str, int]] = {}
+
+    @composable
+    def Owner():
+        let items = state_list([1, 2, 3])
+        let table = state_dict[str, int]()
+        lists["items"] = items  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        dicts["table"] = table  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"{len(items)} {len(table)}")
+
+    rt, core = compose(Owner)
+    items = lists["items"]
+    table = dicts["table"]
+    items.append(4)
+    items[0] = 9
+    items.insert(-1, 7)
+    items.remove_at(-1)
+    items.remove(7)
+    popped = items.pop()
+    items.clear()
+    table["k"] = 1
+    table["k"] = 2
+    table.remove("k")
+    assert popped == 3
+    ops = [(c[2], c[3], c[4], c[5], c[6]) for c in writes(rt)]
+    assert ops == [
+        ("list", "append", 3, None, 4),
+        ("list", "set", 0, 1, 9),
+        ("list", "insert", 3, None, 7),
+        ("list", "remove", 4, 4, None),
+        ("list", "remove", 3, 7, None),
+        ("list", "pop", 2, 3, None),
+        ("list", "clear", None, 2, 0),
+        ("dict", "put", "k", None, 1),
+        ("dict", "put", "k", 1, 2),
+        ("dict", "delete", "k", 2, None),
+    ]
+    assert [c[9] for c in writes(rt)] == ["items"] * 7 + ["table"] * 3
+
+
+frozen data class Pt:
+    x: int
+    y: int
+
+
+frozen data class Loud:
+    """A key whose `repr` raises."""
+
+    n: int
+
+    override def __repr__(self) -> str raises ...:
+        raise RuntimeError("no repr for you")
+
+
+def test_trace_dict_key_that_is_neither_int_nor_str_is_rendered_into_the_at_slot():
+    dicts: dict[str, StateDict[object, str]] = {}
+
+    @composable
+    def Grid():
+        let cells = state_dict[object, str]()
+        dicts["cells"] = cells  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"{len(cells)} cells")
+
+    rt, core = compose(Grid)
+    cells = dicts["cells"]
+    cells[(1, 2)] = "a"
+    cells[Pt(1, 2)] = "b"
+    cells[Loud(3)] = "c"
+    cells[True] = "d"
+    cells[tuple(range(40))] = "e"
+    cells[7] = "f"
+    cells["k"] = "g"
+    cells.remove((1, 2))
+    cells.remove(Pt(1, 2))
+    ats = [c[4] for c in writes(rt)]
+    assert ats[:4] == ["(1, 2)", "Pt(x=1, y=2)", "Loud", "True"], "a tuple, a frozen data class, a raising repr, a bool"
+    long = ats[4]
+    assert isinstance(long, str) and len(long) == 64 and long.endswith("…") and long.startswith("(0, 1, 2,")
+    assert ats[5:] == [7, "k", "(1, 2)", "Pt(x=1, y=2)"], "an int and a str as they are; delete renders like put"
+    assert all(type(at) === int or type(at) === str for at in ats), "the slot never holds a program object"
+    assert len(cells) == 5 and cells[Loud(3)] == "c" and cells[True] == "d", "the dict itself keeps the real keys"
+
+
+def test_key_refuses_a_bool():
+    errors: list[str] = []
+
+    @composable
+    def Flagged():
+        key(True):
+            Named("flag")
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.set_root(Flagged)
+    rt.frame()
+    assert errors == ["root > Flagged: a key must be an int or a str, not bool"]
+    assert runs_named(rt, "Named") == [], "the block never ran"
+
+
+def test_trace_ring_drops_the_oldest_half_and_keeps_order():
+    core = FakeCore()
+    rt = Runtime(core)
+    rt.trace = Trace(8)
+    rt.set_root(lambda: Counter(1))
+    rt.frame()
+    trace = trace_of(rt)
+    for _ in range(10):
+        click(rt, core, "+")
+        rt.frame()
+    assert trace.limit == 8 and len(trace.records) < 8
+    assert trace.dropped > 0 and trace.dropped % 4 == 0, "the oldest half goes at a time"
+    assert trace.dropped + len(trace.records) == 3 + 10 * 3, "root + Counter + frame, then write + run + frame per click"
+    kept: list[dynamic] = list(trace.records)
+    frames = [r[1] for r in kept]
+    assert frames == sorted(frames), "oldest first"
+    assert trace.records[-1][0] == T_FRAME and trace.frames == 10
+    assert len(rt.recompositions_of(Counter)) == len([r for r in trace.records if r[0] == T_RUN]), "runs that fell off the ring are gone"
+    try:
+        _ = Trace(1)
+    except ValueError as error:
+        assert "at least 2" in str(error)
+    else:
+        raise AssertionError("a limit below 2 must be refused")
+    # a limit lowered after construction is refused by the next trim, never
+    # left to grow the ring without bound
+    trace.limit = 1
+    try:
+        trace.append(rt.frames, (T_FRAME, rt.frames, 0, 0, 0, 0))
+    except ValueError as error:
+        assert "at least 2" in str(error)
+    else:
+        raise AssertionError("a limit below 2 must be refused when the ring is trimmed")
+    trace.limit = 2
+    held = len(trace.records)
+    before = trace.dropped
+    for extra in range(1, 4):
+        trace.append(rt.frames, (T_FRAME, rt.frames, 0, 0, 0, 0))
+        assert len(trace.records) == held, "the smallest limit drops one record per append: the ring never grows"
+        assert trace.dropped == before + extra, "and counts each one"
+
+
+def test_runtime_registers_itself_until_disposed():
+    core = FakeCore()
+    rt = Runtime(core)
+    assert live_runtimes[-1] === rt
+    rt.set_root(Parent)
+    rt.frame()
+    rt.dispose()
+    assert all(other !== rt for other in live_runtimes)
+    root = rt.root
+    assert root is not None and not root.alive
+
+
+type AuditArgs = (*: object)
+
+
+private def audit_collector(seen: list[object], armed: list[bool]) -> (str, AuditArgs) -> None:
+    def hook(event: str, args: AuditArgs):
+        if armed[0] and event == "basedpython_ui.trace":
+            seen.append(args[0])
+    return hook
+
+
+def test_trace_off_records_and_audits_nothing():
+    seen: list[object] = []
+    armed: list[bool] = [False]
+    sys.addaudithook(audit_collector(seen, armed))
+    core = FakeCore()
+    rt = Runtime(core, trace=False)
+    armed[0] = True
+    rt.set_root(lambda: Counter(1))
+    rt.frame()
+    click(rt, core, "+")
+    rt.frame()
+    armed[0] = False
+    assert rt.trace is None and seen == []
+    assert core.all_text() == ["count = 1", "+", "reset"], "the runtime works exactly as before"
+    assert rt.explain() == "tracing is off for this runtime; Runtime(core, trace=True) turns it on"
+    assert rt.recompositions_of(Counter) == ()
+
+
+def test_trace_on_audits_every_record():
+    seen: list[object] = []
+    armed: list[bool] = [False]
+    sys.addaudithook(audit_collector(seen, armed))
+    core = FakeCore()
+    rt = Runtime(core)
+    armed[0] = True
+    rt.set_root(lambda: Counter(1))
+    rt.frame()
+    click(rt, core, "+")
+    rt.frame()
+    armed[0] = False
+    records = trace_of(rt).records
+    assert len(seen) == len(records) == 6
+    assert all(a === b for a, b in zip(seen, records)), "the hook saw the very tuples that were appended"
+
+
+def test_explain_reads_like_a_story():
+    rt, core = compose(Parent)
+    click(rt, core, "bump")
+    rt.frame()
+    text = rt.explain(since_frame=1)
+    leaves = [r[2] for r in runs_named(rt, "Leaf")]
+    assert "n (state) set 0 → 1 at " in text
+    assert "Parent#" in text and "ran (from the dirty heap)" in text
+    assert f"skipped: #{leaves[0]}, #{leaves[1]}" in text
+    assert "1 run, 2 skipped, compose " in text
+    assert "tests/test_runtime.by:" in text, "locations map to the .by source through _by_sourcemap"
+    assert "frame 0:" not in text, "since_frame keeps only later frames"
+    rerun = rt.recompositions_of(Parent)[1]
+    assert rerun.origin == "self" and rerun.causes[0].kind == "state" and rerun.causes[0].name == "n"
+    assert rerun.causes[0].text() in text and rerun.text() in text
+
+
+def test_explain_since_a_frame_beyond_the_ring_says_so():
+    rt, core = compose(Parent)
+    assert rt.explain(since_frame=99) == "no records since frame 99"
+    assert "frame 0:" in rt.explain(since_frame=0)
+    empty = Runtime(FakeCore())
+    assert empty.explain() == "nothing has been recorded yet"
+    assert empty.explain(since_frame=99) == "nothing has been recorded yet", "an empty ring, whatever the filter"
+
+
+# ------------------------------------------------------------------- cells made outside composition
+
+# no runtime exists when these are made: each binds to the runtime whose
+# tracker first reads it, and is unbound again when that runtime is disposed
+let GLOBAL = State(0)
+let DOUBLED = Derived(lambda: GLOBAL.value * 2)
+
+
+@composable
+def ReadsGlobals():
+    Text(f"g = {GLOBAL.value} d = {DOUBLED.value}")
+    Button("bump"):
+        GLOBAL.set(GLOBAL.value + 1)
+
+
+def test_trace_a_cell_made_outside_composition_binds_to_its_first_reader():
+    GLOBAL.set(0)
+    assert GLOBAL.runtime is None and DOUBLED.runtime is None
+    rt, core = compose(ReadsGlobals)
+    assert GLOBAL.runtime === rt and DOUBLED.runtime === rt
+    assert core.all_text() == ["g = 0 d = 0", "bump"]
+    click(rt, core, "bump")
+    rt.frame()
+    assert core.all_text() == ["g = 1 d = 2", "bump"]
+    state_write, derived_write = pair(writes(rt))
+    assert state_write[0] == "state" and state_write[3] == "set" and state_write[5] == 0 and state_write[6] == 1
+    assert state_write[7] is None and state_write[8] is None and state_write[9] is None, "made outside composition: no declaration"
+    assert state_write[14] == 2, "the scope and the derived read it"
+    assert derived_write[0] == "derived" and derived_write[2] is None and derived_write[4] is None
+    assert derived_write[5] == 0 and derived_write[6] == 2 and derived_write[7] is True
+    assert derived_write[8] == state_write, "the derived knows the write that made it recompute"
+    rerun = only(reruns_named(rt, "ReadsGlobals"))
+    assert rerun[10] == "self" and [c[0] for c in rerun[11]] == ["state", "derived"], "a state cause, never `invalidated`"
+    assert "a state cell (state) set 0 → 1 at " in rt.explain(since_frame=1)
+    rt.dispose()
+    assert GLOBAL.runtime is None and DOUBLED.runtime is None, "a disposed runtime lets go of the cells it adopted"
+    GLOBAL.set(0)
+    assert GLOBAL.value == 0 and DOUBLED.value == 0, "unbound again: the write applied at once"
+
+
+def test_trace_a_bound_global_written_from_a_worker_is_posted_and_recorded_on_the_ui_thread():
+    GLOBAL.set(0)
+    ui_thread = threading.get_ident()
+    appended_on: list[int] = []
+    armed: list[bool] = [False]
+
+    def hook(event: str, args: AuditArgs):
+        if armed[0] and event == "basedpython_ui.trace":
+            appended_on.append(threading.get_ident())
+
+    sys.addaudithook(hook)
+    rt, core = compose(ReadsGlobals)
+    observed: list[int] = []
+    worker_errors: list[str] = []
+
+    def worker():
+        try:
+            GLOBAL.set(5)
+            observed.append(GLOBAL.value)
+        except BaseException as error:
+            worker_errors.append(repr(error))
+
+    armed[0] = True
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert worker_errors == [] and observed == [0] and GLOBAL.value == 0, "not visible before the frame"
+    assert writes(rt) == [] and len(rt.posted) == 1
+    rt.frame()
+    armed[0] = False
+    state_write = writes(rt)[0]
+    assert state_write[13] is True and state_write[12] != ui_thread and state_write[9] is None
+    assert core.all_text() == ["g = 5 d = 10", "bump"]
+    assert len(appended_on) >= 3 and all(ident == ui_thread for ident in appended_on), "every record was appended on the ui thread"
+    rt.dispose()
+    GLOBAL.set(0)
+
+
+def test_a_write_from_a_worker_while_the_ui_thread_composes_is_posted():
+    cells: dict[str, State[int]] = {}
+    worker_errors: list[str] = []
+    errors: list[str] = []
+    runs: list[int] = [0]
+
+    @composable
+    def Racy():
+        let n = state(0)
+        cells["n"] = n  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Text(f"n = {n.value}")
+        runs[0] += 1  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        if runs[0] == 1:  # ty: ignore[unobservable-dependency] -- deliberate in this test
+
+            def worker():
+                try:
+                    n.value = 5
+                except BaseException as error:
+                    worker_errors.append(repr(error))  # ty: ignore[silent-mutation] -- deliberate in this test
+
+            # a write from another thread while this very scope is composing
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error!r}"))
+    rt.set_root(Racy)
+    rt.frame()
+    assert worker_errors == [] and errors == [], "no CompositionError on the worker"
+    assert core.all_text() == ["n = 0"], "the write was not applied on the worker"
+    assert records_of_kind(rt, T_REFUSED) == [] and len(rt.posted) == 1
+    rt.frame()
+    assert core.all_text() == ["n = 5"], "applied at the next frame"
+    cause = only(writes(rt))
+    assert cause[13] is True and cause[12] != threading.get_ident() and cause[9] == "n"
+
+
+# ------------------------------------------------------------------- rollback
+
+# a run that raises is undone without costing its scope anything it reached:
+# the cells and children it found are kept, only what it created is disposed,
+# and the effects it registered never fire
+
+
+@composable
+def Steady():
+    """A child a failing parent reaches with equal arguments: skipped, never re-run."""
+    let hits = state(0)
+    Text(f"steady {hits.value}")
+    Button("hit"):
+        hits.value += 1
+
+
+def test_rollback_keeps_the_cells_and_the_children_the_failed_run_reached():
+    cells: dict[str, State[int]] = {}
+    errors: list[str] = []
+
+    @composable
+    def Fragile():
+        let total = state(0)
+        cells["total"] = total  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Column:
+            Text(f"total {total.value}")
+            Steady()
+            if total.value == 1:
+                raise ValueError("boom")
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.set_root(Fragile)
+    rt.frame()
+    click(rt, core, "hit")
+    rt.frame()
+    assert core.all_text() == ["total 0", "steady 1", "hit"]
+    total = cells["total"]
+    steady = runs_named(rt, "Steady")[0][2]
+    total.value = 1
+    rt.frame()
+    assert errors == ["root > Fragile: boom"]
+    assert core.all_text() == ["total 0", "steady 1", "hit"], "the failed run never reaches the screen"
+    assert steady in rt.scopes and rt.scopes[steady].alive, "reached and skipped by the failed run: kept"
+    total.value = 2
+    rt.frame()
+    assert errors == ["root > Fragile: boom"], "recovered"
+    assert core.all_text() == ["total 2", "steady 1", "hit"], "the same cell holds the total; the same child holds its hits"
+    assert cells["total"] === total, "the recovery run found the cell the failed run had reached"
+    assert [r[2] for r in runs_named(rt, "Steady")] == [steady, steady], "first run and the click: never re-created"
+    fragile = runs_named(rt, "Fragile")
+    assert len(fragile) == 3 and fragile[2][10] == "self"
+    assert fragile[2][13] == (), "the recovery run disposed nothing: the retained child was never lost"
+    assert fragile[2][12] == (steady,), "and skipped it, as before the error"
+    error = only(records_of_kind(rt, T_ERROR))
+    assert error[2] == fragile[0][2] and error[5] is True
+
+
+def test_a_child_that_ran_under_the_failed_run_runs_again_when_reached():
+    cells: dict[str, State[int]] = {}
+    flags: dict[str, State[bool]] = {}
+    errors: list[str] = []
+
+    @composable
+    def Brittle():
+        let level = state(0)
+        let fails = state(False)
+        cells["level"] = level  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        flags["fails"] = fails  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Column:
+            Text(f"level {level.value}")
+            Shows(level.value)
+            if fails.value:
+                raise ValueError("boom")
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.set_root(Brittle)
+    rt.frame()
+    assert core.all_text() == ["level 0", "shows 0"]
+    shows = only(runs_named(rt, "Shows"))[2]
+    cells["level"].value = 1
+    flags["fails"].value = True
+    rt.frame()
+    assert errors == ["root > Brittle: boom"]
+    assert core.all_text() == ["level 0", "shows 0"], "the child ran under the failed run, and its fragment went with it"
+    flags["fails"].value = False
+    rt.frame()
+    assert core.all_text() == ["level 1", "shows 1"], "the same argument as in the failed run, yet the child ran: the core never received that fragment"
+    runs = runs_named(rt, "Shows")
+    assert [r[2] for r in runs] == [shows, shows, shows], "one scope throughout"
+    assert runs[1][1] == 1 and runs[1][11] == (("args", "step", 0, 1, True),), "the run the rollback discarded"
+    assert runs[2][10] == "parent" and runs[2][11] == (("uncommitted",),), "run again because that fragment was never committed"
+    brittle = runs_named(rt, "Brittle")
+    assert brittle[2][12] == () and brittle[2][13] == (), "neither skipped nor disposed on recovery"
+
+
+@composable
+def Made():
+    let n = state(0)
+    Text(f"made {n.value}")
+
+
+def test_rollback_disposes_only_what_the_failed_run_created():
+    cells: dict[str, State[int]] = {}
+    errors: list[str] = []
+
+    @composable
+    def Maker():
+        let step = state(0)
+        cells["step"] = step  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Column:
+            Text(f"step {step.value}")
+            if step.value >= 1:
+                Made()
+            if step.value == 1:
+                raise ValueError("boom")
+
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.set_root(Maker)
+    rt.frame()
+    cells["step"].value = 1
+    rt.frame()
+    assert errors == ["root > Maker: boom"]
+    made = only(runs_named(rt, "Made"))
+    assert made[11] == (("created",),)
+    assert made[2] not in rt.scopes, "created by the run that raised: disposed with it"
+    assert core.all_text() == ["step 0"]
+    cells["step"].value = 2
+    rt.frame()
+    assert core.all_text() == ["step 2", "made 0"]
+    first, second = pair(runs_named(rt, "Made"))
+    assert second[2] != first[2] and second[11] == (("created",),), "the recovery run created it anew"
+    assert second[2] in rt.scopes
+    assert runs_named(rt, "Maker")[2][13] == (), "nothing left to dispose: the failed run's child was already gone"
+
+
+def test_effects_registered_by_a_run_that_raises_never_fire_and_the_running_one_keeps_its_job():
+    log: list[str] = []
+    jobs: list[Job] = []
+    cells: dict[str, State[int]] = {}
+    errors: list[str] = []
+
+    @composable
+    def Loud(step: int):
+        launched_effect(step):
+            jobs.append(it)  # ty: ignore[silent-mutation] -- deliberate in this test
+            log.append(f"launched {step}")  # ty: ignore[silent-mutation] -- deliberate in this test
+            await asyncio.sleep(0)
+        disposable_effect(step):
+            log.append(f"attach {step}")  # ty: ignore[silent-mutation] -- deliberate in this test
+            it.on_dispose(lambda: log.append(f"detach {step}"))  # ty: ignore[silent-mutation] -- deliberate in this test
+        side_effect(lambda: log.append(f"side {step}"))  # ty: ignore[silent-mutation] -- deliberate in this test
+        Text(f"loud {step}")
+        if step == 1:
+            raise ValueError("boom")
+
+    @composable
+    def Stage():
+        let step = state(0)
+        cells["step"] = step  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Column:
+            Loud(step.value)
+
+    loop = asyncio.new_event_loop()
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.task_runner = lambda coroutine: loop.create_task(coroutine)
+    rt.set_root(Stage)
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert log == ["attach 0", "side 0", "launched 0"]
+    assert len(jobs) == 1 and jobs[0].is_active
+    cells["step"].value = 1
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert errors == ["root > Stage > Loud: boom"]
+    assert log == ["attach 0", "side 0", "launched 0"], "nothing the failed run registered fired"
+    assert jobs[0].is_active, "the running effect kept its job: the restart was requested, then rolled back"
+    assert rt.is_idle(), "no effect is left pending"
+    assert core.all_text() == ["loud 0"]
+    cells["step"].value = 2
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert log[3:] == ["detach 0", "attach 2", "side 2", "launched 2"], "the recovery run restarted the effects with its own key"
+    assert not jobs[0].is_active and len(jobs) == 2 and jobs[1].is_active
+    assert core.all_text() == ["loud 2"]
+    loop.close()
+
+
+def test_an_effect_slot_created_by_the_run_that_raised_is_disposed_with_it():
+    log: list[str] = []
+    cells: dict[str, State[int]] = {}
+    errors: list[str] = []
+
+    @composable
+    def Eager(step: int):
+        launched_effect(step):
+            log.append(f"launched {step}")  # ty: ignore[silent-mutation] -- deliberate in this test
+            await asyncio.sleep(0)
+        if step == 0:
+            raise ValueError("boom")
+        Text(f"eager {step}")
+
+    @composable
+    def Owner():
+        let step = state(0)
+        cells["step"] = step  # ty: ignore[silent-mutation, unobservable-dependency] -- deliberate in this test
+        Column:
+            Eager(step.value)
+
+    loop = asyncio.new_event_loop()
+    core = FakeCore()
+    rt = Runtime(core, on_error=lambda error, where: errors.append(f"{where}: {error}"))
+    rt.task_runner = lambda coroutine: loop.create_task(coroutine)
+    rt.set_root(Owner)
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert errors == ["root > Owner > Eager: boom"] and log == []
+    eager = only(runs_named(rt, "Eager"))
+    scope = rt.scopes[eager[2]]
+    assert scope.alive and scope.slots == {}, "the slot its run created went with the run"
+    cells["step"].value = 1
+    rt.frame()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert log == ["launched 1"] and len(scope.slots) == 1
+    assert core.all_text() == ["eager 1"]
+    loop.close()
+
+
+def test_a_requested_restart_stands_for_the_effect_it_will_start():
+    started: list[object] = []
+    slot = EffectSlot(SLOT_LAUNCHED)
+    assert slot.wants(1)
+    first = Restart(slot, 1, lambda restarted: started.append(restarted.key))
+    assert not slot.wants(1) and slot.wants(2), "requested this frame: the key it will install is what counts"
+    first.withdraw()
+    assert slot.wants(1), "withdrawn: nothing runs and nothing is requested"
+    second = Restart(slot, 1, lambda restarted: started.append(restarted.key))
+    second()
+    assert slot.key == 1 and slot.pending is None and started == [1]
+    assert not slot.wants(1) and slot.wants(2)
+    slot.retire()
+    third = Restart(slot, 2, lambda restarted: started.append(restarted.key))
+    third()
+    assert started == [1] and slot.key == 1 and slot.pending is None, "a retired slot applies nothing"

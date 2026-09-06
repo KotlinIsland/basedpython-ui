@@ -14,6 +14,7 @@ from .runtime export (
     derived,
     remember,
     composable,
+    builder,
     key,
     keyed,
     Keyed,
@@ -25,6 +26,10 @@ from .runtime export (
     Ambient,
     ambient,
     provide,
+    Trace,
+    Recomposition,
+    Cause,
+    TRACE_FORMAT,
 )
 from .widgets export (
     ColumnScope,
