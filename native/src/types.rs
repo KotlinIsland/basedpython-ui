@@ -18,6 +18,7 @@ pub enum Kind {
     Canvas,
     Layout,
     Scroll,
+    Popup,
 }
 
 pub const REC_END: i32 = 0;
@@ -39,6 +40,7 @@ impl Kind {
             11 => Kind::Canvas,
             12 => Kind::Layout,
             13 => Kind::Scroll,
+            14 => Kind::Popup,
             _ => return None,
         })
     }
@@ -47,7 +49,7 @@ impl Kind {
     pub fn has_children(self) -> bool {
         matches!(
             self,
-            Kind::Scope | Kind::Column | Kind::Row | Kind::Box | Kind::Layout | Kind::Scroll
+            Kind::Scope | Kind::Column | Kind::Row | Kind::Box | Kind::Layout | Kind::Scroll | Kind::Popup
         )
     }
 
@@ -65,6 +67,7 @@ impl Kind {
             Kind::Canvas => "Canvas",
             Kind::Layout => "Layout",
             Kind::Scroll => "Scroll",
+            Kind::Popup => "Popup",
         }
     }
 }
@@ -172,6 +175,53 @@ pub fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// Corner radii, clockwise from the top left. Uniform ones come from `Corners::uniform`.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Corners {
+    pub tl: f32,
+    pub tr: f32,
+    pub br: f32,
+    pub bl: f32,
+}
+
+impl Corners {
+    pub const NONE: Corners = Corners { tl: 0.0, tr: 0.0, br: 0.0, bl: 0.0 };
+
+    pub const fn uniform(r: f32) -> Corners {
+        Corners { tl: r, tr: r, br: r, bl: r }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.tl <= 0.0 && self.tr <= 0.0 && self.br <= 0.0 && self.bl <= 0.0
+    }
+
+    /// Each radius moved by `delta` (negative shrinks), never below zero: a border stroked
+    /// inside a rounded rect follows the same curve one half-width in.
+    pub fn adjust(&self, delta: f32) -> Corners {
+        let one = |r: f32| if r <= 0.0 { 0.0 } else { (r + delta).max(0.0) };
+        Corners { tl: one(self.tl), tr: one(self.tr), br: one(self.br), bl: one(self.bl) }
+    }
+
+    /// Clamped so no pair of radii on a side exceeds it (the css rule).
+    pub fn fit(&self, w: f32, h: f32) -> Corners {
+        let mut c = *self;
+        let scale = [
+            (c.tl + c.tr, w),
+            (c.bl + c.br, w),
+            (c.tl + c.bl, h),
+            (c.tr + c.br, h),
+        ]
+        .iter()
+        .filter(|(sum, limit)| *sum > *limit && *sum > 0.0)
+        .map(|(sum, limit)| limit / sum)
+        .fold(1.0f32, f32::min);
+        if scale < 1.0 {
+            c = Corners { tl: c.tl * scale, tr: c.tr * scale, br: c.br * scale, bl: c.bl * scale };
+        }
+        c
+    }
+}
+
 /// One modifier operation. Values are already validated (finite, non-negative where required).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ModOp {
@@ -184,8 +234,8 @@ pub enum ModOp {
     Weight(f32),
     Align(u8),
     Clickable(i32),
-    /// Corner radius for every background, border, shadow and hover layer after it in the chain.
-    Rounded(f32),
+    /// Corner radii for every background, border, shadow and hover layer after it in the chain.
+    Rounded(Corners),
     Border { width: f32, argb: u32 },
     /// Colour painted over the node's clickable layer while the pointer is over it.
     Hover(u32),
@@ -195,6 +245,10 @@ pub enum ModOp {
     Reveal,
     /// Clip the node's own painting and its children to the node's rect.
     Clip,
+    /// A handler for the secondary (right) button.
+    Secondary(i32),
+    /// A handler told when the pointer enters and leaves the layer.
+    Hoverable(i32),
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -285,17 +339,18 @@ impl Modifier {
                 }
                 x if x == 9.0 => {
                     let a = take(1)?;
-                    let h = finite(a[0], "clickable")?;
-                    if h < 0.0 || h > i32::MAX as f32 || h.fract() != 0.0 {
-                        return Err(format!("clickable handler index must be a non-negative int, got {}", h));
-                    }
-                    ops.push(ModOp::Clickable(h as i32));
+                    ops.push(ModOp::Clickable(handler_index(a[0], "clickable")?));
                     i += 2;
                 }
                 x if x == 10.0 => {
-                    let a = take(1)?;
-                    ops.push(ModOp::Rounded(non_negative(a[0], "rounded")?));
-                    i += 2;
+                    let a = take(4)?;
+                    ops.push(ModOp::Rounded(Corners {
+                        tl: non_negative(a[0], "rounded")?,
+                        tr: non_negative(a[1], "rounded")?,
+                        br: non_negative(a[2], "rounded")?,
+                        bl: non_negative(a[3], "rounded")?,
+                    }));
+                    i += 5;
                 }
                 x if x == 11.0 => {
                     let a = take(2)?;
@@ -324,11 +379,30 @@ impl Modifier {
                     ops.push(ModOp::Clip);
                     i += 1;
                 }
+                x if x == 16.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Secondary(handler_index(a[0], "secondary")?));
+                    i += 2;
+                }
+                x if x == 17.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Hoverable(handler_index(a[0], "hoverable")?));
+                    i += 2;
+                }
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
         Ok(Modifier { ops, weight, align, hover, reveal, clip })
     }
+}
+
+/// A handler index carried by a modifier op: a non-negative whole number.
+fn handler_index(v: f64, what: &str) -> Result<i32, String> {
+    let h = finite(v, what)?;
+    if h < 0.0 || h > i32::MAX as f32 || h.fract() != 0.0 {
+        return Err(format!("{} handler index must be a non-negative int, got {}", what, h));
+    }
+    Ok(h as i32)
 }
 
 fn finite(v: f64, what: &str) -> Result<f32, String> {
@@ -394,13 +468,17 @@ impl Style {
 }
 
 /// A rectangle produced by a modifier layer during layout, relative to the node origin.
-/// `radius` is the corner radius in effect at that point of the chain (0 = square).
+/// `corners` are the radii in effect at that point of the chain (all zero = square).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Layer {
-    Shadow { rect: Rect, radius: f32, elevation: f32, argb: u32 },
-    Background { rect: Rect, argb: u32, radius: f32 },
-    Border { rect: Rect, argb: u32, width: f32, radius: f32 },
-    Click { rect: Rect, handler: i32, hover: Option<u32>, radius: f32 },
+    Shadow { rect: Rect, corners: Corners, elevation: f32, argb: u32 },
+    Background { rect: Rect, argb: u32, corners: Corners },
+    Border { rect: Rect, argb: u32, width: f32, corners: Corners },
+    Click { rect: Rect, handler: i32, hover: Option<u32>, corners: Corners },
+    /// The right button over this rect.
+    Secondary { rect: Rect, handler: i32 },
+    /// Told when the pointer enters and leaves this rect.
+    Hoverable { rect: Rect, handler: i32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.
@@ -448,12 +526,28 @@ mod tests {
         assert!(Modifier::parse(&[42.0]).is_err());
         assert!(Modifier::parse(&[7.0, -1.0]).is_err());
         assert!(Modifier::parse(&[6.0, f64::NAN]).is_err());
-        let m = Modifier::parse(&[10.0, 8.0, 11.0, 1.0, 4278190080.0, 12.0, 4278190335.0, 13.0, 4.0, 1090519040.0, 14.0, 15.0]).unwrap();
+        let m = Modifier::parse(&[10.0, 8.0, 8.0, 0.0, 0.0, 11.0, 1.0, 4278190080.0, 12.0, 4278190335.0, 13.0, 4.0, 1090519040.0, 14.0, 15.0]).unwrap();
         assert_eq!(m.ops.len(), 6);
+        assert_eq!(m.ops[0], ModOp::Rounded(Corners { tl: 8.0, tr: 8.0, br: 0.0, bl: 0.0 }));
         assert_eq!(m.hover, Some(0xFF0000FF));
         assert!(m.reveal && m.clip);
-        assert!(Modifier::parse(&[10.0, -1.0]).is_err());
+        assert!(Modifier::parse(&[10.0, 8.0, 8.0, 0.0]).is_err(), "rounded takes four radii");
+        assert!(Modifier::parse(&[10.0, -1.0, 0.0, 0.0, 0.0]).is_err());
         assert!(Modifier::parse(&[11.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn corner_math() {
+        let c = Corners::uniform(10.0);
+        assert!(!c.is_zero() && Corners::NONE.is_zero());
+        assert_eq!(c.adjust(-1.0), Corners::uniform(9.0));
+        // a zero corner stays square however the radii are adjusted
+        let mixed = Corners { tl: 4.0, tr: 0.0, br: 0.0, bl: 4.0 };
+        assert_eq!(mixed.adjust(-2.0), Corners { tl: 2.0, tr: 0.0, br: 0.0, bl: 2.0 });
+        assert_eq!(mixed.adjust(-9.0), Corners { tl: 0.0, tr: 0.0, br: 0.0, bl: 0.0 });
+        // radii that do not fit are scaled down together
+        assert_eq!(Corners::uniform(10.0).fit(10.0, 100.0), Corners::uniform(5.0));
+        assert_eq!(Corners::uniform(4.0).fit(100.0, 100.0), Corners::uniform(4.0));
     }
 
     #[test]

@@ -19,17 +19,17 @@ const BUTTON_FILL: u32 = 0xFFE4_E4E7;
 const BUTTON_FILL_HOVER: u32 = 0xFFD4_D4D8;
 const BUTTON_FILL_DISABLED: u32 = 0xFFF4_F4F5;
 const BUTTON_BORDER: u32 = 0xFFA1_A1AA;
-const BUTTON_RADIUS: f32 = 6.0;
+const BUTTON_RADIUS: Corners = Corners::uniform(6.0);
 const TEXT_DISABLED: u32 = 0xFF9A_9A9A;
 const FIELD_BORDER: u32 = 0xFFA1_A1AA;
 const FIELD_BORDER_FOCUS: u32 = 0xFF3B_82F6;
-const FIELD_RADIUS: f32 = 6.0;
+const FIELD_RADIUS: Corners = Corners::uniform(6.0);
 const PLACEHOLDER: u32 = 0xFF9C_A3AF;
 const ACCENT: u32 = 0xFF3B_82F6;
 const SCROLLBAR: u32 = 0x5A00_0000;
-const SCROLLBAR_WIDTH: f32 = 4.0;
-const SCROLLBAR_INSET: f32 = 2.0;
 const SCROLLBAR_MIN: f32 = 16.0;
+
+use crate::layout::{SCROLLBAR_INSET, SCROLLBAR_WIDTH};
 
 /// The paint pass state: the target and a cache of clip masks (one per distinct clip rect).
 struct Painter {
@@ -97,11 +97,11 @@ impl Painter {
     }
 
     /// A filled rectangle, square or rounded, inside `clip`.
-    fn fill_rect(&mut self, r: Rect, argb: u32, radius: f32, clip: &Rect) {
+    fn fill_rect(&mut self, r: Rect, argb: u32, corners: Corners, clip: &Rect) {
         if argb >> 24 == 0 {
             return;
         }
-        if radius <= 0.0 {
+        if corners.is_zero() {
             let visible = r.intersect(clip);
             if visible.is_empty() {
                 return;
@@ -114,22 +114,22 @@ impl Painter {
         if !r.intersects(clip) {
             return;
         }
-        if let Some(path) = rounded_path(r, radius, self.scale) {
+        if let Some(path) = rounded_path(r, corners, self.scale) {
             self.fill_path(&path, argb, clip);
         }
     }
 
     /// A rectangle outline of `width`, drawn inside the rect.
-    fn stroke_rect(&mut self, r: Rect, argb: u32, width: f32, radius: f32, clip: &Rect) {
+    fn stroke_rect(&mut self, r: Rect, argb: u32, width: f32, corners: Corners, clip: &Rect) {
         if argb >> 24 == 0 || !r.intersects(clip) {
             return;
         }
         let inset = width / 2.0;
         let inner = Rect::new(r.x + inset, r.y + inset, (r.w - width).max(0.0), (r.h - width).max(0.0));
-        let path = if radius > 0.0 {
-            rounded_path(inner, (radius - inset).max(0.0), self.scale)
-        } else {
+        let path = if corners.is_zero() {
             skia_rect(inner, self.scale).map(PathBuilder::from_rect)
+        } else {
+            rounded_path(inner, corners.adjust(-inset), self.scale)
         };
         if let Some(path) = path {
             self.stroke_path(&path, argb, width, clip);
@@ -151,7 +151,7 @@ impl Painter {
 
     /// A soft shadow: a few stacked translucent rounded rects, each a little larger and
     /// lower than the last, so the edge fades instead of stepping.
-    fn shadow(&mut self, r: Rect, radius: f32, elevation: f32, argb: u32, clip: &Rect) {
+    fn shadow(&mut self, r: Rect, corners: Corners, elevation: f32, argb: u32, clip: &Rect) {
         let (a, red, green, blue) = argb_channels(argb);
         if a == 0 || elevation <= 0.0 {
             return;
@@ -163,7 +163,7 @@ impl Painter {
             let rect = Rect::new(r.x - spread, r.y - spread + elevation * 0.6, r.w + 2.0 * spread, r.h + 2.0 * spread);
             let alpha = (alpha_each * (1.0 - i as f32 / steps as f32 * 0.5)).round().clamp(1.0, 255.0) as u32;
             let colour = (alpha << 24) | ((red as u32) << 16) | ((green as u32) << 8) | blue as u32;
-            self.fill_rect(rect, colour, radius + spread, clip);
+            self.fill_rect(rect, colour, corners.adjust(spread), clip);
         }
     }
 
@@ -191,13 +191,22 @@ pub fn paint(inner: &mut Inner) {
     let clip = Rect::new(0.0, 0.0, inner.width, inner.height);
     let root = inner.root;
     paint_children(inner, root, &mut painter, &clip);
+    // popups last, over everything, and clipped to the window rather than to whatever
+    // container they were written in
+    for popup in inner.live_popups() {
+        paint_node(inner, popup, &mut painter, &clip);
+    }
     inner.pixmap = Some(painter.pixmap);
 }
 
+/// Paint the children of `id`, leaving popups to the pass that draws them over everything.
 fn paint_children(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect) {
     let n = inner.nodes.get(id).map(|n| n.children.len()).unwrap_or(0);
     for i in 0..n {
         let Some(c) = inner.nodes.get(id).and_then(|n| n.children.get(i).copied()) else { break };
+        if inner.nodes.get(c).map(|n| n.kind) == Some(Kind::Popup) {
+            continue;
+        }
         paint_node(inner, c, painter, clip);
     }
 }
@@ -223,14 +232,14 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
     }
     let content = node.content_rect();
     let layer_count = node.layers.len();
-    let hovered = inner.hover_handler;
+    let hovered = inner.hover_node == Some(id);
     for i in 0..layer_count {
         match inner.nodes[id].layers.get(i).copied() {
-            Some(Layer::Shadow { rect, radius, elevation, argb }) => painter.shadow(rect.translated(abs.x, abs.y), radius, elevation, argb, &own_clip),
-            Some(Layer::Background { rect, argb, radius }) => painter.fill_rect(rect.translated(abs.x, abs.y), argb, radius, &own_clip),
-            Some(Layer::Border { rect, argb, width, radius }) => painter.stroke_rect(rect.translated(abs.x, abs.y), argb, width, radius, &own_clip),
-            Some(Layer::Click { rect, handler, hover: Some(argb), radius }) if handler >= 0 && handler == hovered => {
-                painter.fill_rect(rect.translated(abs.x, abs.y), argb, radius, &own_clip)
+            Some(Layer::Shadow { rect, corners, elevation, argb }) => painter.shadow(rect.translated(abs.x, abs.y), corners, elevation, argb, &own_clip),
+            Some(Layer::Background { rect, argb, corners }) => painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip),
+            Some(Layer::Border { rect, argb, width, corners }) => painter.stroke_rect(rect.translated(abs.x, abs.y), argb, width, corners, &own_clip),
+            Some(Layer::Click { rect, hover: Some(argb), corners, .. }) if hovered => {
+                painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip)
             }
             _ => {}
         }
@@ -248,13 +257,13 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             }
         }
         Kind::Button => {
-            let (enabled, key, argb, handler) = {
+            let (enabled, key, argb) = {
                 let n = &inner.nodes[id];
-                (n.a != 0, n.text_key.clone(), n.style.argb, n.handler)
+                (n.a != 0, n.text_key.clone(), n.style.argb)
             };
             let fill = if !enabled {
                 BUTTON_FILL_DISABLED
-            } else if handler >= 0 && handler == hovered {
+            } else if hovered {
                 BUTTON_FILL_HOVER
             } else {
                 BUTTON_FILL
@@ -292,20 +301,20 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                     inner.text.measure(&TextKey::new(prefix.into(), Style::DEFAULT, f32::INFINITY)).w
                 };
                 let line = crate::text::TextSystem::line_height(Style::DEFAULT);
-                painter.fill_rect(Rect::new(text_origin.0 + w, text_origin.1, 1.0, line), Style::DEFAULT.argb, 0.0, &text_clip);
+                painter.fill_rect(Rect::new(text_origin.0 + w, text_origin.1, 1.0, line), Style::DEFAULT.argb, Corners::NONE, &text_clip);
             }
         }
         Kind::Checkbox => {
             let checked = inner.nodes[id].a != 0;
             let b = Rect::new(content.x, content.y, crate::layout::CHECKBOX_SIZE, crate::layout::CHECKBOX_SIZE);
             if checked {
-                painter.fill_rect(b, ACCENT, 4.0, &own_clip);
+                painter.fill_rect(b, ACCENT, Corners::uniform(4.0), &own_clip);
                 let (x, y, s) = (b.x, b.y, b.w);
                 painter.stroke_line((x + s * 0.22, y + s * 0.52), (x + s * 0.42, y + s * 0.72), 0xFFFF_FFFF, 2.0, &own_clip);
                 painter.stroke_line((x + s * 0.42, y + s * 0.72), (x + s * 0.78, y + s * 0.3), 0xFFFF_FFFF, 2.0, &own_clip);
             } else {
-                painter.fill_rect(b, 0xFFFF_FFFF, 4.0, &own_clip);
-                painter.stroke_rect(b, BUTTON_BORDER, 1.0, 4.0, &own_clip);
+                painter.fill_rect(b, 0xFFFF_FFFF, Corners::uniform(4.0), &own_clip);
+                painter.stroke_rect(b, BUTTON_BORDER, 1.0, Corners::uniform(4.0), &own_clip);
             }
         }
         Kind::Canvas => {
@@ -350,12 +359,12 @@ fn paint_scrollbar(inner: &Inner, id: NodeId, painter: &mut Painter, clip: &Rect
     let thumb_h = (track * viewport.h / node.content_len).clamp(SCROLLBAR_MIN.min(track), track);
     let thumb_y = viewport.y + SCROLLBAR_INSET + (track - thumb_h) * (node.scroll / limit);
     let rect = Rect::new(viewport.x + viewport.w - SCROLLBAR_WIDTH - SCROLLBAR_INSET, thumb_y, SCROLLBAR_WIDTH, thumb_h);
-    painter.fill_rect(rect, SCROLLBAR, SCROLLBAR_WIDTH / 2.0, clip);
+    painter.fill_rect(rect, SCROLLBAR, Corners::uniform(SCROLLBAR_WIDTH / 2.0), clip);
 }
 
 fn paint_canvas_cmd(inner: &mut Inner, painter: &mut Painter, cmd: &CanvasCmd, origin: (f32, f32), clip: &Rect) {
     match cmd {
-        CanvasCmd::Rect { x, y, w, h, argb } => painter.fill_rect(Rect::new(origin.0 + x, origin.1 + y, *w, *h), *argb, 0.0, clip),
+        CanvasCmd::Rect { x, y, w, h, argb } => painter.fill_rect(Rect::new(origin.0 + x, origin.1 + y, *w, *h), *argb, Corners::NONE, clip),
         CanvasCmd::Circle { cx, cy, r, argb } => painter.fill_circle((origin.0 + cx, origin.1 + cy), *r, *argb, clip),
         CanvasCmd::Line { x1, y1, x2, y2, argb, stroke } => {
             painter.stroke_line((origin.0 + x1, origin.1 + y1), (origin.0 + x2, origin.1 + y2), *argb, *stroke, clip)
@@ -380,28 +389,38 @@ fn skia_rect(r: Rect, scale: f32) -> Option<tiny_skia::Rect> {
     tiny_skia::Rect::from_xywh(r.x * scale, r.y * scale, r.w * scale, r.h * scale)
 }
 
-/// A rounded-rectangle path in physical pixels; the radius is clamped to half the shorter side.
-fn rounded_path(r: Rect, radius: f32, scale: f32) -> Option<Path> {
+/// A rounded-rectangle path in physical pixels; radii that do not fit are scaled down
+/// together, so adjacent rounded rows still share an edge exactly.
+fn rounded_path(r: Rect, corners: Corners, scale: f32) -> Option<Path> {
     if r.w <= 0.0 || r.h <= 0.0 {
         return None;
     }
-    let rad = radius.min(r.w / 2.0).min(r.h / 2.0) * scale;
-    let (x, y, w, h) = (r.x * scale, r.y * scale, r.w * scale, r.h * scale);
-    if rad <= 0.0 {
+    let c = corners.fit(r.w, r.h);
+    if c.is_zero() {
         return skia_rect(r, scale).map(PathBuilder::from_rect);
     }
+    let (x, y, w, h) = (r.x * scale, r.y * scale, r.w * scale, r.h * scale);
+    let (tl, tr, br, bl) = (c.tl * scale, c.tr * scale, c.br * scale, c.bl * scale);
     // a quarter circle approximated by one cubic per corner (kappa = 0.5523)
-    let k = rad * 0.5523;
+    let k = 0.5523;
     let mut pb = PathBuilder::new();
-    pb.move_to(x + rad, y);
-    pb.line_to(x + w - rad, y);
-    pb.cubic_to(x + w - rad + k, y, x + w, y + rad - k, x + w, y + rad);
-    pb.line_to(x + w, y + h - rad);
-    pb.cubic_to(x + w, y + h - rad + k, x + w - rad + k, y + h, x + w - rad, y + h);
-    pb.line_to(x + rad, y + h);
-    pb.cubic_to(x + rad - k, y + h, x, y + h - rad + k, x, y + h - rad);
-    pb.line_to(x, y + rad);
-    pb.cubic_to(x, y + rad - k, x + rad - k, y, x + rad, y);
+    pb.move_to(x + tl, y);
+    pb.line_to(x + w - tr, y);
+    if tr > 0.0 {
+        pb.cubic_to(x + w - tr + tr * k, y, x + w, y + tr - tr * k, x + w, y + tr);
+    }
+    pb.line_to(x + w, y + h - br);
+    if br > 0.0 {
+        pb.cubic_to(x + w, y + h - br + br * k, x + w - br + br * k, y + h, x + w - br, y + h);
+    }
+    pb.line_to(x + bl, y + h);
+    if bl > 0.0 {
+        pb.cubic_to(x + bl - bl * k, y + h, x, y + h - bl + bl * k, x, y + h - bl);
+    }
+    pb.line_to(x, y + tl);
+    if tl > 0.0 {
+        pb.cubic_to(x, y + tl - tl * k, x + tl - tl * k, y, x + tl, y);
+    }
     pb.close();
     pb.finish()
 }
@@ -439,7 +458,7 @@ mod tests {
         let b = at(px, 20, 30);
         assert!(b[0] > 200 && b[0] < 255 && b[3] == 255, "{:?}", b);
         // hovering the button darkens it
-        inner.hover_handler = 1;
+        crate::input::pointer(&mut inner, crate::input::EV_POINTER_MOVE, 20.0, 30.0);
         paint(&mut inner);
         let h = at(inner.pixmap.as_ref().unwrap(), 20, 30);
         assert!(h[0] < b[0], "{:?} vs {:?}", h, b);
@@ -458,7 +477,7 @@ mod tests {
         let mods = vec![
             (1, vec![2.0, 60.0, 3.0, 40.0, 6.0, 4294901760.0]),
             (2, vec![2.0, 60.0, 3.0, 30.0, 6.0, 4278190335.0]),
-            (3, vec![2.0, 40.0, 3.0, 40.0, 10.0, 10.0, 6.0, 4278255360.0]),
+            (3, vec![2.0, 40.0, 3.0, 40.0, 10.0, 10.0, 10.0, 10.0, 10.0, 6.0, 4278255360.0]),
         ];
         let ints: Vec<i32> = [
             [3, 0, -1, 0, -1, 0, 0, 0],
@@ -497,5 +516,39 @@ mod tests {
         paint(&mut inner);
         let px = inner.pixmap.as_ref().unwrap();
         assert_eq!(at(px, 10, 35), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn rows_rounded_only_on_their_outer_corners_form_one_shape() {
+        // two 40x20 green rows: the first rounded on top, the second on the bottom. together
+        // they read as one bubble — round at the four outer corners, square where they meet
+        let mut inner = Inner::new(60.0, 60.0, 1.0, TextSystem::monospace_only());
+        let mods = vec![
+            (1, vec![2.0, 40.0, 3.0, 20.0, 10.0, 8.0, 8.0, 0.0, 0.0, 6.0, 4278255360.0]),
+            (2, vec![2.0, 40.0, 3.0, 20.0, 10.0, 0.0, 0.0, 8.0, 8.0, 6.0, 4278255360.0]),
+        ];
+        let ints: Vec<i32> = [
+            [3, 0, -1, 0, -1, 0, 0, 0],
+            [10, 0, -1, 1, -1, 0, 0, 0],
+            [10, 0, -1, 2, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 4)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        paint(&mut inner);
+        let px = inner.pixmap.as_ref().unwrap();
+        let green = [0, 255, 0, 255];
+        let white = [255, 255, 255, 255];
+        assert_eq!(at(px, 0, 0), white, "the outer top-left corner is rounded away");
+        assert_eq!(at(px, 39, 0), white, "and the outer top-right");
+        assert_eq!(at(px, 0, 39), white, "and the outer bottom-left");
+        assert_eq!(at(px, 0, 19), green, "but the seam between them is square");
+        assert_eq!(at(px, 0, 20), green);
+        assert_eq!(at(px, 20, 19), green);
+        assert_eq!(at(px, 20, 20), green);
     }
 }

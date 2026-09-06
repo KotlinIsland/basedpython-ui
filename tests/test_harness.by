@@ -3,8 +3,8 @@ layout, hit testing and text editing end to end."""
 
 from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
-    Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, MeasureScope, Constraints, Size, compose_test,
-    chord_of_text, system_theme, WindowEvents,
+    Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
+    chord_of_text, system_theme, WindowEvents, Popup, input_position,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -348,4 +348,136 @@ def test_window_events_reach_the_runtime_and_the_appearance_needs_none():
     assert t.find_text("hits 1 last 'escape'"), t.dump()
     assert system_theme.value == "dark"
     system_theme.value = "light"
+    t.dispose()
+
+
+@composable
+def Aligned():
+    Column:
+        Row(Modifier().height(40).fill_max_width(), alignment=Alignment.Center):
+            Text("centred")
+            Text("tall", Modifier().height(30))
+        Row(Modifier().height(40).fill_max_width()):
+            Text("start")
+
+
+def test_a_row_centres_its_children_across_itself():
+    let t = compose_test:
+        Aligned()
+    let centred = t.rect_of("centred")
+    let start = t.rect_of("start")
+    assert centred[1] > 0.0, f"the centred text was moved down: {t.dump()}"
+    assert abs((centred[1] - 0.0) - (40.0 - centred[1] - centred[3])) < 1.0, "equal space above and below"
+    assert start[1] == 40.0, "the second row starts where the first ends, with its text at the top"
+    t.dispose()
+
+
+let ZERO = Dp(0.0)
+let SELECTED = Color(204, 238, 255)
+let PLAIN = Color(255, 255, 255)
+
+
+@composable
+def Bubble(rows: tuple[str, ...], selected: tuple[str, ...]):
+    Column:
+        keyed(rows).each_indexed(key=lambda name: name):
+            let row = it
+            let chosen = row.item in selected
+            let above = row.index > 0 and rows[row.index - 1] in selected
+            let below = row.index + 1 < len(rows) and rows[row.index + 1] in selected
+            let radius = ZERO if not chosen else Dp(8.0)
+            Text(
+                row.item,
+                Modifier()
+                .fill_max_width()
+                .height(20)
+                .rounded_corners(ZERO if above else radius, ZERO if above else radius, ZERO if below else radius, ZERO if below else radius)
+                .background(SELECTED if chosen else PLAIN),
+            )
+
+
+def test_each_indexed_gives_a_run_of_rows_one_outline():
+    let t = compose_test(width=120, height=120):
+        Bubble(("a", "b", "c"), ("a", "b"))
+    assert t.all_text() == ("a", "b", "c"), t.dump()
+    assert t.rect_of("a")[1] == 0.0 and t.rect_of("b")[1] == 20.0
+    # the middle of the run keeps its square seam, the ends are rounded: the modifier of
+    # each row is interned separately, so the tree shows three different chains
+    let dump = t.dump()
+    assert dump.count("mod=") >= 3, dump
+    t.dispose()
+
+
+@composable
+def Fills():
+    Column(Modifier().fill_max_size()):
+        Text("stretched", Modifier().fill_max_width().background(Color(240, 240, 240)))
+
+
+def test_a_resize_reflows_on_the_next_frame_without_recomposing():
+    let t = compose_test(width=400, height=200):
+        Fills()
+    assert t.rect_of("stretched")[2] == 400.0
+    let core: dynamic = t.core
+    core.resize(700.0, 300.0, 1.0)
+    t.advance()
+    assert t.rect_of("stretched")[2] == 700.0, f"the resize reflowed: {t.dump()}"
+    assert t.recompositions(Fills) == 1, "and nothing had to recompose for it"
+    t.dispose()
+
+
+@composable
+def Menus():
+    let menu = state((0.0, 0.0))
+    let shown = state(False)
+    let picked = state("")
+    let tip = state(False)
+    Column(Modifier().size(300, 200)):
+        Text(f"picked {picked.value!r}")
+        Text(
+            "right click me",
+            Modifier().fill_max_width().height(40).on_secondary(lambda: (menu.set(input_position()), shown.set(True)).1),
+        )
+        Text("hover me", Modifier().height(30).hoverable(lambda (entered: bool): tip.set(entered)))
+        if tip.value:
+            Text("a tooltip")
+        if shown.value:
+            let at = menu.value
+            Popup(Dp(at.0), Dp(at.1)):
+                Column(Modifier().background(Color(250, 250, 250)).border(1, Color(200, 200, 200)).padding(4)):
+                    Text("cut", Modifier().clickable(lambda: (picked.set("cut"), shown.set(False)).1))
+                    Text("copy", Modifier().clickable(lambda: (picked.set("copy"), shown.set(False)).1))
+
+
+def test_a_right_click_opens_a_popup_that_is_hit_before_what_it_covers():
+    let t = compose_test(width=300, height=200):
+        Menus()
+    assert t.find_text("picked ''")
+    assert not t.find_text("cut"), "no menu until it is asked for"
+    t.right_click("right click me")
+    t.advance()
+    assert t.find_text("cut") and t.find_text("copy"), t.dump()
+    # the menu opened where the pointer was, and is painted over the row it covers
+    let menu = t.rect_of("cut")
+    let row = t.rect_of("right click me")
+    assert menu[1] >= row[1], f"the menu is at the pointer: {menu} {row}"
+    t.click("cut")
+    t.advance()
+    assert t.find_text("picked 'cut'"), t.dump()
+    assert not t.find_text("copy"), "the menu closed"
+    t.dispose()
+
+
+def test_hovering_reports_entering_and_leaving():
+    let t = compose_test(width=300, height=200):
+        Menus()
+    assert not t.find_text("a tooltip")
+    t.hover("hover me")
+    t.advance()
+    assert t.find_text("a tooltip"), t.dump()
+    assert t.hover_target() >= 0
+    t.hover_at(299.0, 199.0)
+    t.advance()
+    assert not t.find_text("a tooltip"), "leaving takes it away"
+    assert t.hover_target() == -1
     t.dispose()

@@ -14,6 +14,13 @@ pub const EV_KEY_CHORD: i32 = 7;
 /// The system appearance the window follows (`text` is "light" or "dark"); sent when the
 /// window opens and whenever it changes.
 pub const EV_THEME: i32 = 8;
+/// The secondary (right) button, down and up, over a node carrying an `on_secondary`
+/// modifier; `handler` is that handler.
+pub const EV_SECONDARY_DOWN: i32 = 9;
+pub const EV_SECONDARY_UP: i32 = 10;
+/// The pointer entered (`text` = "1") or left (`text` = "") a node carrying a `hoverable`
+/// modifier; `handler` is that handler, `x` / `y` where the pointer is.
+pub const EV_HOVER: i32 = 11;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;
@@ -37,6 +44,17 @@ impl Event {
     }
 }
 
+/// Which handler a hit test is looking for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Which {
+    /// Buttons, checkboxes, text fields and `clickable` layers.
+    Primary,
+    /// `on_secondary` layers only — the right button falls through everything else.
+    Secondary,
+    /// `hoverable` layers only.
+    Hover,
+}
+
 /// The result of a hit test.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
@@ -55,16 +73,36 @@ impl Hit {
 /// parent; enabled buttons, checkboxes and clickable layers report their handler, disabled
 /// buttons and text fields consume the hit without one.
 pub fn hit_test(inner: &Inner, x: f32, y: f32) -> Hit {
-    let root = inner.root;
-    hit_children(inner, root, x, y).unwrap_or(Hit::NONE)
+    hit_for(inner, x, y, Which::Primary)
 }
 
-fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
+/// The topmost thing under `(x, y)` that answers to `which`. Popups are tested before the
+/// rest of the tree, because that is the order they are painted in.
+pub fn hit_for(inner: &Inner, x: f32, y: f32, which: Which) -> Hit {
+    for popup in inner.live_popups().into_iter().rev() {
+        let Some(node) = inner.nodes.get(popup) else { continue };
+        if !node.abs.contains(x, y) {
+            continue;
+        }
+        if let Some(h) = hit_children(inner, popup, x, y, which) {
+            return h;
+        }
+        // nothing in the popup answers here, so the pointer carries on down: a tooltip is
+        // not something to click, and a menu keeps its own sheet behind it to catch the
+        // clicks that dismiss it
+    }
+    hit_children(inner, inner.root, x, y, which).unwrap_or(Hit::NONE)
+}
+
+fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Option<Hit> {
     let node = inner.nodes.get(id)?;
     for &c in node.children.iter().rev() {
         let Some(child) = inner.nodes.get(c) else { continue };
+        if child.kind == Kind::Popup {
+            continue; // reached through `hit_for`, ahead of everything else
+        }
         if child.is_group() {
-            if let Some(h) = hit_children(inner, c, x, y) {
+            if let Some(h) = hit_children(inner, c, x, y, which) {
                 return Some(h);
             }
             continue;
@@ -72,7 +110,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
         if !child.abs.contains(x, y) {
             continue;
         }
-        if let Some(h) = hit_children(inner, c, x, y) {
+        if let Some(h) = hit_children(inner, c, x, y, which) {
             return Some(h);
         }
         let content = Rect::new(
@@ -81,24 +119,32 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
             child.content_size.w,
             child.content_size.h,
         );
-        match child.kind {
-            Kind::Button if content.contains(x, y) => {
-                return Some(Hit { handler: if child.a != 0 { child.handler } else { -1 }, focus: None, node: Some(c) });
+        if which == Which::Primary {
+            match child.kind {
+                Kind::Button if content.contains(x, y) => {
+                    return Some(Hit { handler: if child.a != 0 { child.handler } else { -1 }, focus: None, node: Some(c) });
+                }
+                Kind::Checkbox if content.contains(x, y) => {
+                    return Some(Hit { handler: child.handler, focus: None, node: Some(c) });
+                }
+                Kind::TextField if content.contains(x, y) => {
+                    return Some(Hit { handler: -1, focus: Some(c), node: Some(c) });
+                }
+                _ => {}
             }
-            Kind::Checkbox if content.contains(x, y) => {
-                return Some(Hit { handler: child.handler, focus: None, node: Some(c) });
-            }
-            Kind::TextField if content.contains(x, y) => {
-                return Some(Hit { handler: -1, focus: Some(c), node: Some(c) });
-            }
-            _ => {}
         }
         let lx = x - child.abs.x;
         let ly = y - child.abs.y;
         for layer in child.layers.iter().rev() {
-            if let Layer::Click { rect, handler, .. } = layer {
+            let found = match (which, layer) {
+                (Which::Primary, Layer::Click { rect, handler, .. }) => Some((rect, *handler)),
+                (Which::Secondary, Layer::Secondary { rect, handler }) => Some((rect, *handler)),
+                (Which::Hover, Layer::Hoverable { rect, handler }) => Some((rect, *handler)),
+                _ => None,
+            };
+            if let Some((rect, handler)) = found {
                 if rect.contains(lx, ly) {
-                    return Some(Hit { handler: *handler, focus: None, node: Some(c) });
+                    return Some(Hit { handler, focus: None, node: Some(c) });
                 }
             }
         }
@@ -106,23 +152,72 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
     None
 }
 
-/// A pointer event (kinds 1, 2, 3). Pointer down moves focus to the text field hit, or clears
-/// it; every kind records the handler under the pointer for hover painting.
+/// A pointer event (kinds 1, 2, 3, or 9 / 10 for the right button). Pointer down moves focus
+/// to the text field hit, or clears it; every kind records what is under the pointer, for the
+/// hover paint and for the enter / leave events `take_hover_events` hands back.
 pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
-    let hit = hit_test(inner, x, y);
+    let secondary = kind == EV_SECONDARY_DOWN || kind == EV_SECONDARY_UP;
+    let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
     if kind == EV_POINTER_DOWN {
         match hit.focus {
             Some(field) => focus_field(inner, field),
             None => inner.focus = None,
         }
     }
-    inner.hover_handler = hit.handler;
+    if !secondary {
+        inner.hover_node = hit.node;
+    }
+    update_hover_target(inner, x, y);
     Event::new(kind, x, y, hit.handler, String::new())
+}
+
+/// The `hoverable` handler of a node as of the last layout, or -1.
+fn hover_handler_of(inner: &Inner, node: Option<NodeId>) -> i32 {
+    node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(true)).unwrap_or(-1)
+}
+
+/// The handler the pointer is over, for the python side (`hovered_handler`).
+pub fn hovered_handler(inner: &Inner) -> i32 {
+    inner.hover_node.and_then(|n| inner.nodes.get(n)).map(|n| n.layer_handler(false)).unwrap_or(-1)
+}
+
+/// The `hoverable` handler the pointer is over, or -1.
+pub fn hover_target(inner: &Inner) -> i32 {
+    hover_handler_of(inner, inner.hover_target_node)
+}
+
+/// Recompute what the pointer hovers, queueing a leave and an enter when it changes. The
+/// handler each event carries is read now rather than remembered, so a node whose scope
+/// recomposed while the pointer sat on it is still told when the pointer leaves.
+pub fn update_hover_target(inner: &mut Inner, x: f32, y: f32) {
+    let target = hit_for(inner, x, y, Which::Hover).node;
+    if target == inner.hover_target_node {
+        return;
+    }
+    let leaving = hover_handler_of(inner, inner.hover_target_node);
+    inner.hover_target_node = target;
+    let entering = hover_handler_of(inner, target);
+    if leaving >= 0 {
+        inner.hover_pending.push(Event::new(EV_HOVER, x, y, leaving, String::new()));
+    }
+    if entering >= 0 {
+        inner.hover_pending.push(Event::new(EV_HOVER, x, y, entering, "1".to_string()));
+    }
+}
+
+/// The enter / leave events queued since the last call.
+pub fn take_hover_events(inner: &mut Inner) -> Vec<Event> {
+    std::mem::take(&mut inner.hover_pending)
 }
 
 /// The pointer left the window: nothing is hovered any more.
 pub fn pointer_left(inner: &mut Inner) {
-    inner.hover_handler = -1;
+    inner.hover_node = None;
+    let leaving = hover_handler_of(inner, inner.hover_target_node);
+    inner.hover_target_node = None;
+    if leaving >= 0 {
+        inner.hover_pending.push(Event::new(EV_HOVER, 0.0, 0.0, leaving, String::new()));
+    }
 }
 
 /// Scroll the innermost scrollable container under `(x, y)` by `dy` logical pixels
@@ -141,7 +236,8 @@ pub fn scroll(inner: &mut Inner, x: f32, y: f32, dy: f32) -> bool {
     }
     node.scroll = new;
     crate::layout::assign_abs(inner);
-    inner.hover_handler = hit_test(inner, x, y).handler;
+    inner.hover_node = hit_test(inner, x, y).node;
+    update_hover_target(inner, x, y);
     true
 }
 
@@ -417,10 +513,10 @@ mod tests {
         let mut inner = scrolled();
         assert_eq!(hit_test(&inner, 10.0, 75.0).handler, 2);
         assert_eq!(pointer(&mut inner, EV_POINTER_MOVE, 10.0, 75.0).handler, 2);
-        assert_eq!(inner.hover_handler, 2);
+        assert_eq!(hovered_handler(&inner), 2);
         assert!(scroll(&mut inner, 10.0, 75.0, 60.0));
         assert_eq!(hit_test(&inner, 10.0, 75.0).handler, 3, "row 3 moved under the pointer");
-        assert_eq!(inner.hover_handler, 3);
+        assert_eq!(hovered_handler(&inner), 3);
         // clamped at the end: 200 content - 100 viewport = 100
         assert!(scroll(&mut inner, 10.0, 75.0, 1000.0));
         let sc = inner.layout_children(inner.root)[0];
@@ -432,7 +528,99 @@ mod tests {
         assert!(!scroll(&mut inner, 199.0, 99.0, f32::NAN));
         assert!(!scroll(&mut inner, 300.0, 300.0, 10.0), "outside every container");
         pointer_left(&mut inner);
-        assert_eq!(inner.hover_handler, -1);
+        assert_eq!(hovered_handler(&inner), -1);
+    }
+
+    fn popup_tree() -> Inner {
+        let mut inner = Inner::new(200.0, 200.0, 1.0, TextSystem::monospace_only());
+        // mod 1: 200x200 with a clickable (handler 1) and a secondary handler (2);
+        // mod 2: a 60x40 popup body; mod 4: a 60x20 clickable (handler 3) filling its top
+        // half, so its bottom half is blank; mod 3: 50x50 hoverable (handler 4)
+        let mods = vec![
+            (1, vec![2.0, 200.0, 3.0, 200.0, 9.0, 1.0, 16.0, 2.0]),
+            (2, vec![2.0, 60.0, 3.0, 40.0]),
+            (3, vec![2.0, 50.0, 3.0, 50.0, 17.0, 4.0]),
+            (4, vec![2.0, 60.0, 3.0, 20.0, 9.0, 3.0]),
+        ];
+        let ints: Vec<i32> = [
+            [3, 0, -1, 0, -1, 0, 0, 0],       // column
+            [10, 0, -1, 3, -1, 0, 0, 0],      // hoverable spacer, 50x50 at the top
+            [10, 0, -1, 1, -1, 0, 0, 0],      // the big clickable / right-clickable spacer
+            [14, 0, -1, 0, -1, 20, 0, 20],    // a popup at (20, 20)
+            [3, 0, -1, 2, -1, 0, 0, 0],       // its body, 60x40
+            [10, 0, -1, 4, -1, 0, 0, 0],      // clickable, top half only
+            [0, 0, -1, 0, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 9)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        inner
+    }
+
+    #[test]
+    fn a_popup_is_hit_before_the_tree_under_it() {
+        let mut inner = popup_tree();
+        // the popup sits at (20, 20) and is 60x40; inside it, its own handler answers
+        assert_eq!(hit_test(&inner, 30.0, 30.0).handler, 3);
+        // its blank half is not something to click, so the pointer carries on down to what
+        // the popup covers — a tooltip must not eat the click under it
+        assert_eq!(hit_test(&inner, 30.0, 55.0).handler, 1);
+        // outside it, the tree below answers again
+        assert_eq!(hit_test(&inner, 150.0, 150.0).handler, 1);
+        // a popup that no longer exists stops being hit
+        let ints: Vec<i32> = [[3, 0, -1, 0, -1, 0, 0, 0], [0, 0, -1, 0, -1, 0, 0, 0]].iter().flatten().copied().collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 2)], &[], &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        assert!(inner.live_popups().is_empty());
+        assert_eq!(hit_test(&inner, 30.0, 30.0).handler, -1);
+    }
+
+    #[test]
+    fn the_right_button_reports_its_own_handler() {
+        let mut inner = popup_tree();
+        // the right button falls through the clickable to the secondary handler
+        let down = pointer(&mut inner, EV_SECONDARY_DOWN, 150.0, 150.0);
+        assert_eq!((down.kind, down.handler), (EV_SECONDARY_DOWN, 2));
+        let up = pointer(&mut inner, EV_SECONDARY_UP, 150.0, 150.0);
+        assert_eq!(up.handler, 2);
+        // and the left button still reports the clickable
+        assert_eq!(pointer(&mut inner, EV_POINTER_DOWN, 150.0, 150.0).handler, 1);
+        // a right click where nothing asked for one reports nothing
+        assert_eq!(pointer(&mut inner, EV_SECONDARY_DOWN, 30.0, 30.0).handler, -1);
+        // the right button leaves the hover paint alone
+        assert_eq!(hovered_handler(&inner), 1);
+    }
+
+    #[test]
+    fn entering_and_leaving_a_hoverable_is_reported_once_each() {
+        let mut inner = popup_tree();
+        assert!(take_hover_events(&mut inner).is_empty());
+        pointer(&mut inner, EV_POINTER_MOVE, 10.0, 10.0);
+        let events = take_hover_events(&mut inner);
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind, events[0].handler, events[0].text.as_str()), (EV_HOVER, 4, "1"));
+        assert_eq!(hover_target(&inner), 4);
+        // moving within it says nothing more
+        pointer(&mut inner, EV_POINTER_MOVE, 12.0, 12.0);
+        assert!(take_hover_events(&mut inner).is_empty());
+        // moving out reports the leave
+        pointer(&mut inner, EV_POINTER_MOVE, 150.0, 150.0);
+        let events = take_hover_events(&mut inner);
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].handler, events[0].text.as_str()), (4, ""));
+        assert_eq!(hover_target(&inner), -1);
+        // and leaving the window entirely reports it too
+        pointer(&mut inner, EV_POINTER_MOVE, 10.0, 10.0);
+        take_hover_events(&mut inner);
+        pointer_left(&mut inner);
+        let events = take_hover_events(&mut inner);
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].handler, events[0].text.as_str()), (4, ""));
     }
 
     #[test]

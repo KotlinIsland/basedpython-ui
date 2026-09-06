@@ -37,8 +37,8 @@ enum class ModOp:
     case Weight(value: float)
     case Align(alignment: Alignment)
     case Clickable(on_click: () -> None)
-    # corner radius for every background, border, shadow and hover layer after it in the chain
-    case Rounded(radius: Dp)
+    # corner radii for every background, border, shadow and hover layer after it in the chain
+    case Rounded(top_left: Dp, top_right: Dp, bottom_right: Dp, bottom_left: Dp)
     case Border(width: Dp, color: Color)
     # painted over the clickable layer while the pointer is over it
     case Hover(color: Color)
@@ -48,6 +48,10 @@ enum class ModOp:
     case Reveal
     # clip the node's own painting and its children to the node's rect
     case Clip
+    # the secondary (right) button over this layer
+    case Secondary(on_click: () -> None)
+    # told when the pointer enters and leaves this layer
+    case Hoverable(on_change: (bool) -> None)
 
 
 frozen data class Modifier:
@@ -87,7 +91,18 @@ frozen data class Modifier:
         return self.then(ModOp.Clickable(on_click))
 
     def rounded(self, radius: Dp) -> Modifier:
-        return self.then(ModOp.Rounded(radius))
+        return self.then(ModOp.Rounded(radius, radius, radius, radius))
+
+    def rounded_corners(self, top_left: Dp, top_right: Dp, bottom_right: Dp, bottom_left: Dp) -> Modifier:
+        """Round each corner on its own — what makes a run of adjacent nodes read as one
+        shape: round the outer corners of the run and leave the seams square."""
+        return self.then(ModOp.Rounded(top_left, top_right, bottom_right, bottom_left))
+
+    def rounded_top(self, radius: Dp) -> Modifier:
+        return self.rounded_corners(radius, radius, ZERO_DP, ZERO_DP)
+
+    def rounded_bottom(self, radius: Dp) -> Modifier:
+        return self.rounded_corners(ZERO_DP, ZERO_DP, radius, radius)
 
     def border(self, width: Dp, color: Color) -> Modifier:
         return self.then(ModOp.Border(width, color))
@@ -105,6 +120,16 @@ frozen data class Modifier:
 
     def clip(self) -> Modifier:
         return self.then(ModOp.Clip)
+
+    def on_secondary(self, on_click: () -> None) -> Modifier:
+        """The right button over this layer. It falls through buttons and text fields, so a
+        row can offer a menu without every widget on it having to forward one."""
+        return self.then(ModOp.Secondary(on_click))
+
+    def hoverable(self, on_change: (bool) -> None) -> Modifier:
+        """Called with True when the pointer enters this layer and False when it leaves —
+        what a tooltip hangs off. `input_position()` says where the pointer is."""
+        return self.then(ModOp.Hoverable(on_change))
 
 
 let NONE = Modifier()

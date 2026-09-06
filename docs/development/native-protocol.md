@@ -50,7 +50,8 @@ not copy it per element beyond one pass). records are fixed width: **8 ints per 
 | 0 | END | closes the innermost open container / scope |
 | 1 | SCOPE | opens a scope group; `a` = scope id. a scope group is transparent for layout (its children are laid out as children of the enclosing container) |
 | 2 | SCOPE_REF | `a` = scope id: keep the retained group for that scope exactly as it is (the scope was skipped) |
-| 3 | COLUMN | container; `a` = arrangement (0 start, 1 center, 2 end, 3 space-between, 4 space-evenly); children follow until END |
+| 14 | POPUP | container; `a` = x, `c` = y in logical pixels. see below |
+| 3 | COLUMN | container; `a` = arrangement (0 start, 1 center, 2 end, 3 space-between, 4 space-evenly), `c` = cross-axis alignment (0 start, 1 center, 2 end; a child's own `align` modifier wins); children follow until END |
 | 4 | ROW | container; as COLUMN |
 | 5 | BOX | container; `a` = alignment (0 start, 1 center, 2 end) |
 | 6 | TEXT | `text_idx`; `a` = style id |
@@ -327,25 +328,31 @@ hover, keyboard chords and the modifier keys of pointer events.
 
 ### SCROLL (kind 13)
 
-a container; `a` = axis and must be 0 (vertical); children follow until END. children are laid
+a container; `a` = axis and must be 0 (vertical), `c` = cross-axis alignment (0/1/2);
+children follow until END. children are laid
 out like a `Column` with an unbounded height, the node takes the height its constraints give it
 (`fill_max_height` / `weight` make it the viewport), and its painting, its children's painting
 and hit testing are clipped to its content rect. the core owns the scroll offset (clamped to
 `[0, content - viewport]` on every layout); `Core.scroll(x, y, dy)` moves the innermost
 container under the point that can still move that way and returns whether anything moved
 (the `Window` maps the mouse wheel onto it: one line = 40 logical pixels). a thin thumb is
-painted at the right edge while the content overflows. `dump()` shows `scroll=` and `content=`.
+painted at the right edge while the content overflows, and the content is then laid out one
+gutter (8 px) narrower so the thumb never covers it — narrowing can only make the content
+taller, so the second measuring pass is always the last. `dump()` shows `scroll=` and
+`content=`.
 
 ### modifier ops 10–15
 
 | op | args | effect |
 |---|---|---|
-| 10 rounded | radius | corner radius for every background, border, shadow and hover layer after it in the chain |
+| 10 rounded | tl, tr, br, bl | corner radii, clockwise from the top left, for every background, border, shadow and hover layer after it in the chain. radii that do not fit a side are scaled down together (the css rule), so adjacent rounded nodes still share an edge exactly |
 | 11 border | width, argb | a stroke inside the layer's rect (no layout effect) |
 | 12 hover | argb | painted over the chain's clickable layer while `hovered_handler()` is its handler |
 | 13 shadow | elevation, argb | a soft shadow under the layer's rect, painted before the layers after it |
 | 14 reveal | | when a node's modifier *gains* this op (a new node, or a modifier change), layout scrolls the nearest enclosing SCROLL so the node is inside its viewport, once |
 | 15 clip | | the node's own painting and its children are clipped to the node's rect |
+| 16 secondary | handler index | the right button over this layer |
+| 17 hoverable | handler index | told when the pointer enters and leaves this layer |
 
 ### style flags
 
@@ -353,11 +360,29 @@ painted at the right edge while the content overflows. `dump()` shows `scroll=` 
 family, 4 no-wrap (one line, clipped to the node's content rect when wider). other bits are a
 `ValueError`. `Style::DEFAULT` is unchanged (flags 0).
 
+### POPUP (kind 14)
+
+content that floats over the window: a menu, a tooltip. it is **outside the flow** — the
+container it is written in neither measures nor places it — it is laid out against the window
+(loose constraints), placed at `(a, c)` clamped so it stays inside, painted after everything
+else, hit before everything else, and no ancestor's `clip` applies to it. what lands on a part
+of it that answers nothing carries on down the tree, so a tooltip does not eat the click under
+it; a menu that wants the clicks around it keeps its own full-window popup behind it.
+`dump()` shows `at=x,y`.
+
 ### hover
 
-`Core.pointer(kind, x, y)` records the handler under the pointer for every kind (also 3, move);
-`Core.hovered_handler()` reads it. an enabled `Button` under the pointer is painted darker.
-the `Window` clears it when the cursor leaves the window.
+`Core.pointer(kind, x, y)` records the **node** under the pointer for every kind (also 3,
+move); `Core.hovered_handler()` reads that node's click handler as of the last layout, and an
+enabled `Button` under the pointer is painted darker. tracking the node rather than the handler
+index is what keeps a hover correct across a recomposition, which hands every handler a new
+index.
+
+a node carrying op 17 also gets **enter / leave events**: when the hovered node changes, the
+core queues a kind-11 event for the node being left (`text` = "") and one for the node being
+entered (`text` = "1"), each carrying that node's current hoverable handler and the pointer
+position. `Core.take_hover_events()` drains the queue (the `Window` does this after every
+pointer event); `Core.hover_target()` is the hoverable handler under the pointer, or -1.
 
 ### events
 
@@ -370,6 +395,11 @@ the `Window` clears it when the cursor leaves the window.
   turns the unfocused kind-4 texts into chord names (`chord_of_text`).
 - pointer events (kinds 1, 2, 3) carry the held modifiers in `text` ("", "shift",
   "shift+cmd", …) so a click handler can read them (`input_modifiers()`).
+- kinds **9 / 10** are the right button down and up. they hit-test `on_secondary` layers only,
+  falling through buttons, checkboxes and text fields, so a row can offer a menu without every
+  widget on it forwarding one. python dispatches on the up when it lands on the same handler
+  as the down, exactly as it does for the left button.
+- kind **11** is a hover enter or leave (see above).
 - kind **8 THEME**: `(8, 0, 0, -1, "light" | "dark")`, the appearance the window follows,
   sent when the window opens (when the platform reports one) and on every change; the
   python side keeps it in `basedpython_ui.app.system_theme`, a `State[str]`.
@@ -378,6 +408,8 @@ the `Window` clears it when the cursor leaves the window.
 
 ```
 def hovered_handler(self) -> int
+def hover_target(self) -> int
+def take_hover_events(self) -> list[tuple]                   # kind 11 events since the last call
 def scroll(self, x: float, y: float, dy: float) -> bool
 def scroll_offset(self, node_id: int) -> float | None          # SCROLL nodes only
 def first_scroll(self) -> tuple[int, float, float, float] | None   # (node id, offset, content, viewport), tests

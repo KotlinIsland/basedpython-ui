@@ -313,6 +313,9 @@ fn validate(
                             if !(0..=4).contains(&r.a) {
                                 bad!("record {}: arrangement {} must be 0..=4", i, r.a);
                             }
+                            if !(0..=2).contains(&r.c) {
+                                bad!("record {}: cross-axis alignment {} must be 0..=2", i, r.c);
+                            }
                         }
                         Kind::Box => {
                             if !(0..=2).contains(&r.a) {
@@ -350,6 +353,14 @@ fn validate(
                         Kind::Scroll => {
                             if r.a != 0 {
                                 bad!("record {}: scroll axis {} must be 0 (vertical)", i, r.a);
+                            }
+                            if !(0..=2).contains(&r.c) {
+                                bad!("record {}: cross-axis alignment {} must be 0..=2", i, r.c);
+                            }
+                        }
+                        Kind::Popup => {
+                            if !(-100_000..=100_000).contains(&r.a) || !(-100_000..=100_000).contains(&r.c) {
+                                bad!("record {}: popup position ({}, {}) is out of range", i, r.a, r.c);
                             }
                         }
                         Kind::Spacer | Kind::Canvas | Kind::Scope => {}
@@ -761,6 +772,9 @@ fn create(inner: &mut Inner, parent: NodeId, kind: Kind, r: &Rec, j: usize, ctx:
     if kind == Kind::Canvas {
         inner.canvas_pending.push(id);
     }
+    if kind == Kind::Popup {
+        inner.popups.push(id);
+    }
     if reveal {
         inner.reveal_pending.push(id);
     }
@@ -977,6 +991,7 @@ mod tests {
             (recs(&[column(), keyed_text(0, 1), keyed_text(0, 1), END]), vec![(0, 0, 4)]), // dup key
             (vec![1, 2, 3], vec![(0, 0, 0)]),                                 // not a multiple of 8
             (recs(&[[3, 0, -1, 0, -1, 7, 0, 0], END]), vec![(0, 0, 2)]),      // bad arrangement
+            (recs(&[[3, 0, -1, 0, -1, 0, 0, 5], END]), vec![(0, 0, 2)]),      // bad cross alignment
         ];
         for (ints, ranges) in cases {
             let r = do_commit(&mut inner, &ints, &strs, &ranges);

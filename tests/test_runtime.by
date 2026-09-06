@@ -38,6 +38,7 @@ class FakeCore:
         self.commits: int = 0
         self.last_ranges: list[(int, int, int)] = []
         self.last_refs: int = 0
+        self.layouts: int = 0
         self.disposed: list[int] = []
 
     def commit(self, ints: array[int], floats: array[float], strs: list[str], ranges: list[(int, int, int)], new_modifiers: list[(int, list[float])], new_styles: list[(int, float, float, int)]) -> list[int]:
@@ -111,8 +112,10 @@ class FakeCore:
             else:
                 out.append(rec)
 
-    def layout(self, measure: object): ...
+    def layout(self, measure: object):
+        self.layouts += 1
     def paint(self): ...
+    def resize(self, width: float, height: float, scale: float): ...
     def canvas_requests(self) -> list[(int, int, float, float)]:
         return []
     def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
@@ -140,6 +143,10 @@ class FakeCore:
         return False
     def hovered_handler(self) -> int:
         return -1
+    def hover_target(self) -> int:
+        return -1
+    def take_hover_events(self) -> list[tuple[int, float, float, int, str]]:
+        return []
     def first_scroll(self) -> tuple[int, float, float, float] | None:
         return None
     def dump(self) -> str:
@@ -214,6 +221,19 @@ def Parent():
         Leaf("b")
         Button("bump"):
             n.value += 1
+
+
+def test_every_frame_lays_out_so_a_resize_is_never_waited_out():
+    # a window resize changes what the same tree measures to without recomposing anything,
+    # so layout cannot be conditional on a commit
+    rt, core = compose(Parent)
+    assert core.layouts == 1
+    rt.frame()
+    assert core.commits == 1, "an idle frame commits nothing"
+    assert core.layouts == 2, "but it still lays out"
+    click(rt, core, "bump")
+    rt.frame()
+    assert (core.commits, core.layouts) == (2, 3)
 
 
 def test_stable_children_are_skipped():

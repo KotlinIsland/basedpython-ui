@@ -19,7 +19,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Theme, Window as WinitWindow, WindowId};
 
-use crate::input::{self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, EV_THEME, WHEEL_LINE};
+use crate::input::{
+    self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, EV_SECONDARY_DOWN,
+    EV_SECONDARY_UP, EV_THEME, WHEEL_LINE,
+};
 use crate::py::Core;
 use crate::text::TextSystem;
 use crate::tree::Inner;
@@ -178,6 +181,15 @@ impl App {
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+
+    /// Queue the enter / leave events the last pointer event produced.
+    fn push_hover(&mut self) {
+        if let Ok(events) = self.with_core(input::take_hover_events) {
+            for ev in events {
+                self.push(ev);
+            }
         }
     }
 
@@ -475,6 +487,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.fail(event_loop, e);
                     return;
                 }
+                self.push_hover();
                 if changed {
                     self.request_redraw();
                 }
@@ -495,6 +508,7 @@ impl ApplicationHandler<UserEvent> for App {
                             if let Ok(ev) = self.with_core(|inner| input::pointer(inner, EV_POINTER_MOVE, x, y)) {
                                 self.hover_handler = ev.handler;
                             }
+                            self.push_hover();
                             self.request_redraw();
                         }
                     }
@@ -524,6 +538,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                         }
                         self.push(ev);
+                        self.push_hover();
                         if hover_changed {
                             self.request_redraw();
                         }
@@ -531,8 +546,14 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(e) => self.fail(event_loop, e),
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                let kind = if state == ElementState::Pressed { EV_POINTER_DOWN } else { EV_POINTER_UP };
+            WindowEvent::MouseInput { state, button, .. } if button == MouseButton::Left || button == MouseButton::Right => {
+                let pressed = state == ElementState::Pressed;
+                let kind = match (button, pressed) {
+                    (MouseButton::Right, true) => EV_SECONDARY_DOWN,
+                    (MouseButton::Right, false) => EV_SECONDARY_UP,
+                    (_, true) => EV_POINTER_DOWN,
+                    (_, false) => EV_POINTER_UP,
+                };
                 let (x, y) = self.cursor;
                 let mods = self.modifier_text();
                 match self.with_core(|inner| {
@@ -542,6 +563,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }) {
                     Ok(ev) => {
                         self.push(ev);
+                        self.push_hover();
                         self.request_redraw();
                     }
                     Err(e) => self.fail(event_loop, e),

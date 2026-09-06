@@ -28,6 +28,7 @@ let R_SPACER = _runtime.R_SPACER
 let R_CANVAS = _runtime.R_CANVAS
 let R_LAYOUT = _runtime.R_LAYOUT
 let R_SCROLL = _runtime.R_SCROLL
+let R_POPUP = _runtime.R_POPUP
 
 
 class ColumnScope:
@@ -116,8 +117,8 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((8.0, float(alignment_code(alignment))))
             case ModOp.Clickable(on_click):
                 ops.extend((9.0, float(rt.handler(on_click))))
-            case ModOp.Rounded(radius):
-                ops.extend((10.0, radius.value))
+            case ModOp.Rounded(top_left, top_right, bottom_right, bottom_left):
+                ops.extend((10.0, top_left.value, top_right.value, bottom_right.value, bottom_left.value))
             case ModOp.Border(width, color):
                 ops.extend((11.0, width.value, float(color.argb())))
             case ModOp.Hover(color):
@@ -128,6 +129,10 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.append(14.0)
             case ModOp.Clip:
                 ops.append(15.0)
+            case ModOp.Secondary(on_click):
+                ops.extend((16.0, float(rt.handler(on_click))))
+            case ModOp.Hoverable(on_change):
+                ops.extend((17.0, float(rt.handler(on_change))))
     return ops
 
 
@@ -167,9 +172,9 @@ private def intern_modifier(rt: Runtime, modifier: Modifier) -> int:
     # a clickable carries a handler index that is scope-owned, so the chain is
     # interned by its encoded ops rather than by the modifier value
     for op in modifier.ops:
-        if op is ModOp.Clickable:
+        if op is ModOp.Clickable or op is ModOp.Secondary or op is ModOp.Hoverable:
             return rt.modifier_id_for_ops(encode_modifier(modifier, rt))
-    return rt.modifier_id(modifier, encode_modifier)
+    return rt.modifier_id(modifier, _encode_modifier)
 
 
 private def intern_style(rt: Runtime, style: TextStyle) -> int:
@@ -241,10 +246,12 @@ def Spacer(modifier: Modifier = NONE) raises ...:
 
 
 @builder
-def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: ColumnScope.() -> None) raises ...:
+def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, alignment: Alignment = Alignment.Start, once content: ColumnScope.() -> None) raises ...:
+    """`arrangement` places the children along the column, `alignment` across it; a child's
+    own `align` modifier overrides the latter."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_COLUMN, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
+    rt.ints.extend((R_COLUMN, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, alignment_code(alignment)))
     rt.depth += 1
     content(_COLUMN_SCOPE)
     rt.depth -= 1
@@ -252,10 +259,12 @@ def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Sta
 
 
 @builder
-def Row(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, once content: RowScope.() -> None) raises ...:
+def Row(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start, alignment: Alignment = Alignment.Start, once content: RowScope.() -> None) raises ...:
+    """`arrangement` places the children along the row, `alignment` across it (`Center`
+    is what makes a row of differently sized things share a centre line)."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_ROW, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
+    rt.ints.extend((R_ROW, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, alignment_code(alignment)))
     rt.depth += 1
     content(_ROW_SCOPE)
     rt.depth -= 1
@@ -273,16 +282,32 @@ def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once 
     rt.ints.extend(_END_RECORD)
 
 
-def Scroll(modifier: Modifier = NONE, once content: ColumnScope.() -> None) raises ...:
+@builder
+def Scroll(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once content: ColumnScope.() -> None) raises ...:
     """A vertically scrolling column: the content may be taller than the node, which takes
     the height its constraints give it (`fill_max_height` / `weight` make it the viewport).
-    The wheel scrolls it; a child with `Modifier().reveal()` is scrolled into view."""
+    The wheel scrolls it; a child with `Modifier().reveal()` is scrolled into view. Once the
+    content overflows, it is laid out narrower by the width of the scrollbar, which
+    therefore never covers it."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 0, k, 0))
+    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 0, k, alignment_code(alignment)))
     rt.depth += 1
     content(_COLUMN_SCOPE)
     rt.depth -= 1
+    rt.ints.extend(_END_RECORD)
+
+
+@builder
+def Popup(x: Dp, y: Dp, modifier: Modifier = NONE, once content: ColumnScope.() -> None) raises ...:
+    """Content that floats over the window at `(x, y)` — a menu, a tooltip. It is outside
+    the layout of the container it is written in (it takes no space there), it is painted
+    after everything else, it is hit before everything else, no ancestor's `clip` applies to
+    it, and it is moved back inside the window when it would not fit."""
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_POPUP, flags, -1, optional_modifier(rt, modifier), -1, int(x.value), k, int(y.value)))
+    content(_COLUMN_SCOPE)
     rt.ints.extend(_END_RECORD)
 
 

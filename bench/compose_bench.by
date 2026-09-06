@@ -36,6 +36,7 @@ class NullCore:
 
     def layout(self, measure: object): ...
     def paint(self): ...
+    def resize(self, width: float, height: float, scale: float): ...
     def canvas_requests(self) -> list[(int, int, float, float)]:
         return []
     def set_canvas_commands(self, node_id: int, floats: array[float], strs: list[str]): ...
@@ -60,6 +61,10 @@ class NullCore:
         return False
     def hovered_handler(self) -> int:
         return -1
+    def hover_target(self) -> int:
+        return -1
+    def take_hover_events(self) -> list[tuple[int, float, float, int, str]]:
+        return []
     def first_scroll(self) -> tuple[int, float, float, float] | None:
         return None
     def dump(self) -> str:

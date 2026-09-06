@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use slotmap::SlotMap;
 
+use crate::input::Event;
 use crate::text::{TextKey, TextSystem};
 use crate::types::*;
 
@@ -46,6 +47,8 @@ pub struct Node {
     /// SCROLL: the current offset of the content (logical pixels, >= 0) and its full length.
     pub scroll: f32,
     pub content_len: f32,
+    /// POPUP: where its content sits in the window, after clamping it into view.
+    pub popup_at: (f32, f32),
     /// Commit serial of the last reconciliation that reused this node (see `commit.rs`).
     pub mark: u32,
     /// Commit serial of the reconciliation frame currently running on this container.
@@ -93,6 +96,7 @@ impl Node {
             canvas_pending: false,
             scroll: 0.0,
             content_len: 0.0,
+            popup_at: (0.0, 0.0),
             mark: 0,
             frame_serial: 0,
             dirty: true,
@@ -114,6 +118,18 @@ impl Node {
 
     pub fn text_str(&self) -> &str {
         self.text.as_deref().unwrap_or("")
+    }
+
+    /// The handler of the first layer of a kind, as of the last layout.
+    pub fn layer_handler(&self, hoverable: bool) -> i32 {
+        for layer in self.layers.iter().rev() {
+            match layer {
+                Layer::Hoverable { handler, .. } if hoverable => return *handler,
+                Layer::Click { handler, .. } if !hoverable => return *handler,
+                _ => {}
+            }
+        }
+        -1
     }
 
     /// The content rect (inside the modifier layers) in absolute coordinates; valid after layout.
@@ -154,10 +170,17 @@ pub struct Inner {
     pub focus: Option<Focus>,
     /// Canvas nodes whose draw block must run again (flag `canvas_pending` on the node too).
     pub canvas_pending: Vec<NodeId>,
+    /// Popups, in creation order: laid out against the window, painted last, hit first.
+    pub popups: Vec<NodeId>,
     /// Nodes whose modifier gained `reveal` this commit: layout scrolls them into view.
     pub reveal_pending: Vec<NodeId>,
-    /// Handler index under the pointer as of the last pointer event, or -1 (paint reads it).
-    pub hover_handler: i32,
+    /// What the pointer is over, as of the last pointer event. Nodes rather than handler
+    /// indices: a handler index belongs to one composition, and the node outlives it, so a
+    /// scope that recomposes while the pointer rests on it keeps its hover.
+    pub hover_node: Option<NodeId>,
+    pub hover_target_node: Option<NodeId>,
+    /// The enter / leave events not yet taken.
+    pub hover_pending: Vec<Event>,
     /// commit, layout, paint durations of the last calls, in milliseconds.
     pub timings: [f64; 3],
     pub commit_serial: u32,
@@ -193,8 +216,11 @@ impl Inner {
             pixmap: None,
             focus: None,
             canvas_pending: Vec::new(),
+            popups: Vec::new(),
             reveal_pending: Vec::new(),
-            hover_handler: -1,
+            hover_node: None,
+            hover_target_node: None,
+            hover_pending: Vec::new(),
             timings: [0.0; 3],
             commit_serial: 0,
             layout_epoch: 0,
@@ -263,7 +289,8 @@ impl Inner {
         self.nodes.values().filter(|n| !n.is_group()).count()
     }
 
-    /// Children as layout sees them: scope groups flattened in place.
+    /// Children as layout sees them: scope groups flattened in place, popups left out —
+    /// they are laid out against the window rather than by the container they sit in.
     pub fn layout_children(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
         self.collect_layout_children(id, &mut out);
@@ -275,10 +302,16 @@ impl Inner {
         for &c in &node.children {
             match self.nodes.get(c) {
                 Some(child) if child.is_group() => self.collect_layout_children(c, out),
+                Some(child) if child.kind == Kind::Popup => {}
                 Some(_) => out.push(c),
                 None => {}
             }
         }
+    }
+
+    /// The popups still in the tree, in creation order.
+    pub fn live_popups(&self) -> Vec<NodeId> {
+        self.popups.iter().copied().filter(|&p| self.nodes.contains_key(p)).collect()
     }
 
     /// Whether `node` is `ancestor` or one of its descendants.
@@ -312,7 +345,16 @@ impl Inner {
             if node.canvas_pending {
                 self.canvas_pending.retain(|&c| c != n);
             }
+            if self.hover_node == Some(n) {
+                self.hover_node = None;
+            }
+            if self.hover_target_node == Some(n) {
+                self.hover_target_node = None;
+            }
             self.reveal_pending.retain(|&c| c != n);
+            if node.kind == Kind::Popup {
+                self.popups.retain(|&c| c != n);
+            }
             for c in node.children {
                 if self.nodes.get(c).map(|cn| cn.parent) == Some(Some(n)) {
                     stack.push(c);
@@ -458,12 +500,18 @@ impl Inner {
             match node.kind {
                 Kind::Column | Kind::Row => {
                     let _ = write!(out, " arrangement={}", node.a);
+                    if node.c != 0 {
+                        let _ = write!(out, " alignment={}", node.c);
+                    }
                 }
                 Kind::Box => {
                     let _ = write!(out, " alignment={}", node.a);
                 }
                 Kind::Scroll => {
                     let _ = write!(out, " scroll={} content={}", fmt(node.scroll), fmt(node.content_len));
+                }
+                Kind::Popup => {
+                    let _ = write!(out, " at={},{}", fmt(node.popup_at.0), fmt(node.popup_at.1));
                 }
                 Kind::Button => {
                     if node.a == 0 {

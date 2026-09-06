@@ -514,11 +514,13 @@ impl Core {
         })
     }
 
-    /// A pointer event (1 down, 2 up, 3 move) at logical `(x, y)`; returns the protocol tuple.
-    /// Down focuses the text field hit (or blurs). The `Window` uses this; headless tests can too.
+    /// A pointer event (1 down, 2 up, 3 move, 9 right down, 10 right up) at logical `(x, y)`;
+    /// returns the protocol tuple. Down focuses the text field hit (or blurs), and a right
+    /// button reports the `on_secondary` handler instead. The `Window` uses this; headless
+    /// tests can too.
     fn pointer(&self, kind: i32, x: f64, y: f64) -> PyResult<EventTuple> {
-        if !(1..=3).contains(&kind) {
-            return Err(PyValueError::new_err("pointer kind must be 1 (down), 2 (up) or 3 (move)"));
+        if !(1..=3).contains(&kind) && !(9..=10).contains(&kind) {
+            return Err(PyValueError::new_err("pointer kind must be 1 (down), 2 (up), 3 (move), 9 (right down) or 10 (right up)"));
         }
         let x = finite(x, "x")?;
         let y = finite(y, "y")?;
@@ -535,6 +537,17 @@ impl Core {
         self.with_state(true, |inner| Ok(input::key_named(inner, name).map(|e| e.tuple())))
     }
 
+    /// The enter / leave events queued by the pointer since the last call: kind 11 tuples
+    /// whose `text` is "1" for an enter and "" for a leave.
+    fn take_hover_events(&self) -> PyResult<Vec<EventTuple>> {
+        self.with_state(true, |inner| Ok(input::take_hover_events(inner).iter().map(|e| e.tuple()).collect()))
+    }
+
+    /// The `hoverable` handler the pointer is over, or -1.
+    fn hover_target(&self) -> PyResult<i32> {
+        self.with_state(false, |inner| Ok(input::hover_target(inner)))
+    }
+
     /// Handler index of the focused text field, or -1.
     fn focused_handler(&self) -> PyResult<i32> {
         self.with_state(false, |inner| Ok(input::focused_handler(inner)))
@@ -542,7 +555,7 @@ impl Core {
 
     /// Handler index under the pointer as of the last pointer event, or -1.
     fn hovered_handler(&self) -> PyResult<i32> {
-        self.with_state(false, |inner| Ok(inner.hover_handler))
+        self.with_state(false, |inner| Ok(input::hovered_handler(inner)))
     }
 
     /// Scroll the innermost scroll container under `(x, y)` by `dy` logical pixels (positive

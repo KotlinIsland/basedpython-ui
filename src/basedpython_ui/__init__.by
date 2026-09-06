@@ -32,6 +32,7 @@ from .runtime export (
     TRACE_FORMAT,
     on_key,
     input_modifiers,
+    input_position,
 )
 from .widgets export (
     ColumnScope,
@@ -48,6 +49,7 @@ from .widgets export (
     Row,
     Box,
     Scroll,
+    Popup,
     Canvas,
     Layout,
 )
