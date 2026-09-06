@@ -43,6 +43,8 @@ cd .. && PYTHONPATH=src .venv/bin/python -m pytest native/tests -q -s   # bounda
   `paint.rs`.
 - text fields: single line, caret, insert / delete / arrows / home / end, tab cycles fields,
   escape blurs; no selection, clipboard or IME composition.
-- buttons and fields are flat rectangles; no rounded corners, hover or pressed states.
+- buttons and fields have rounded corners and a hover fill; no pressed state or animation.
+- `Scroll` is vertical only, without momentum or keyboard scrolling of its own (`reveal`
+  covers the selection-follows-keyboard case); no horizontal scrolling.
 - canvas commands are not clipped to the canvas.
 - one window (winit allows one event loop per process); the loop must run on the main thread.

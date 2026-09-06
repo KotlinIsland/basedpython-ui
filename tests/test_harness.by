@@ -2,8 +2,9 @@
 layout, hit testing and text editing end to end."""
 
 from basedpython_ui import (
-    composable, state, state_list, derived, Column, Row, Text, Button, TextField, Checkbox, Modifier, Canvas, Layout,
-    MeasureScope, Constraints, Size, compose_test,
+    composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
+    Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, MeasureScope, Constraints, Size, compose_test,
+    chord_of_text,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -163,4 +164,133 @@ def test_compose_test_without_tracing():
     t.advance()
     assert t.find_text("count = 2"), t.dump()
     assert t.why(Counter) == () and t.runtime.trace is None
+
+
+@composable
+def Rows():
+    let selected = state(0)
+
+    def handle(chord: str) -> bool:
+        if chord == "down":
+            selected.value += 1
+            return True
+        if chord == "up":
+            selected.value -= 1
+            return True
+        return False
+
+    on_key(handle)
+    Column(Modifier().size(200, 100)):
+        Scroll(Modifier().fill_max_size()):
+            keyed(range(10)).each(key=lambda i: i):
+                let i = it
+                Text(
+                    f"row {i}",
+                    Modifier().height(30).fill_max_width().reveal(i == selected.value).hover("#eeeeee").clickable(lambda: selected.set(i)),
+                )
+
+
+def test_scroll_container_wheel_reveal_hover_and_keys():
+    let t = compose_test(width=200, height=100):
+        Rows()
+    assert t.find_text("row 0") and t.find_text("row 9"), t.dump()
+    assert t.rect_of("row 9")[1] >= 100.0, "the last row starts below the viewport"
+    assert t.scroll("row 1", 60.0)
+    assert t.rect_of("row 0")[1] == -60.0 and t.scroll_offset() == 60.0, t.dump()
+    assert not t.scroll("row 1", -1000.0) or t.scroll_offset() == 0.0
+    t.hover("row 3")
+    assert t.hovered_handler() >= 0, "a hoverable row reports its handler"
+    for _ in range(5):
+        assert t.press("down")
+    t.advance()
+    let y = t.rect_of("row 5")[1]
+    assert 0.0 <= y and y + 30.0 <= 100.0, f"the selected row was scrolled into view: {t.dump()}"
+    assert not t.press("left"), "an unbound chord is declined"
+    assert t.rect_of("row 2")[1] < 0.0, "row 2 is scrolled out, so it cannot be clicked"
+    t.click("row 4")
+    t.advance()
+    assert t.press("up") and t.press("up")
+    t.advance()
+    assert 0.0 <= t.rect_of("row 2")[1] <= 70.0, f"the selection went back to row 2 and revealed it: {t.dump()}"
+    assert "Scroll" in t.dump()
+    t.dispose()
+
+
+@composable
+def ModifierClicks():
+    let seen = state("")
+    Column:
+        Button("pick"):
+            seen.value = input_modifiers()
+        Text(f"mods={seen.value!r}")
+
+
+def test_click_modifiers_reach_the_handler():
+    let t = compose_test:
+        ModifierClicks()
+    t.click("pick", modifiers="shift+cmd")
+    t.advance()
+    assert t.find_text("mods='shift+cmd'"), t.dump()
+    t.click("pick")
+    t.advance()
+    assert t.find_text("mods=''"), t.dump()
+    t.dispose()
+
+
+@composable
+def Styled():
+    Column(Modifier().width(120)):
+        Text("0123456789 0123456789 0123456789", style=TextStyle(mono=True, nowrap=True))
+        Text("0123456789 0123456789 0123456789")
+
+
+def test_nowrap_text_stays_on_one_line():
+    let t = compose_test:
+        Styled()
+    let one = t.rect_of("0123456789 0123456789 0123456789")
+    assert one[3] < 30.0, f"a single line: {one}"
+    assert one[2] <= 120.0, "and no wider than its column"
+    t.dispose()
+
+
+def test_chord_names():
+    assert chord_of_text("\n") == "enter"
+    assert chord_of_text("\x1b") == "escape"
+    assert chord_of_text("\x08") == "backspace"
+    assert chord_of_text("X") == "shift+x"
+    assert chord_of_text("j") == "j"
+    assert chord_of_text(" ") == "space"
+
+
+frozen data class Entry:
+    id: int
+    left: str
+    right: str
+
+
+@composable
+def Table():
+    let entries = state_list([Entry(1, "a", "b"), Entry(2, "c", "d")])
+    Column:
+        entries.each(key=lambda entry: entry.id):
+            let entry = it
+            Row:
+                Text(entry.left)
+                Text(entry.right)
+        Button("swap"):
+            entries[0] = Entry(2, "c", "d")
+            entries[1] = Entry(1, "a", "b")
+
+
+def test_a_key_covers_the_group_not_what_is_nested_in_it():
+    # two texts inside one keyed row must not both carry the row's key
+    let t = compose_test:
+        Table()
+    assert t.all_text() == ("a", "b", "c", "d", "swap"), t.dump()
+    let first_row_before = t.rect_of("a")
+    t.click("swap")
+    t.advance()
+    assert t.all_text() == ("c", "d", "a", "b", "swap"), t.dump()
+    assert t.rect_of("c")[:2] == first_row_before[:2], "the rows were reconciled by key"
+    assert "key=1" in t.dump() and "key=2" in t.dump()
     t.dispose()

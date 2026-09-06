@@ -17,9 +17,14 @@ frozen data class TextStyle:
     size: Dp = Dp(14.0)
     color: Color = Color(32, 32, 32)
     bold: bool = False
+    # shape with the monospace family
+    mono: bool = False
+    # never wrap: one line, cut off at the node's edge when it is wider
+    nowrap: bool = False
 
 
 let DEFAULT_TEXT_STYLE = TextStyle()
+let SHADOW_COLOR = Color(0, 0, 0, 40)
 
 
 enum class ModOp:
@@ -32,6 +37,17 @@ enum class ModOp:
     case Weight(value: float)
     case Align(alignment: Alignment)
     case Clickable(on_click: () -> None)
+    # corner radius for every background, border, shadow and hover layer after it in the chain
+    case Rounded(radius: Dp)
+    case Border(width: Dp, color: Color)
+    # painted over the clickable layer while the pointer is over it
+    case Hover(color: Color)
+    # a soft drop shadow under the layer; `elevation` is its spread
+    case Shadow(elevation: Dp, color: Color)
+    # ask the nearest `Scroll` to bring the node into view when this op appears
+    case Reveal
+    # clip the node's own painting and its children to the node's rect
+    case Clip
 
 
 frozen data class Modifier:
@@ -69,6 +85,26 @@ frozen data class Modifier:
 
     def clickable(self, on_click: () -> None) -> Modifier:
         return self.then(ModOp.Clickable(on_click))
+
+    def rounded(self, radius: Dp) -> Modifier:
+        return self.then(ModOp.Rounded(radius))
+
+    def border(self, width: Dp, color: Color) -> Modifier:
+        return self.then(ModOp.Border(width, color))
+
+    def hover(self, color: Color) -> Modifier:
+        """Paint `color` over the clickable layer of this chain while the pointer is over it."""
+        return self.then(ModOp.Hover(color))
+
+    def shadow(self, elevation: Dp, color: Color = SHADOW_COLOR) -> Modifier:
+        return self.then(ModOp.Shadow(elevation, color))
+
+    def reveal(self, when: bool = True) -> Modifier:
+        """Scroll the node into view when `when` turns true (a selection moving with the keyboard)."""
+        return self.then(ModOp.Reveal) if when else self
+
+    def clip(self) -> Modifier:
+        return self.then(ModOp.Clip)
 
 
 let NONE = Modifier()

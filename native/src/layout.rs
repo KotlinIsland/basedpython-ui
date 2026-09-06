@@ -93,7 +93,49 @@ pub fn layout_tree<H: MeasureHost>(inner: &mut Inner, host: &mut H) {
     r.dirty = volatile;
     r.offset = (0.0, 0.0);
     assign_abs(inner);
+    apply_reveals(inner);
     inner.text.end_layout();
+}
+
+/// Scroll the nearest scroll container of every node that asked to be revealed this commit.
+fn apply_reveals(inner: &mut Inner) {
+    let pending = std::mem::take(&mut inner.reveal_pending);
+    let mut changed = false;
+    for id in pending {
+        changed |= reveal(inner, id);
+    }
+    if changed {
+        assign_abs(inner);
+    }
+}
+
+/// Adjust the nearest enclosing SCROLL so `id` is inside its viewport; true when it moved.
+pub fn reveal(inner: &mut Inner, id: NodeId) -> bool {
+    let Some(node) = inner.nodes.get(id) else { return false };
+    let target = node.abs;
+    let mut cursor = node.parent;
+    while let Some(p) = cursor {
+        let Some(parent) = inner.nodes.get(p) else { return false };
+        if parent.kind == Kind::Scroll {
+            let viewport = parent.content_rect();
+            let delta = if target.y < viewport.y {
+                target.y - viewport.y
+            } else if target.y + target.h > viewport.y + viewport.h {
+                (target.y + target.h - viewport.y - viewport.h).min(target.y - viewport.y)
+            } else {
+                0.0
+            };
+            let limit = parent.scroll_limit();
+            let new = (parent.scroll + delta).clamp(0.0, limit);
+            if new != parent.scroll {
+                inner.nodes[p].scroll = new;
+                return true;
+            }
+            return false;
+        }
+        cursor = parent.parent;
+    }
+    false
 }
 
 /// Lay out one node (never a scope group) under `c`; returns its size. Served from the cache
@@ -117,7 +159,7 @@ pub fn layout_node<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints
     let n = &mut inner.nodes[id];
     n.layers.clear();
     n.volatile = false;
-    let size = layout_layer(inner, id, &modifier, 0, c, (0.0, 0.0), host);
+    let size = layout_layer(inner, id, &modifier, 0, c, (0.0, 0.0), 0.0, host);
     let n = &mut inner.nodes[id];
     n.layers.reverse();
     n.size = size;
@@ -140,7 +182,9 @@ fn sanitize(c: Constraints) -> Constraints {
     Constraints { min_w, max_w, min_h, max_h }
 }
 
-/// Apply modifier op `i` and the rest of the chain, ending in the content.
+/// Apply modifier op `i` and the rest of the chain, ending in the content. `radius` is the
+/// corner radius in effect (set by `Rounded`, read by the layers after it).
+#[allow(clippy::too_many_arguments)]
 fn layout_layer<H: MeasureHost>(
     inner: &mut Inner,
     id: NodeId,
@@ -148,6 +192,7 @@ fn layout_layer<H: MeasureHost>(
     i: usize,
     c: Constraints,
     origin: (f32, f32),
+    radius: f32,
     host: &mut H,
 ) -> Size {
     let Some(op) = m.ops.get(i).copied() else {
@@ -156,36 +201,49 @@ fn layout_layer<H: MeasureHost>(
     match op {
         ModOp::Padding { l, t, r, b } => {
             let inner_c = c.deflate(l + r, t + b);
-            let s = layout_layer(inner, id, m, i + 1, inner_c, (origin.0 + l, origin.1 + t), host);
+            let s = layout_layer(inner, id, m, i + 1, inner_c, (origin.0 + l, origin.1 + t), radius, host);
             c.constrain(Size::new(s.w + l + r, s.h + t + b))
         }
         ModOp::Width(v) => {
             let w = clamp(v, c.min_w, c.max_w);
-            layout_layer(inner, id, m, i + 1, Constraints { min_w: w, max_w: w, ..c }, origin, host)
+            layout_layer(inner, id, m, i + 1, Constraints { min_w: w, max_w: w, ..c }, origin, radius, host)
         }
         ModOp::Height(v) => {
             let h = clamp(v, c.min_h, c.max_h);
-            layout_layer(inner, id, m, i + 1, Constraints { min_h: h, max_h: h, ..c }, origin, host)
+            layout_layer(inner, id, m, i + 1, Constraints { min_h: h, max_h: h, ..c }, origin, radius, host)
         }
         ModOp::FillMaxWidth => {
             let cc = if c.max_w.is_finite() { Constraints { min_w: c.max_w, ..c } } else { c };
-            layout_layer(inner, id, m, i + 1, cc, origin, host)
+            layout_layer(inner, id, m, i + 1, cc, origin, radius, host)
         }
         ModOp::FillMaxHeight => {
             let cc = if c.max_h.is_finite() { Constraints { min_h: c.max_h, ..c } } else { c };
-            layout_layer(inner, id, m, i + 1, cc, origin, host)
+            layout_layer(inner, id, m, i + 1, cc, origin, radius, host)
         }
         ModOp::Background(argb) => {
-            let s = layout_layer(inner, id, m, i + 1, c, origin, host);
-            inner.nodes[id].layers.push(Layer::Background { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb });
+            let s = layout_layer(inner, id, m, i + 1, c, origin, radius, host);
+            inner.nodes[id].layers.push(Layer::Background { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb, radius });
             s
         }
         ModOp::Clickable(handler) => {
-            let s = layout_layer(inner, id, m, i + 1, c, origin, host);
-            inner.nodes[id].layers.push(Layer::Click { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
+            let s = layout_layer(inner, id, m, i + 1, c, origin, radius, host);
+            inner.nodes[id].layers.push(Layer::Click { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler, hover: m.hover, radius });
             s
         }
-        ModOp::Weight(_) | ModOp::Align(_) => layout_layer(inner, id, m, i + 1, c, origin, host),
+        ModOp::Rounded(r) => layout_layer(inner, id, m, i + 1, c, origin, r, host),
+        ModOp::Border { width, argb } => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, radius, host);
+            inner.nodes[id].layers.push(Layer::Border { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb, width, radius });
+            s
+        }
+        ModOp::Shadow { elevation, argb } => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, radius, host);
+            inner.nodes[id].layers.push(Layer::Shadow { rect: Rect::new(origin.0, origin.1, s.w, s.h), radius, elevation, argb });
+            s
+        }
+        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Reveal | ModOp::Clip => {
+            layout_layer(inner, id, m, i + 1, c, origin, radius, host)
+        }
     }
 }
 
@@ -236,6 +294,7 @@ fn layout_content<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints,
         Kind::Column | Kind::Row => layout_flex(inner, id, c, origin, kind == Kind::Column, host),
         Kind::Box => layout_box(inner, id, c, origin, host),
         Kind::Layout => layout_custom(inner, id, c, origin, host),
+        Kind::Scroll => layout_scroll(inner, id, c, origin, host),
         Kind::Scope => panic!("internal: layout_content on a scope group"),
     };
     let node = &mut inner.nodes[id];
@@ -330,6 +389,38 @@ fn layout_flex<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, or
     if vertical { Size::new(cross_size, main_size) } else { Size::new(main_size, cross_size) }
 }
 
+/// A vertical scroll container: children are stacked with an unbounded height, the node
+/// itself takes what its constraints give it (so `fill_max_height` / `weight` make it a
+/// viewport), and `assign_abs` shifts the children up by the scroll offset.
+fn layout_scroll<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, origin: (f32, f32), host: &mut H) -> Size {
+    let children = inner.layout_children(id);
+    let child_c = Constraints { min_w: 0.0, max_w: c.max_w, min_h: 0.0, max_h: f32::INFINITY };
+    let mut total = 0.0f32;
+    let mut cross = 0.0f32;
+    let mut sizes = Vec::with_capacity(children.len());
+    let mut volatile = false;
+    for &ch in &children {
+        let s = layout_node(inner, ch, child_c, host);
+        total += s.h;
+        cross = cross.max(s.w);
+        sizes.push(s);
+        volatile |= inner.nodes[ch].volatile;
+    }
+    let size = c.constrain(Size::new(cross, total));
+    let mut pos = 0.0f32;
+    for (i, &ch) in children.iter().enumerate() {
+        let align = inner.nodes[ch].modifier.align.unwrap_or(0);
+        let cross_off = (size.w - sizes[i].w).max(0.0) * align_factor(align);
+        inner.nodes[ch].offset = (origin.0 + cross_off, origin.1 + pos);
+        pos += sizes[i].h;
+    }
+    let node = &mut inner.nodes[id];
+    node.content_len = total;
+    node.scroll = node.scroll.clamp(0.0, (total - size.h).max(0.0));
+    node.volatile = volatile;
+    size
+}
+
 fn layout_box<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, origin: (f32, f32), host: &mut H) -> Size {
     let children = inner.layout_children(id);
     let box_align = inner.nodes[id].a.clamp(0, 2) as u8;
@@ -387,26 +478,28 @@ fn layout_custom<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, 
     size
 }
 
-/// Absolute rects for every node: offsets are relative to the nearest layout container.
-fn assign_abs(inner: &mut Inner) {
+/// Absolute rects for every node: offsets are relative to the nearest layout container, and
+/// the children of a SCROLL node are shifted up by its scroll offset. Cheap enough to re-run
+/// on every scroll (no measuring).
+pub fn assign_abs(inner: &mut Inner) {
     let root = inner.root;
-    let mut stack: Vec<(NodeId, (f32, f32))> = vec![(root, (0.0, 0.0))];
-    while let Some((id, base)) = stack.pop() {
+    let mut stack: Vec<(NodeId, (f32, f32), f32)> = vec![(root, (0.0, 0.0), 0.0)];
+    while let Some((id, base, scroll)) = stack.pop() {
         let Some(node) = inner.nodes.get_mut(id) else { continue };
-        let child_base = if node.is_group() {
+        let (child_base, child_scroll) = if node.is_group() {
             node.abs = Rect::new(base.0, base.1, 0.0, 0.0);
-            base
+            (base, scroll)
         } else {
             let x = base.0 + node.offset.0;
-            let y = base.1 + node.offset.1;
+            let y = base.1 + node.offset.1 - scroll;
             node.abs = Rect::new(x, y, node.size.w, node.size.h);
-            (x, y)
+            ((x, y), if node.kind == Kind::Scroll { node.scroll } else { 0.0 })
         };
         if id == root {
             node.abs = Rect::new(0.0, 0.0, node.size.w, node.size.h);
         }
         for &c in node.children.iter().rev() {
-            stack.push((c, child_base));
+            stack.push((c, child_base, child_scroll));
         }
     }
 }
@@ -544,8 +637,8 @@ mod tests {
         let id = inner.layout_children(inner.layout_children(inner.root)[0])[2];
         let layers = &inner.nodes[id].layers;
         assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0], Layer::Background { rect: Rect::new(0.0, 0.0, 10.0, 10.0), argb: 0xFFFF0000 });
-        assert_eq!(layers[1], Layer::Background { rect: Rect::new(5.0, 5.0, 0.0, 0.0), argb: 0xFF0000FF });
+        assert_eq!(layers[0], Layer::Background { rect: Rect::new(0.0, 0.0, 10.0, 10.0), argb: 0xFFFF0000, radius: 0.0 });
+        assert_eq!(layers[1], Layer::Background { rect: Rect::new(5.0, 5.0, 0.0, 0.0), argb: 0xFF0000FF, radius: 0.0 });
     }
 
     #[test]
@@ -599,6 +692,62 @@ mod tests {
         layout_tree(&mut inner, &mut NoHost::default());
         assert_eq!(rect_of(&inner, &[0, 0]).w, 34.0);
         assert_eq!(rect_of(&inner, &[0]).w, 34.0);
+    }
+
+    fn scroll(m: i32) -> [i32; 8] {
+        [13, 0, -1, m, -1, 0, 0, 0]
+    }
+
+    #[test]
+    fn scroll_container_offsets_children_and_clamps() {
+        let mut inner = core();
+        // mod 1: 50x50 spacer; mod 2: width 200 height 120 (the viewport); mod 3: 50x50 + reveal
+        let mods = vec![(1, vec![2.0, 50.0, 3.0, 50.0]), (2, vec![2.0, 200.0, 3.0, 120.0]), (3, vec![2.0, 50.0, 3.0, 50.0, 14.0])];
+        let ints = recs(&[column(0, 0), scroll(2), spacer(1), spacer(1), spacer(1), spacer(1), END, text(0, 0), END]);
+        run(&mut inner, &ints, &["x"], &mods);
+        let sc = inner.layout_children(inner.layout_children(inner.root)[0])[0];
+        assert_eq!(inner.nodes[sc].size, Size::new(200.0, 120.0));
+        assert_eq!(inner.nodes[sc].content_len, 200.0);
+        assert_eq!(inner.nodes[sc].scroll_limit(), 80.0);
+        assert_eq!(rect_of(&inner, &[0, 0, 2]), Rect::new(0.0, 100.0, 50.0, 50.0));
+        // the text after the scroll sits right below the viewport, not below the content
+        assert_eq!(rect_of(&inner, &[0, 1]).y, 120.0);
+        // scrolling moves the children up, and is clamped to the limit
+        inner.nodes[sc].scroll = 500.0;
+        layout_tree(&mut inner, &mut NoHost::default());
+        assert_eq!(inner.nodes[sc].scroll, 500.0, "a clean tree is not re-laid out");
+        inner.nodes[sc].scroll = 30.0;
+        assign_abs(&mut inner);
+        assert_eq!(rect_of(&inner, &[0, 0, 2]).y, 70.0);
+        assert_eq!(rect_of(&inner, &[0, 0]).y, 0.0, "the viewport itself does not move");
+        // a child gaining `reveal` scrolls the container so it is visible
+        let ints = recs(&[column(0, 0), scroll(2), spacer(1), spacer(1), spacer(1), spacer(3), END, text(0, 0), END]);
+        commit(&mut inner, &ints, &["x"], &[(0, 0, 9)], &[], &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        assert_eq!(inner.nodes[sc].scroll, 80.0);
+        assert_eq!(rect_of(&inner, &[0, 0, 3]), Rect::new(0.0, 70.0, 50.0, 50.0));
+        // revealing the first child scrolls back up
+        let ints = recs(&[column(0, 0), scroll(2), spacer(3), spacer(1), spacer(1), spacer(1), END, text(0, 0), END]);
+        commit(&mut inner, &ints, &["x"], &[(0, 0, 9)], &[], &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        assert_eq!(inner.nodes[sc].scroll, 0.0);
+    }
+
+    #[test]
+    fn decorated_layers_record_radius_border_shadow_and_hover() {
+        let mut inner = core();
+        // shadow, rounded 8, background, border, hover + clickable, then padding 4 and size
+        let mods = vec![(1, vec![13.0, 3.0, 2164260864.0, 10.0, 8.0, 6.0, 4294967295.0, 11.0, 1.0, 4278190080.0, 12.0, 4278255360.0, 9.0, 3.0, 1.0, 4.0, 4.0, 4.0, 4.0, 2.0, 40.0, 3.0, 20.0])];
+        let ints = recs(&[column(0, 0), spacer(1), END]);
+        run(&mut inner, &ints, &[], &mods);
+        let id = inner.layout_children(inner.layout_children(inner.root)[0])[0];
+        let layers = &inner.nodes[id].layers;
+        assert_eq!(layers.len(), 4);
+        let rect = Rect::new(0.0, 0.0, 48.0, 28.0);
+        assert_eq!(layers[0], Layer::Shadow { rect, radius: 0.0, elevation: 3.0, argb: 0x81000000 });
+        assert_eq!(layers[1], Layer::Background { rect, argb: 0xFFFFFFFF, radius: 8.0 });
+        assert_eq!(layers[2], Layer::Border { rect, argb: 0xFF000000, width: 1.0, radius: 8.0 });
+        assert_eq!(layers[3], Layer::Click { rect, handler: 3, hover: Some(0xFF00FF00), radius: 8.0 });
     }
 
     /// A custom layout that stacks children diagonally and claims 300x300.

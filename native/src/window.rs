@@ -14,12 +14,12 @@ use pyo3::prelude::*;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window as WinitWindow, WindowId};
 
-use crate::input::{self, Event, EV_CLOSE, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE};
+use crate::input::{self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, WHEEL_LINE};
 use crate::py::Core;
 use crate::text::TextSystem;
 use crate::tree::Inner;
@@ -208,8 +208,75 @@ impl App {
         ((p.x / scale) as f32, (p.y / scale) as f32)
     }
 
+    fn modifier_text(&self) -> String {
+        let m = self.modifiers;
+        input::modifier_text(m.control_key(), m.alt_key(), m.shift_key(), m.super_key())
+    }
+
+    /// The lowercase chord name of a key, when it is one the application can bind.
+    fn chord_key(key: &Key) -> Option<String> {
+        Some(match key {
+            Key::Named(n) => match n {
+                NamedKey::ArrowUp => "up".to_string(),
+                NamedKey::ArrowDown => "down".to_string(),
+                NamedKey::ArrowLeft => "left".to_string(),
+                NamedKey::ArrowRight => "right".to_string(),
+                NamedKey::PageUp => "pageup".to_string(),
+                NamedKey::PageDown => "pagedown".to_string(),
+                NamedKey::Home => "home".to_string(),
+                NamedKey::End => "end".to_string(),
+                NamedKey::Enter => "enter".to_string(),
+                NamedKey::Escape => "escape".to_string(),
+                NamedKey::Tab => "tab".to_string(),
+                NamedKey::Backspace => "backspace".to_string(),
+                NamedKey::Delete => "delete".to_string(),
+                NamedKey::Space => "space".to_string(),
+                NamedKey::F1 => "f1".to_string(),
+                NamedKey::F2 => "f2".to_string(),
+                NamedKey::F3 => "f3".to_string(),
+                NamedKey::F4 => "f4".to_string(),
+                NamedKey::F5 => "f5".to_string(),
+                NamedKey::F6 => "f6".to_string(),
+                NamedKey::F7 => "f7".to_string(),
+                NamedKey::F8 => "f8".to_string(),
+                NamedKey::F9 => "f9".to_string(),
+                NamedKey::F10 => "f10".to_string(),
+                NamedKey::F11 => "f11".to_string(),
+                NamedKey::F12 => "f12".to_string(),
+                _ => return None,
+            },
+            Key::Character(c) => {
+                let t = c.to_string();
+                if t == " " {
+                    "space".to_string()
+                } else {
+                    t.to_lowercase()
+                }
+            }
+            _ => return None,
+        })
+    }
+
     fn keyboard(&mut self, event_loop: &ActiveEventLoop, event: KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        let m = self.modifiers;
+        let chorded = m.super_key() || m.control_key() || m.alt_key();
+        // keys the text field never uses go to the application as chords, with or without
+        // modifiers; everything else is a chord only while a command modifier is held
+        let navigation = matches!(
+            &event.logical_key,
+            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::PageUp | NamedKey::PageDown)
+                | Key::Named(NamedKey::F1 | NamedKey::F2 | NamedKey::F3 | NamedKey::F4 | NamedKey::F5 | NamedKey::F6)
+                | Key::Named(NamedKey::F7 | NamedKey::F8 | NamedKey::F9 | NamedKey::F10 | NamedKey::F11 | NamedKey::F12)
+        );
+        if chorded || navigation {
+            if let Some(key) = Self::chord_key(&event.logical_key) {
+                let text = input::chord(m.control_key(), m.alt_key(), m.shift_key(), m.super_key(), &key);
+                self.push(Event::new(EV_KEY_CHORD, 0.0, 0.0, -1, text));
+                self.request_redraw();
+            }
             return;
         }
         let named = match &event.logical_key {
@@ -226,8 +293,6 @@ impl App {
         };
         let result = if let Some(name) = named {
             self.with_core(|inner| input::key_named(inner, name))
-        } else if self.modifiers.super_key() || self.modifiers.control_key() {
-            Ok(None)
         } else if let Some(text) = event.text.as_ref() {
             let text = text.to_string();
             self.with_core(move |inner| input::key_text(inner, &text))
@@ -393,10 +458,48 @@ impl ApplicationHandler<UserEvent> for App {
                     self.resize(event_loop, w.inner_size());
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                let changed = self.hover_handler != -1;
+                self.hover_handler = -1;
+                if let Err(e) = self.with_core(input::pointer_left) {
+                    self.fail(event_loop, e);
+                    return;
+                }
+                if changed {
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE,
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0).max(0.01);
+                        -(p.y / scale) as f32
+                    }
+                };
+                let (x, y) = self.cursor;
+                match self.with_core(|inner| input::scroll(inner, x, y, dy)) {
+                    Ok(moved) => {
+                        if moved {
+                            // the content moved under the pointer: keep the hover state honest
+                            if let Ok(ev) = self.with_core(|inner| input::pointer(inner, EV_POINTER_MOVE, x, y)) {
+                                self.hover_handler = ev.handler;
+                            }
+                            self.request_redraw();
+                        }
+                    }
+                    Err(e) => self.fail(event_loop, e),
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = self.logical(position);
                 self.cursor = (x, y);
-                match self.with_core(|inner| input::pointer(inner, EV_POINTER_MOVE, x, y)) {
+                let mods = self.modifier_text();
+                match self.with_core(|inner| {
+                    let mut ev = input::pointer(inner, EV_POINTER_MOVE, x, y);
+                    ev.text = mods;
+                    ev
+                }) {
                     Ok(ev) => {
                         let hover_changed = ev.handler != self.hover_handler;
                         self.hover_handler = ev.handler;
@@ -421,7 +524,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 let kind = if state == ElementState::Pressed { EV_POINTER_DOWN } else { EV_POINTER_UP };
                 let (x, y) = self.cursor;
-                match self.with_core(|inner| input::pointer(inner, kind, x, y)) {
+                let mods = self.modifier_text();
+                match self.with_core(|inner| {
+                    let mut ev = input::pointer(inner, kind, x, y);
+                    ev.text = mods;
+                    ev
+                }) {
                     Ok(ev) => {
                         self.push(ev);
                         self.request_redraw();

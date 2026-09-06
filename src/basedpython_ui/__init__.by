@@ -1,7 +1,7 @@
 """basedpython-ui: a compose / swiftui / flutter inspired ui framework."""
 
 from .geometry export Dp, Size, Offset, Rect, Constraints, Color, ZERO_DP, ONE_DP, BLACK, WHITE, TRANSPARENT
-from .modifier export Modifier, ModOp, Alignment, Arrangement, TextStyle, NONE, DEFAULT_TEXT_STYLE
+from .modifier export Modifier, ModOp, Alignment, Arrangement, TextStyle, NONE, DEFAULT_TEXT_STYLE, SHADOW_COLOR
 from .runtime export (
     State,
     StateList,
@@ -30,6 +30,8 @@ from .runtime export (
     Recomposition,
     Cause,
     TRACE_FORMAT,
+    on_key,
+    input_modifiers,
 )
 from .widgets export (
     ColumnScope,
@@ -45,7 +47,8 @@ from .widgets export (
     Column,
     Row,
     Box,
+    Scroll,
     Canvas,
     Layout,
 )
-from .app export run_app, compose_test, TestComposition
+from .app export run_app, compose_test, TestComposition, chord_of_text

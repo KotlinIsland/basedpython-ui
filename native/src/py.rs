@@ -540,6 +540,46 @@ impl Core {
         self.with_state(false, |inner| Ok(input::focused_handler(inner)))
     }
 
+    /// Handler index under the pointer as of the last pointer event, or -1.
+    fn hovered_handler(&self) -> PyResult<i32> {
+        self.with_state(false, |inner| Ok(inner.hover_handler))
+    }
+
+    /// Scroll the innermost scroll container under `(x, y)` by `dy` logical pixels (positive
+    /// moves the content up). Returns whether anything moved; the `Window` uses this for the
+    /// mouse wheel and headless tests can too.
+    fn scroll(&self, x: f64, y: f64, dy: f64) -> PyResult<bool> {
+        let x = finite(x, "x")?;
+        let y = finite(y, "y")?;
+        let dy = finite(dy, "dy")?;
+        self.with_state(true, |inner| Ok(input::scroll(inner, x, y, dy)))
+    }
+
+    /// The scroll offset of a SCROLL node (`None` for anything else or a stale id).
+    fn scroll_offset(&self, node_id: u64) -> PyResult<Option<f64>> {
+        self.with_state(false, |inner| {
+            Ok(inner.nodes.get(NodeId::from_ffi(node_id)).filter(|n| n.kind == Kind::Scroll).map(|n| n.scroll as f64))
+        })
+    }
+
+    /// The first SCROLL node in tree order (`(node_id, scroll, content_length, viewport_height)`),
+    /// for tests; `None` when there is none.
+    fn first_scroll(&self) -> PyResult<Option<(u64, f64, f64, f64)>> {
+        self.with_state(false, |inner| {
+            let mut stack = vec![inner.root];
+            while let Some(n) = stack.pop() {
+                let Some(node) = inner.nodes.get(n) else { continue };
+                if node.kind == Kind::Scroll {
+                    return Ok(Some((n.to_ffi(), node.scroll as f64, node.content_len as f64, node.content_size.h as f64)));
+                }
+                for &c in node.children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+            Ok(None)
+        })
+    }
+
     fn __repr__(&self) -> String {
         match self.slot.lock() {
             Ok(slot) => match &slot.inner {

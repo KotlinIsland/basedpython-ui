@@ -31,6 +31,10 @@ class Core:
     @ignorable_return_value
     def key_named(self, name: str) -> (int, float, float, int, str)?
     def focused_handler(self) -> int
+    def hovered_handler(self) -> int
+    def scroll(self, x: float, y: float, dy: float) -> bool
+    def scroll_offset(self, node_id: int) -> float | None
+    def first_scroll(self) -> tuple[int, float, float, float] | None
 
 
 class Window:

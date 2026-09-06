@@ -9,6 +9,11 @@ pub const EV_POINTER_MOVE: i32 = 3;
 pub const EV_KEY_TEXT: i32 = 4;
 pub const EV_RESIZE: i32 = 5;
 pub const EV_CLOSE: i32 = 6;
+/// A key chord for the application (`text` is e.g. "cmd+x", "shift+up", "pagedown").
+pub const EV_KEY_CHORD: i32 = 7;
+
+/// Lines of a mouse-wheel tick, in logical pixels.
+pub const WHEEL_LINE: f32 = 40.0;
 
 /// `(kind, x, y, handler_idx, text)`.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,7 +93,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
         let lx = x - child.abs.x;
         let ly = y - child.abs.y;
         for layer in child.layers.iter().rev() {
-            if let Layer::Click { rect, handler } = layer {
+            if let Layer::Click { rect, handler, .. } = layer {
                 if rect.contains(lx, ly) {
                     return Some(Hit { handler: *handler, focus: None, node: Some(c) });
                 }
@@ -98,7 +103,8 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32) -> Option<Hit> {
     None
 }
 
-/// A pointer event (kinds 1, 2, 3). Pointer down moves focus to the text field hit, or clears it.
+/// A pointer event (kinds 1, 2, 3). Pointer down moves focus to the text field hit, or clears
+/// it; every kind records the handler under the pointer for hover painting.
 pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
     let hit = hit_test(inner, x, y);
     if kind == EV_POINTER_DOWN {
@@ -107,7 +113,83 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
             None => inner.focus = None,
         }
     }
+    inner.hover_handler = hit.handler;
     Event::new(kind, x, y, hit.handler, String::new())
+}
+
+/// The pointer left the window: nothing is hovered any more.
+pub fn pointer_left(inner: &mut Inner) {
+    inner.hover_handler = -1;
+}
+
+/// Scroll the innermost scrollable container under `(x, y)` by `dy` logical pixels
+/// (positive = content moves up). Returns whether anything moved. Absolute rects and the
+/// hovered handler are brought up to date, so a repaint is all that is needed afterwards.
+pub fn scroll(inner: &mut Inner, x: f32, y: f32, dy: f32) -> bool {
+    if !dy.is_finite() || dy == 0.0 {
+        return false;
+    }
+    let root = inner.root;
+    let Some(target) = innermost_scrollable(inner, root, x, y, dy) else { return false };
+    let node = &mut inner.nodes[target];
+    let new = (node.scroll + dy).clamp(0.0, node.scroll_limit());
+    if new == node.scroll {
+        return false;
+    }
+    node.scroll = new;
+    crate::layout::assign_abs(inner);
+    inner.hover_handler = hit_test(inner, x, y).handler;
+    true
+}
+
+/// The deepest SCROLL node containing the point that can still move in the direction of `dy`;
+/// an inner container that has reached its end hands the wheel to the one around it.
+fn innermost_scrollable(inner: &Inner, id: NodeId, x: f32, y: f32, dy: f32) -> Option<NodeId> {
+    let node = inner.nodes.get(id)?;
+    for &c in node.children.iter().rev() {
+        let Some(child) = inner.nodes.get(c) else { continue };
+        if child.is_group() {
+            if let Some(found) = innermost_scrollable(inner, c, x, y, dy) {
+                return Some(found);
+            }
+            continue;
+        }
+        if !child.abs.contains(x, y) {
+            continue;
+        }
+        if let Some(found) = innermost_scrollable(inner, c, x, y, dy) {
+            return Some(found);
+        }
+        if child.kind == Kind::Scroll {
+            let limit = child.scroll_limit();
+            let can_move = if dy > 0.0 { child.scroll < limit } else { child.scroll > 0.0 };
+            if limit > 0.0 && can_move {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// The chord string for a key press with modifiers, in the order `ctrl+alt+shift+cmd+key`.
+/// `key` is already the lowercase key name ("x", "up", "enter").
+pub fn chord(ctrl: bool, alt: bool, shift: bool, cmd: bool, key: &str) -> String {
+    let mut out = String::new();
+    for (on, name) in [(ctrl, "ctrl"), (alt, "alt"), (shift, "shift"), (cmd, "cmd")] {
+        if on {
+            out.push_str(name);
+            out.push('+');
+        }
+    }
+    out.push_str(key);
+    out
+}
+
+/// The modifier prefix for a pointer event ("", "shift", "shift+cmd", …).
+pub fn modifier_text(ctrl: bool, alt: bool, shift: bool, cmd: bool) -> String {
+    let mut out = chord(ctrl, alt, shift, cmd, "");
+    out.pop();
+    out
 }
 
 fn focus_field(inner: &mut Inner, field: NodeId) {
@@ -298,6 +380,65 @@ mod tests {
         assert_eq!(hit_test(&inner, r(4).x + 2.0, r(4).y + 2.0).handler, -1);
         assert_eq!(hit_test(&inner, r(4).x + 20.0, r(4).y + 20.0).handler, 6);
         assert_eq!(hit_test(&inner, 399.0, 299.0), Hit::NONE);
+    }
+
+    fn scrolled() -> Inner {
+        let mut inner = Inner::new(200.0, 100.0, 1.0, TextSystem::monospace_only());
+        // mod 1: 200x100 viewport; mod 2: 200x50 clickable rows (handlers 1..4)
+        let mods = vec![
+            (1, vec![2.0, 200.0, 3.0, 100.0]),
+            (2, vec![2.0, 200.0, 3.0, 50.0, 9.0, 1.0]),
+            (3, vec![2.0, 200.0, 3.0, 50.0, 9.0, 2.0]),
+            (4, vec![2.0, 200.0, 3.0, 50.0, 9.0, 3.0]),
+            (5, vec![2.0, 200.0, 3.0, 50.0, 9.0, 4.0]),
+        ];
+        let ints: Vec<i32> = [
+            [13, 0, -1, 1, -1, 0, 0, 0],
+            [10, 0, -1, 2, -1, 0, 0, 0],
+            [10, 0, -1, 3, -1, 0, 0, 0],
+            [10, 0, -1, 4, -1, 0, 0, 0],
+            [10, 0, -1, 5, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 6)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        inner
+    }
+
+    #[test]
+    fn wheel_scrolling_moves_content_and_hover() {
+        let mut inner = scrolled();
+        assert_eq!(hit_test(&inner, 10.0, 75.0).handler, 2);
+        assert_eq!(pointer(&mut inner, EV_POINTER_MOVE, 10.0, 75.0).handler, 2);
+        assert_eq!(inner.hover_handler, 2);
+        assert!(scroll(&mut inner, 10.0, 75.0, 60.0));
+        assert_eq!(hit_test(&inner, 10.0, 75.0).handler, 3, "row 3 moved under the pointer");
+        assert_eq!(inner.hover_handler, 3);
+        // clamped at the end: 200 content - 100 viewport = 100
+        assert!(scroll(&mut inner, 10.0, 75.0, 1000.0));
+        let sc = inner.layout_children(inner.root)[0];
+        assert_eq!(inner.nodes[sc].scroll, 100.0);
+        assert!(!scroll(&mut inner, 10.0, 75.0, 10.0), "nothing left to scroll");
+        assert!(scroll(&mut inner, 10.0, 75.0, -100.0));
+        assert_eq!(inner.nodes[sc].scroll, 0.0);
+        assert!(!scroll(&mut inner, 10.0, 75.0, -1.0));
+        assert!(!scroll(&mut inner, 199.0, 99.0, f32::NAN));
+        assert!(!scroll(&mut inner, 300.0, 300.0, 10.0), "outside every container");
+        pointer_left(&mut inner);
+        assert_eq!(inner.hover_handler, -1);
+    }
+
+    #[test]
+    fn chords_and_modifier_text() {
+        assert_eq!(chord(false, false, false, true, "x"), "cmd+x");
+        assert_eq!(chord(true, true, true, true, "up"), "ctrl+alt+shift+cmd+up");
+        assert_eq!(chord(false, false, false, false, "enter"), "enter");
+        assert_eq!(modifier_text(false, false, true, true), "shift+cmd");
+        assert_eq!(modifier_text(false, false, false, false), "");
     }
 
     #[test]

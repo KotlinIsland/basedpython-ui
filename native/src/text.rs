@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight, Wrap};
 
 use crate::types::{Size, Style};
 
@@ -185,7 +185,9 @@ impl TextSystem {
     }
 
     /// Rasterise the glyphs of a shaped text into a premultiplied RGBA8 buffer.
-    /// `origin` is in logical pixels; `scale` maps logical to physical pixels.
+    /// `origin` is in logical pixels; `scale` maps logical to physical pixels; `clip` is an
+    /// optional `(x0, y0, x1, y1)` window in physical pixels (exclusive ends) outside of which
+    /// nothing is written.
     pub fn draw(
         &mut self,
         key: &TextKey,
@@ -195,6 +197,7 @@ impl TextSystem {
         target: &mut [u8],
         target_w: u32,
         target_h: u32,
+        clip: Option<(i32, i32, i32, i32)>,
     ) {
         let epoch = self.epoch;
         let own = &mut self.own_fonts;
@@ -210,6 +213,13 @@ impl TextSystem {
         }
         let mut fonts = fonts_of(own);
         let (a, r, g, b) = crate::types::argb_channels(argb);
+        let (cx0, cy0, cx1, cy1) = match clip {
+            Some((x0, y0, x1, y1)) => (x0.max(0), y0.max(0), x1.min(target_w as i32), y1.min(target_h as i32)),
+            None => (0, 0, target_w as i32, target_h as i32),
+        };
+        if cx0 >= cx1 || cy0 >= cy1 {
+            return;
+        }
         for run in entry.buffer.layout_runs() {
             for glyph in run.glyphs {
                 let phys = glyph.physical((origin.0, origin.1 + run.line_y), scale);
@@ -222,12 +232,12 @@ impl TextSystem {
                     SwashContent::Mask => {
                         for iy in 0..ih {
                             let py = y0 + iy;
-                            if py < 0 || py >= target_h as i32 {
+                            if py < cy0 || py >= cy1 {
                                 continue;
                             }
                             for ix in 0..iw {
                                 let px = x0 + ix;
-                                if px < 0 || px >= target_w as i32 {
+                                if px < cx0 || px >= cx1 {
                                     continue;
                                 }
                                 let Some(&m) = image.data.get((iy * iw + ix) as usize) else { continue };
@@ -242,12 +252,12 @@ impl TextSystem {
                     SwashContent::Color => {
                         for iy in 0..ih {
                             let py = y0 + iy;
-                            if py < 0 || py >= target_h as i32 {
+                            if py < cy0 || py >= cy1 {
                                 continue;
                             }
                             for ix in 0..iw {
                                 let px = x0 + ix;
-                                if px < 0 || px >= target_w as i32 {
+                                if px < cx0 || px >= cx1 {
                                     continue;
                                 }
                                 let i = ((iy * iw + ix) * 4) as usize;
@@ -263,12 +273,12 @@ impl TextSystem {
                     SwashContent::SubpixelMask => {
                         for iy in 0..ih {
                             let py = y0 + iy;
-                            if py < 0 || py >= target_h as i32 {
+                            if py < cy0 || py >= cy1 {
                                 continue;
                             }
                             for ix in 0..iw {
                                 let px = x0 + ix;
-                                if px < 0 || px >= target_w as i32 {
+                                if px < cx0 || px >= cx1 {
                                     continue;
                                 }
                                 let i = ((iy * iw + ix) * 4) as usize;
@@ -320,9 +330,14 @@ fn shape(fonts: &mut FontSystem, key: &TextKey, epoch: u64) -> TextEntry {
         };
     }
     let mut buffer = Buffer::new(fonts, metrics);
-    buffer.set_size(if max_w.is_finite() { Some(max_w) } else { None }, None);
+    if style.nowrap {
+        buffer.set_wrap(Wrap::None);
+        buffer.set_size(None, None);
+    } else {
+        buffer.set_size(if max_w.is_finite() { Some(max_w) } else { None }, None);
+    }
     let attrs = Attrs::new()
-        .family(Family::SansSerif)
+        .family(if style.mono { Family::Monospace } else { Family::SansSerif })
         .weight(if style.bold { Weight::BOLD } else { Weight::NORMAL });
     buffer.set_text(&key.text, &attrs, Shaping::Advanced, None);
     buffer.shape_until_scroll(fonts, false);
@@ -376,6 +391,7 @@ pub fn monospace_estimate(text: &str, style: Style, max_w: f32) -> Size {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{STYLE_MONO, STYLE_NOWRAP};
 
     #[test]
     fn monospace_fallback_is_deterministic() {
@@ -406,7 +422,16 @@ mod tests {
         let sb = ts.measure(&bold);
         assert!(sb.w >= s.w);
         let mut buf = vec![0u8; 200 * 40 * 4];
-        ts.draw(&key, (2.0, 2.0), 1.0, 0xFF000000, &mut buf, 200, 40);
+        ts.draw(&key, (2.0, 2.0), 1.0, 0xFF000000, &mut buf, 200, 40, None);
         assert!(buf.iter().any(|&b| b != 0), "glyphs were rasterised");
+        // a clip window that misses the text draws nothing
+        let mut buf = vec![0u8; 200 * 40 * 4];
+        ts.draw(&key, (2.0, 2.0), 1.0, 0xFF000000, &mut buf, 200, 40, Some((150, 0, 200, 40)));
+        assert!(buf.iter().all(|&b| b == 0));
+        // a monospace, no-wrap style shapes on one line
+        let mono = TextKey::new(Arc::from("0123456789 0123456789 0123456789"), Style::with_flags(14.0, 0xFF000000, STYLE_MONO | STYLE_NOWRAP), 40.0);
+        let sm = ts.measure(&mono);
+        assert_eq!(sm.h, 18.0, "{:?}", sm);
+        assert!(sm.w > 40.0);
     }
 }

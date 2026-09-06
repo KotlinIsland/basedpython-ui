@@ -143,7 +143,10 @@ fn parse_tables(
             bad!("style {}: size must be in (0, 4096], got {}", id, size);
         }
         let argb = argb_from_f64(*argb).map_err(|e| InputError(format!("style {}: {}", id, e)))?;
-        let s = Style::new(*size as f32, argb, *bold != 0);
+        if *bold & !(STYLE_BOLD | STYLE_MONO | STYLE_NOWRAP) != 0 {
+            bad!("style {}: unknown flag bits in {} (1 bold, 2 mono, 4 nowrap)", id, bold);
+        }
+        let s = Style::with_flags(*size as f32, argb, *bold);
         if let Some(existing) = inner.styles.get(&id) {
             if *existing != s {
                 bad!("style id {} is already interned with different values", id);
@@ -342,6 +345,11 @@ fn validate(
                         Kind::Layout => {
                             if r.handler < 0 {
                                 bad!("record {}: LAYOUT needs a measure callback handler index", i);
+                            }
+                        }
+                        Kind::Scroll => {
+                            if r.a != 0 {
+                                bad!("record {}: scroll axis {} must be 0 (vertical)", i, r.a);
                             }
                         }
                         Kind::Spacer | Kind::Canvas | Kind::Scope => {}
@@ -649,6 +657,7 @@ fn reuse(inner: &mut Inner, id: NodeId, r: &Rec, j: usize, ctx: &mut Ctx) {
         _ => None,
     };
     let strs = ctx.frag.strs;
+    let reveal_now = new_modifier.as_ref().map(|m| m.reveal && !inner.nodes[id].modifier.reveal).unwrap_or(false);
     let node = &mut inner.nodes[id];
     node.mark = serial;
     let kind = node.kind;
@@ -692,6 +701,9 @@ fn reuse(inner: &mut Inner, id: NodeId, r: &Rec, j: usize, ctx: &mut Ctx) {
     }
     if flag_canvas {
         inner.canvas_pending.push(id);
+    }
+    if reveal_now {
+        inner.reveal_pending.push(id);
     }
     if changed {
         inner.mark_dirty(id);
@@ -744,9 +756,13 @@ fn create(inner: &mut Inner, parent: NodeId, kind: Kind, r: &Rec, j: usize, ctx:
         _ => Style::DEFAULT,
     };
     node.canvas_pending = kind == Kind::Canvas;
+    let reveal = node.modifier.reveal;
     let id = inner.nodes.insert(node);
     if kind == Kind::Canvas {
         inner.canvas_pending.push(id);
+    }
+    if reveal {
+        inner.reveal_pending.push(id);
     }
     if kind.has_children() {
         reconcile_children(inner, id, j + 1, ctx.close[j] as usize, ctx);
@@ -996,6 +1012,29 @@ mod tests {
         assert!(commit(&mut inner, &[], &[], &[], &[(1, vec![2.0, 11.0])], &[]).is_err());
         assert!(commit(&mut inner, &[], &[], &[], &[(1, vec![2.0, 10.0])], &[]).is_ok());
         assert!(commit(&mut inner, &[], &[], &[], &[], &[(0, 15.0, 0.0, 0)]).is_err()); // redefine default
+        assert!(commit(&mut inner, &[], &[], &[], &[], &[(2, 12.0, 0.0, 8)]).is_err()); // unknown style flag
+        assert!(commit(&mut inner, &[], &[], &[], &[], &[(2, 12.0, 0.0, 7)]).is_ok());
+        assert!(inner.styles[&2].mono && inner.styles[&2].nowrap && inner.styles[&2].bold);
+    }
+
+    #[test]
+    fn scroll_records_and_reveal_are_tracked() {
+        let mut inner = core();
+        let strs = ["a"];
+        // a scroll container with a bad axis is rejected
+        let ints = recs(&[[13, 0, -1, 0, -1, 1, 0, 0], END]);
+        assert!(do_commit(&mut inner, &ints, &strs, &[(0, 0, 2)]).is_err());
+        let ints = recs(&[[13, 0, -1, 0, -1, 0, 0, 0], text(0), END]);
+        do_commit(&mut inner, &ints, &strs, &[(0, 0, 3)]).unwrap();
+        assert!(inner.reveal_pending.is_empty());
+        // a modifier that gains `reveal` queues the node once
+        let mods = vec![(1, vec![14.0])];
+        let ints = recs(&[[13, 0, -1, 0, -1, 0, 0, 0], [6, 0, 0, 1, -1, 0, 0, 0], END]);
+        commit(&mut inner, &ints, &strs, &[(0, 0, 3)], &mods, &[]).unwrap();
+        assert_eq!(inner.reveal_pending.len(), 1);
+        inner.reveal_pending.clear();
+        commit(&mut inner, &ints, &strs, &[(0, 0, 3)], &[], &[]).unwrap();
+        assert!(inner.reveal_pending.is_empty(), "unchanged modifier: no new request");
     }
 }
 

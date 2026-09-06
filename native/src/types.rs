@@ -17,6 +17,7 @@ pub enum Kind {
     Spacer,
     Canvas,
     Layout,
+    Scroll,
 }
 
 pub const REC_END: i32 = 0;
@@ -37,6 +38,7 @@ impl Kind {
             10 => Kind::Spacer,
             11 => Kind::Canvas,
             12 => Kind::Layout,
+            13 => Kind::Scroll,
             _ => return None,
         })
     }
@@ -45,7 +47,7 @@ impl Kind {
     pub fn has_children(self) -> bool {
         matches!(
             self,
-            Kind::Scope | Kind::Column | Kind::Row | Kind::Box | Kind::Layout
+            Kind::Scope | Kind::Column | Kind::Row | Kind::Box | Kind::Layout | Kind::Scroll
         )
     }
 
@@ -62,6 +64,7 @@ impl Kind {
             Kind::Spacer => "Spacer",
             Kind::Canvas => "Canvas",
             Kind::Layout => "Layout",
+            Kind::Scroll => "Scroll",
         }
     }
 }
@@ -104,6 +107,20 @@ impl Rect {
     }
     pub fn translated(&self, dx: f32, dy: f32) -> Rect {
         Rect::new(self.x + dx, self.y + dy, self.w, self.h)
+    }
+    /// The overlap of two rects; empty (zero-sized) when they do not meet.
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let r = (self.x + self.w).min(other.x + other.w);
+        let b = (self.y + self.h).min(other.y + other.h);
+        Rect::new(x, y, (r - x).max(0.0), (b - y).max(0.0))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.w <= 0.0 || self.h <= 0.0
+    }
+    pub fn intersects(&self, other: &Rect) -> bool {
+        !self.intersect(other).is_empty()
     }
 }
 
@@ -167,15 +184,30 @@ pub enum ModOp {
     Weight(f32),
     Align(u8),
     Clickable(i32),
+    /// Corner radius for every background, border, shadow and hover layer after it in the chain.
+    Rounded(f32),
+    Border { width: f32, argb: u32 },
+    /// Colour painted over the node's clickable layer while the pointer is over it.
+    Hover(u32),
+    /// A soft drop shadow under the layer's rect; `elevation` is its spread in logical pixels.
+    Shadow { elevation: f32, argb: u32 },
+    /// Ask the nearest scroll container to bring the node into view when this op appears.
+    Reveal,
+    /// Clip the node's own painting and its children to the node's rect.
+    Clip,
 }
 
-/// An interned modifier chain. `weight` / `align` are read by the parent container
-/// (last op of that kind wins); the other ops are applied in order by the node itself.
+/// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
+/// the parent container or by paint (last op of that kind wins); the other ops are applied in
+/// order by the node itself.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Modifier {
     pub ops: Vec<ModOp>,
     pub weight: f32,
     pub align: Option<u8>,
+    pub hover: Option<u32>,
+    pub reveal: bool,
+    pub clip: bool,
 }
 
 impl Modifier {
@@ -185,6 +217,9 @@ impl Modifier {
         let mut i = 0;
         let mut weight = 0.0f32;
         let mut align = None;
+        let mut hover = None;
+        let mut reveal = false;
+        let mut clip = false;
         while i < raw.len() {
             let op = raw[i];
             let take = |n: usize| -> Result<&[f64], String> {
@@ -257,10 +292,42 @@ impl Modifier {
                     ops.push(ModOp::Clickable(h as i32));
                     i += 2;
                 }
+                x if x == 10.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Rounded(non_negative(a[0], "rounded")?));
+                    i += 2;
+                }
+                x if x == 11.0 => {
+                    let a = take(2)?;
+                    ops.push(ModOp::Border { width: non_negative(a[0], "border width")?, argb: argb_from_f64(a[1])? });
+                    i += 3;
+                }
+                x if x == 12.0 => {
+                    let a = take(1)?;
+                    let argb = argb_from_f64(a[0])?;
+                    hover = Some(argb);
+                    ops.push(ModOp::Hover(argb));
+                    i += 2;
+                }
+                x if x == 13.0 => {
+                    let a = take(2)?;
+                    ops.push(ModOp::Shadow { elevation: non_negative(a[0], "shadow elevation")?, argb: argb_from_f64(a[1])? });
+                    i += 3;
+                }
+                x if x == 14.0 => {
+                    reveal = true;
+                    ops.push(ModOp::Reveal);
+                    i += 1;
+                }
+                x if x == 15.0 => {
+                    clip = true;
+                    ops.push(ModOp::Clip);
+                    i += 1;
+                }
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align })
+        Ok(Modifier { ops, weight, align, hover, reveal, clip })
     }
 }
 
@@ -295,13 +362,31 @@ pub struct Style {
     pub size_bits: u32,
     pub argb: u32,
     pub bold: bool,
+    /// Shape with the monospace family.
+    pub mono: bool,
+    /// Never wrap: one line, clipped to the node's rect when it is wider.
+    pub nowrap: bool,
 }
 
+pub const STYLE_BOLD: i64 = 1;
+pub const STYLE_MONO: i64 = 2;
+pub const STYLE_NOWRAP: i64 = 4;
+
 impl Style {
-    pub const DEFAULT: Style = Style { size_bits: 0x4160_0000, argb: 0xFF20_2020, bold: false }; // 14.0
+    pub const DEFAULT: Style = Style { size_bits: 0x4160_0000, argb: 0xFF20_2020, bold: false, mono: false, nowrap: false }; // 14.0
 
     pub fn new(size: f32, argb: u32, bold: bool) -> Style {
-        Style { size_bits: size.to_bits(), argb, bold }
+        Style { size_bits: size.to_bits(), argb, bold, mono: false, nowrap: false }
+    }
+    /// From the protocol's flag word: bit 0 bold, bit 1 monospace, bit 2 no-wrap.
+    pub fn with_flags(size: f32, argb: u32, flags: i64) -> Style {
+        Style {
+            size_bits: size.to_bits(),
+            argb,
+            bold: flags & STYLE_BOLD != 0,
+            mono: flags & STYLE_MONO != 0,
+            nowrap: flags & STYLE_NOWRAP != 0,
+        }
     }
     pub fn size(&self) -> f32 {
         f32::from_bits(self.size_bits)
@@ -309,10 +394,13 @@ impl Style {
 }
 
 /// A rectangle produced by a modifier layer during layout, relative to the node origin.
+/// `radius` is the corner radius in effect at that point of the chain (0 = square).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Layer {
-    Background { rect: Rect, argb: u32 },
-    Click { rect: Rect, handler: i32 },
+    Shadow { rect: Rect, radius: f32, elevation: f32, argb: u32 },
+    Background { rect: Rect, argb: u32, radius: f32 },
+    Border { rect: Rect, argb: u32, width: f32, radius: f32 },
+    Click { rect: Rect, handler: i32, hover: Option<u32>, radius: f32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.
@@ -360,6 +448,24 @@ mod tests {
         assert!(Modifier::parse(&[42.0]).is_err());
         assert!(Modifier::parse(&[7.0, -1.0]).is_err());
         assert!(Modifier::parse(&[6.0, f64::NAN]).is_err());
+        let m = Modifier::parse(&[10.0, 8.0, 11.0, 1.0, 4278190080.0, 12.0, 4278190335.0, 13.0, 4.0, 1090519040.0, 14.0, 15.0]).unwrap();
+        assert_eq!(m.ops.len(), 6);
+        assert_eq!(m.hover, Some(0xFF0000FF));
+        assert!(m.reveal && m.clip);
+        assert!(Modifier::parse(&[10.0, -1.0]).is_err());
+        assert!(Modifier::parse(&[11.0, 1.0]).is_err());
+    }
+
+    #[test]
+    fn style_flags_and_rect_math() {
+        let s = Style::with_flags(12.0, 0xFF000000, STYLE_BOLD | STYLE_MONO | STYLE_NOWRAP);
+        assert!(s.bold && s.mono && s.nowrap);
+        assert_eq!(Style::with_flags(14.0, 0xFF202020, 0), Style::DEFAULT);
+        let a = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let b = Rect::new(5.0, 5.0, 10.0, 10.0);
+        assert_eq!(a.intersect(&b), Rect::new(5.0, 5.0, 5.0, 5.0));
+        assert!(a.intersect(&Rect::new(20.0, 20.0, 1.0, 1.0)).is_empty());
+        assert!(a.intersects(&b));
     }
 
     #[test]

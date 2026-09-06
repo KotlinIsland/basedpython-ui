@@ -9,9 +9,12 @@ from array import array
 
 from basedpython_ui import (
     composable, state, state_list, state_dict, derived, key, keyed, launched_effect, disposable_effect, side_effect,
-    ambient, provide, Column, Row, Text, Button, Modifier, StateList, StateDict, State, Derived, Job,
+    ambient, provide, on_key, input_modifiers, Column, Row, Text, Button, Modifier, StateList, StateDict, State,
+    Derived, Job,
 )
 from basedpython_ui.geometry import Dp   # literal conversions need the declaring module
+from examples.counter import Counter as ImportedCounter   # a composable reached through a lazy-import proxy
+from examples.theming import LIGHT, DARK, Theme, density   # values and an ambient reached through lazy-import proxies
 from basedpython_ui.runtime import (
     Runtime, CompositionError, Handler, R_END, R_SCOPE, R_SCOPE_REF, R_TEXT, R_BUTTON, R_TEXTFIELD, R_COLUMN, R_ROW, R_BOX, R_LAYOUT,
     Trace, T_RUN, T_WRITE, T_FRAME, T_ERROR, T_REFUSED, live_runtimes, EffectSlot, Restart, SLOT_LAUNCHED,
@@ -133,6 +136,12 @@ class FakeCore:
         return [rec.text for rec in self.records() if rec.text]
     def field_handler(self, placeholder: str) -> int:
         return -1
+    def scroll(self, x: float, y: float, dy: float) -> bool:
+        return False
+    def hovered_handler(self) -> int:
+        return -1
+    def first_scroll(self) -> tuple[int, float, float, float] | None:
+        return None
     def dump(self) -> str:
         return "\n".join(f"{rec.kind} {rec.text!r} h={rec.handler} a={rec.a}" for rec in self.records())
     def node_count(self) -> int:
@@ -284,6 +293,85 @@ def test_keyed_children_survive_removal_of_a_sibling():
     assert rt.recompositions["ItemRow"] == 4, "3 initial runs + the clicked row; the survivors were matched by key, not re-created"
 
 
+@composable
+def Imported():
+    let show = state(True)
+    Column:
+        if show.value:
+            ImportedCounter()
+        ImportedCounter(step=5)
+        Button("toggle"):
+            show.value = not show.value
+
+
+def test_composables_called_through_import_proxies_keep_their_own_identity():
+    # `from examples.counter import Counter` binds a proxy on python < 3.15: every call
+    # through it passes the proxy's own `__call__` frame, which must not be the call site
+    rt, core = compose(Imported)
+    assert core.all_text()[:1] == ["count = 0"]
+    click(rt, core, "+")             # the first "+" belongs to the first counter
+    rt.frame()
+    texts = core.all_text()
+    assert texts.count("count = 1") == 1 and texts.count("count = 0") == 1
+    click(rt, core, "toggle")
+    rt.frame()
+    assert "count = 1" not in core.all_text(), "the conditional counter is gone"
+    assert "count = 0" in core.all_text(), "the second counter kept its own scope and state"
+    click(rt, core, "+")
+    rt.frame()
+    assert "count = 5" in core.all_text(), "and it is still the step-5 counter"
+    click(rt, core, "toggle")
+    rt.frame()
+    assert core.all_text()[:1] == ["count = 0"], "the re-added counter starts fresh"
+    assert "count = 5" in core.all_text()
+
+
+let palette = ambient(LIGHT)
+
+
+@composable
+def Themed2():
+    let dark = state(False)
+    provide(palette, DARK if dark.value else LIGHT):
+        Text(f"spacing {palette.current.spacing.value}")
+    Button("flip"):
+        dark.value = not dark.value
+
+
+def test_imported_values_enter_state_and_ambients_as_themselves():
+    # `from examples.theming import LIGHT` binds a proxy on python < 3.15: the real theme is
+    # what must be held, compared and provided
+    rt, core = compose(Themed2)
+    assert core.all_text() == ["spacing 8.0", "flip"]
+    click(rt, core, "flip")
+    rt.frame()
+    assert core.all_text() == ["spacing 12.0", "flip"]
+    cell: State[Theme] = State(LIGHT)
+    assert type(cell.value).__name__ == "Theme"
+    cell.value = DARK
+    assert cell.value.spacing.value == 12.0
+    items: StateList[Theme] = StateList([LIGHT])
+    items.append(DARK)
+    assert [t.spacing.value for t in items] == [8.0, 12.0]
+
+
+@composable
+def Dense():
+    let scale = state(1.0)
+    provide(density, scale.value):
+        Text(f"density {density.current}")
+    Button("denser"):
+        scale.value += 1.0
+
+
+def test_an_imported_ambient_is_provided_and_read_as_the_same_object():
+    rt, core = compose(Dense)
+    assert core.all_text() == ["density 1.0", "denser"]
+    click(rt, core, "denser")
+    rt.frame()
+    assert core.all_text() == ["density 2.0", "denser"], "the provided value reached the reader through the proxy"
+
+
 def test_derived_recomputes_once_per_change_and_only_notifies_on_change():
     evaluations: list[int] = [0]
     seen: list[str] = []
@@ -427,6 +515,71 @@ def test_effects_restart_on_key_change_and_dispose_with_the_scope():
     assert log[7:] == ["detach 2"]
     assert "user 2" not in core.all_text()
     loop.close()
+
+
+@composable
+def KeyInner():
+    let hits = state(0)
+
+    def handle(chord: str) -> bool:
+        if chord == "x":
+            hits.value += 1
+            return True
+        return False
+
+    on_key(handle)
+    Text(f"inner {hits.value}")
+
+
+@composable
+def KeyOuter():
+    let hits = state(0)
+    let shown = state(True)
+
+    def handle(chord: str) -> bool:
+        if chord == "hide":
+            shown.value = False
+        else:
+            hits.value += 1
+        return True
+
+    on_key(handle)
+    Column:
+        Text(f"outer {hits.value}")
+        if shown.value:
+            KeyInner()
+
+
+def test_key_handlers_run_deepest_scope_first_and_leave_with_their_scope():
+    rt, core = compose(KeyOuter)
+    assert rt.dispatch_key("x"), "the inner handler takes its chord"
+    rt.frame()
+    assert core.all_text() == ["outer 0", "inner 1"]
+    assert rt.dispatch_key("y"), "the inner handler declines, the outer one takes it"
+    rt.frame()
+    assert core.all_text() == ["outer 1", "inner 1"]
+    assert rt.dispatch_key("hide")
+    rt.frame()
+    assert core.all_text() == ["outer 1"]
+    assert rt.dispatch_key("x"), "the disposed inner scope no longer listens; the outer handler counts it"
+    rt.frame()
+    assert core.all_text() == ["outer 2"]
+
+
+def test_a_handler_sees_the_modifiers_of_its_event_and_nothing_outside_one():
+    seen: list[str] = []
+
+    @composable
+    def Picker():
+        Button("pick"):
+            seen.append(input_modifiers())  # ty: ignore[silent-mutation] -- deliberate in this test
+
+    rt, core = compose(Picker)
+    rt.dispatch(core.handler_of("pick"), None, "shift+cmd")
+    rt.dispatch(core.handler_of("pick"), None)
+    assert seen == ["shift+cmd", ""]
+    assert input_modifiers() == ""
+    rt.dispatch(99, None)  # an unknown index is ignored, not an error
 
 
 def test_a_write_from_another_thread_is_posted_to_the_ui_thread():

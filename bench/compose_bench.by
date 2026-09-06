@@ -56,6 +56,12 @@ class NullCore:
         return []
     def field_handler(self, placeholder: str) -> int:
         return -1
+    def scroll(self, x: float, y: float, dy: float) -> bool:
+        return False
+    def hovered_handler(self) -> int:
+        return -1
+    def first_scroll(self) -> tuple[int, float, float, float] | None:
+        return None
     def dump(self) -> str:
         return ""
     def node_count(self) -> int:

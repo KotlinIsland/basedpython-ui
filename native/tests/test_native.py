@@ -335,3 +335,74 @@ def test_commit_10k_nodes_timing():
         f"layout {layout_ms:.3f} ms, relayout (all cached) {relayout_ms:.3f} ms, paint {paint_ms:.3f} ms"
     )
     assert best < 20.0  # generous sanity bound; the real number is printed
+
+
+SCROLL = 13
+
+
+def test_scroll_container_wheel_hover_and_reveal():
+    core = Core(200.0, 100.0)
+    # mod 1: the 200x100 viewport; 2: a 200x50 clickable row (handler 1) hovering blue;
+    # 3/4: rows with handlers 2 and 3; 5: handler 3 plus `reveal`
+    mods = [
+        (1, [2.0, 200.0, 3.0, 100.0]),
+        (2, [2.0, 200.0, 3.0, 50.0, 9.0, 1.0, 12.0, float(0xFF0000FF)]),
+        (3, [2.0, 200.0, 3.0, 50.0, 9.0, 2.0]),
+        (4, [2.0, 200.0, 3.0, 50.0, 9.0, 3.0]),
+        (5, [2.0, 200.0, 3.0, 50.0, 9.0, 3.0, 14.0]),
+    ]
+    rows = [rec(SCROLL, modifier=1), rec(SPACER, modifier=2), rec(SPACER, modifier=3), rec(SPACER, modifier=4), END]
+    commit(core, rows, mods=mods)
+    core.layout()
+    core.paint()
+    found = core.first_scroll()
+    assert found is not None
+    node_id, offset, content, viewport = found
+    assert (offset, content, viewport) == (0.0, 150.0, 100.0)
+    assert core.scroll_offset(node_id) == 0.0
+    assert core.scroll_offset(123456789) is None
+
+    assert core.hit_test(10, 75) == 2
+    assert core.scroll(10, 75, 30) is True
+    assert core.scroll_offset(node_id) == 30.0
+    assert core.hit_test(10, 75) == 3, "the third row moved under the pointer"
+    assert core.scroll(10, 75, 1000) and core.scroll_offset(node_id) == 50.0
+    assert core.scroll(10, 75, 10) is False
+    assert core.scroll(10, 75, -1000) and core.scroll_offset(node_id) == 0.0
+    with pytest.raises(ValueError):
+        core.scroll(10, 75, float("nan"))
+
+    # hovering the first row paints its hover colour over it
+    ev = core.pointer(3, 10.0, 10.0)
+    assert ev[3] == 1 and core.hovered_handler() == 1
+    core.paint()
+    assert pixel(core.pixels(), 200, 5, 5) == (0, 0, 255, 255)
+    core.pointer(3, 250.0, 150.0)
+    assert core.hovered_handler() == -1, "nothing under a point outside the window"
+    assert "scroll=0 content=150" in core.dump()
+
+    # the third row gaining `reveal` scrolls it into view
+    rows = [rec(SCROLL, modifier=1), rec(SPACER, modifier=2), rec(SPACER, modifier=3), rec(SPACER, modifier=5), END]
+    commit(core, rows, mods=mods)
+    core.layout()
+    assert core.scroll_offset(node_id) == 50.0
+    # a scroll container must be vertical
+    with pytest.raises(ValueError):
+        commit(core, [rec(SCROLL, a=1), END])
+
+
+def test_style_flags_and_decorated_layers():
+    core = Core(300.0, 100.0)
+    styles = [(1, 14.0, float(0xFF000000), 7)]
+    # rounded 8, white background, 1px black border, shadow 2, then padding 8
+    mods = [(1, [10.0, 8.0, 6.0, float(0xFFFFFFFF), 11.0, 1.0, float(0xFF000000), 13.0, 2.0, float(0x40000000), 1.0, 8.0, 8.0, 8.0, 8.0, 15.0])]
+    records = [rec(COLUMN, modifier=1), rec(TEXT, text=0, a=1), END]
+    commit(core, records, ["mono bold nowrap"], mods=mods, styles=styles)
+    core.layout()
+    core.paint()
+    assert core.find_text("mono bold nowrap") is not None
+    assert "clip" in core.dump()
+    with pytest.raises(ValueError):
+        commit(core, records, ["mono bold nowrap"], styles=[(2, 14.0, 0.0, 8)])
+    with pytest.raises(ValueError):
+        commit(core, records, ["x"], mods=[(9, [10.0, -1.0])])

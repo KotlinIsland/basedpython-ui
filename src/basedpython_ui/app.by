@@ -30,6 +30,21 @@ class _TaskThread:
         _ = self.loop.call_soon_threadsafe(self.loop.stop)
 
 
+let _CONTROL_CHORDS: dict[str, str] = {"\n": "enter", "\r": "enter", "\t": "tab", "\x1b": "escape", "\x08": "backspace", "\x7f": "delete", " ": "space"}
+
+
+def chord_of_text(text: str) -> str:
+    """The chord name of text typed with no field focused: control characters become
+    "enter" / "tab" / "escape" / "backspace" / "delete" / "space", an upper-case letter
+    "shift+<letter>", anything else is itself in lower case."""
+    named = _CONTROL_CHORDS.get(text)
+    if named is not None:
+        return named
+    if len(text) == 1 and text.isalpha() and text.isupper():
+        return f"shift+{text.lower()}"
+    return text.lower()
+
+
 private def measure_dispatcher(rt: Runtime, core: NativeCore) -> object:
     def measure(handler_idx: int, child_count: int, min_w: float, max_w: float, min_h: float, max_h: float) -> (float, float):
         callback = rt.handlers[handler_idx]
@@ -61,11 +76,15 @@ def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, 
                     pressed[0] = handler_idx
                 case 2:
                     if handler_idx >= 0 and handler_idx == pressed[0]:
-                        dispatch(runtime, handler_idx, None)
+                        runtime.dispatch(handler_idx, None, text)
                     pressed[0] = -1
                 case 4:
                     if handler_idx >= 0:
-                        dispatch(runtime, handler_idx, text)
+                        runtime.dispatch(handler_idx, text)
+                    else:
+                        runtime.dispatch_key(chord_of_text(text))
+                case 7:
+                    runtime.dispatch_key(text)
                 case _:
                     pass
 
@@ -85,17 +104,6 @@ def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, 
         window.run(on_frame, on_events)
     finally:
         tasks.stop()
-
-
-private def dispatch(rt: Runtime, handler_idx: int, payload: object):
-    handler = rt.handlers[handler_idx] ?? return
-    try:
-        if payload is None:
-            _ = handler()
-        else:
-            _ = handler(payload)
-    except BaseException as error:
-        rt.on_error(error, "handler")
 
 
 class TestComposition:
@@ -125,21 +133,53 @@ class TestComposition:
     def all_text(self) -> (*: str):
         return tuple(self.core.all_text())
 
-    def click(self, label: str):
-        """Press and release the pointer over the node showing `label`, through
-        the same hit test and event path a window uses."""
-        found = self.core.find_text(label)
+    def rect_of(self, text: str) -> tuple[float, float, float, float]:
+        """`(x, y, w, h)` of the node showing `text`, in logical pixels."""
+        found = self.core.find_text(text)
         if found is None:
-            raise AssertionError(f"no node showing {label!r}; tree:\n{self.dump()}")
+            raise AssertionError(f"no node showing {text!r}; tree:\n{self.dump()}")
         _, x, y, w, h = found
-        cx = x + w / 2.0
-        cy = y + h / 2.0
+        return (x, y, w, h)
+
+    def _centre(self, text: str) -> tuple[float, float]:
+        x, y, w, h = self.rect_of(text)
+        return (x + w / 2.0, y + h / 2.0)
+
+    def click(self, label: str, modifiers: str = ""):
+        """Press and release the pointer over the node showing `label`, through
+        the same hit test and event path a window uses; `modifiers` is what
+        `input_modifiers()` reports inside the handler ("shift", "shift+cmd", …)."""
+        cx, cy = self._centre(label)
         down = self.core.pointer(1, cx, cy)
         up = self.core.pointer(2, cx, cy)
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
             raise AssertionError(f"{label!r} is not clickable; tree:\n{self.dump()}")
-        dispatch(self.runtime, handler_idx, None)
+        self.runtime.dispatch(handler_idx, None, modifiers)
+
+    def press(self, chord: str) -> bool:
+        """Offer a key chord ("cmd+x", "down", "shift+up", "enter") to the composition's
+        `on_key` handlers, as the window does; True when one took it."""
+        return self.runtime.dispatch_key(chord)
+
+    def hover(self, label: str):
+        """Move the pointer over the node showing `label`."""
+        cx, cy = self._centre(label)
+        self.core.pointer(3, cx, cy)
+
+    def hovered_handler(self) -> int:
+        return self.core.hovered_handler()
+
+    def scroll(self, label: str, dy: float) -> bool:
+        """Turn the wheel by `dy` logical pixels (positive scrolls the content up) over the
+        node showing `label`; True when a scroll container moved."""
+        cx, cy = self._centre(label)
+        return self.core.scroll(cx, cy, dy)
+
+    def scroll_offset(self) -> float:
+        """The offset of the first scroll container in tree order (0 when there is none)."""
+        found = self.core.first_scroll()
+        return found[1] if found is not None else 0.0
 
     def type_into(self, placeholder: str, text: str):
         """Focus the field showing `placeholder` (or its current value) and type `text`."""
@@ -152,7 +192,7 @@ class TestComposition:
         event = self.core.key_text(text)
         if event is None or event[3] < 0:
             raise AssertionError(f"{placeholder!r} did not take focus; tree:\n{self.dump()}")
-        dispatch(self.runtime, event[3], event[4])
+        self.runtime.dispatch(event[3], event[4])
 
     def recompositions(self, fn: object) -> int:
         name = getattr(fn, "__name__", str(fn))

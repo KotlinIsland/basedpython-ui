@@ -27,6 +27,7 @@ let R_CHECKBOX = _runtime.R_CHECKBOX
 let R_SPACER = _runtime.R_SPACER
 let R_CANVAS = _runtime.R_CANVAS
 let R_LAYOUT = _runtime.R_LAYOUT
+let R_SCROLL = _runtime.R_SCROLL
 
 
 class ColumnScope:
@@ -115,12 +116,25 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((8.0, float(alignment_code(alignment))))
             case ModOp.Clickable(on_click):
                 ops.extend((9.0, float(rt.handler(on_click))))
+            case ModOp.Rounded(radius):
+                ops.extend((10.0, radius.value))
+            case ModOp.Border(width, color):
+                ops.extend((11.0, width.value, float(color.argb())))
+            case ModOp.Hover(color):
+                ops.extend((12.0, float(color.argb())))
+            case ModOp.Shadow(elevation, color):
+                ops.extend((13.0, elevation.value, float(color.argb())))
+            case ModOp.Reveal:
+                ops.append(14.0)
+            case ModOp.Clip:
+                ops.append(15.0)
     return ops
 
 
 private def encode_style(style: object) -> (float, float, int):
     s = style cast! TextStyle
-    return (s.size.value, float(s.color.argb()), 1 if s.bold else 0)
+    flags = (1 if s.bold else 0) | (2 if s.mono else 0) | (4 if s.nowrap else 0)
+    return (s.size.value, float(s.color.argb()), flags)
 
 
 private def alignment_code(alignment: Alignment) -> int:
@@ -193,7 +207,7 @@ def Text(text: str, modifier: Modifier = NONE, style: TextStyle = DEFAULT_TEXT_S
     rt = composing()
     flags, k = key_flags(rt)
     if color is not None:
-        style = TextStyle(style.size, color, style.bold)
+        style = TextStyle(style.size, color, style.bold, style.mono, style.nowrap)
     rt.ints.extend((R_TEXT, flags, intern_text(rt, text), optional_modifier(rt, modifier), -1, intern_style(rt, style), k, 0))
 
 
@@ -231,7 +245,9 @@ def Column(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Sta
     rt = composing()
     flags, k = key_flags(rt)
     rt.ints.extend((R_COLUMN, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
+    rt.depth += 1
     content(_COLUMN_SCOPE)
+    rt.depth -= 1
     rt.ints.extend(_END_RECORD)
 
 
@@ -240,7 +256,9 @@ def Row(modifier: Modifier = NONE, arrangement: Arrangement = Arrangement.Start,
     rt = composing()
     flags, k = key_flags(rt)
     rt.ints.extend((R_ROW, flags, -1, optional_modifier(rt, modifier), -1, arrangement_code(arrangement), k, 0))
+    rt.depth += 1
     content(_ROW_SCOPE)
+    rt.depth -= 1
     rt.ints.extend(_END_RECORD)
 
 
@@ -249,7 +267,22 @@ def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once 
     rt = composing()
     flags, k = key_flags(rt)
     rt.ints.extend((R_BOX, flags, -1, optional_modifier(rt, modifier), -1, alignment_code(alignment), k, 0))
+    rt.depth += 1
     content(_BOX_SCOPE)
+    rt.depth -= 1
+    rt.ints.extend(_END_RECORD)
+
+
+def Scroll(modifier: Modifier = NONE, once content: ColumnScope.() -> None) raises ...:
+    """A vertically scrolling column: the content may be taller than the node, which takes
+    the height its constraints give it (`fill_max_height` / `weight` make it the viewport).
+    The wheel scrolls it; a child with `Modifier().reveal()` is scrolled into view."""
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 0, k, 0))
+    rt.depth += 1
+    content(_COLUMN_SCOPE)
+    rt.depth -= 1
     rt.ints.extend(_END_RECORD)
 
 
@@ -274,5 +307,7 @@ def Layout(measure: (MeasureScope, Constraints) -> Size, modifier: Modifier = NO
         return (size.width, size.height)
 
     rt.emit(R_LAYOUT, flags, -1, intern_modifier(rt, modifier), rt.handler(measure_callback), 0, k, 0)
+    rt.depth += 1
     content()
+    rt.depth -= 1
     rt.end()

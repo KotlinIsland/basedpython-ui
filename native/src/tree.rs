@@ -43,6 +43,9 @@ pub struct Node {
     pub style: Style,
     pub canvas: Option<Box<Vec<CanvasCmd>>>,
     pub canvas_pending: bool,
+    /// SCROLL: the current offset of the content (logical pixels, >= 0) and its full length.
+    pub scroll: f32,
+    pub content_len: f32,
     /// Commit serial of the last reconciliation that reused this node (see `commit.rs`).
     pub mark: u32,
     /// Commit serial of the reconciliation frame currently running on this container.
@@ -88,6 +91,8 @@ impl Node {
             style: Style::DEFAULT,
             canvas: None,
             canvas_pending: false,
+            scroll: 0.0,
+            content_len: 0.0,
             mark: 0,
             frame_serial: 0,
             dirty: true,
@@ -109,6 +114,16 @@ impl Node {
 
     pub fn text_str(&self) -> &str {
         self.text.as_deref().unwrap_or("")
+    }
+
+    /// The content rect (inside the modifier layers) in absolute coordinates; valid after layout.
+    pub fn content_rect(&self) -> Rect {
+        Rect::new(self.abs.x + self.content_origin.0, self.abs.y + self.content_origin.1, self.content_size.w, self.content_size.h)
+    }
+
+    /// How far the content of a SCROLL node can be scrolled.
+    pub fn scroll_limit(&self) -> f32 {
+        (self.content_len - self.content_size.h).max(0.0)
     }
 }
 
@@ -139,6 +154,10 @@ pub struct Inner {
     pub focus: Option<Focus>,
     /// Canvas nodes whose draw block must run again (flag `canvas_pending` on the node too).
     pub canvas_pending: Vec<NodeId>,
+    /// Nodes whose modifier gained `reveal` this commit: layout scrolls them into view.
+    pub reveal_pending: Vec<NodeId>,
+    /// Handler index under the pointer as of the last pointer event, or -1 (paint reads it).
+    pub hover_handler: i32,
     /// commit, layout, paint durations of the last calls, in milliseconds.
     pub timings: [f64; 3],
     pub commit_serial: u32,
@@ -174,6 +193,8 @@ impl Inner {
             pixmap: None,
             focus: None,
             canvas_pending: Vec::new(),
+            reveal_pending: Vec::new(),
+            hover_handler: -1,
             timings: [0.0; 3],
             commit_serial: 0,
             layout_epoch: 0,
@@ -291,6 +312,7 @@ impl Inner {
             if node.canvas_pending {
                 self.canvas_pending.retain(|&c| c != n);
             }
+            self.reveal_pending.retain(|&c| c != n);
             for c in node.children {
                 if self.nodes.get(c).map(|cn| cn.parent) == Some(Some(n)) {
                     stack.push(c);
@@ -430,12 +452,18 @@ impl Inner {
             if node.handler >= 0 {
                 let _ = write!(out, " handler={}", node.handler);
             }
+            if node.modifier.clip {
+                out.push_str(" clip");
+            }
             match node.kind {
                 Kind::Column | Kind::Row => {
                     let _ = write!(out, " arrangement={}", node.a);
                 }
                 Kind::Box => {
                     let _ = write!(out, " alignment={}", node.a);
+                }
+                Kind::Scroll => {
+                    let _ = write!(out, " scroll={} content={}", fmt(node.scroll), fmt(node.content_len));
                 }
                 Kind::Button => {
                     if node.a == 0 {

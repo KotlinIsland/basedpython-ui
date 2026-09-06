@@ -396,6 +396,7 @@ loop capturing the loop variable; a missing `context` argument.
 | a module attribute read during composition (`math.tau`) | exempt: a module is treated as a namespace, so a mutable module-level value is only checked when read through its own name (a global) |
 | a frozen data class holding a mutable field typed `object` | rejected statically by `mutable-state-value`; the runtime guard checks declared field types one level down |
 | a fresh lambda passed every composition | correct but never skipped; documented; `remember` a handler on hot paths |
+| a `from x import y` binds a lazy-import proxy (python < 3.15), so a composable or a value from another module arrives as one | the runtime looks past the proxy's `__call__` frame when it takes a call site, and unwraps a proxy where a value enters state, a key, a comparison for skipping, or an ambient (`provide`); F9 removes the proxy altogether |
 
 ## 5. dependency inference and inlay hints (fork; implemented on `ui-support`)
 
@@ -475,7 +476,9 @@ runtime, with its exact read set, does not re-run, and the trace (§6.7) is the 
   ever retained. this is what keeps `once` honest
 - **slots**: `state(x)` reads `scope.slots[cursor]` if present (kind checked) else creates;
   `cursor += 1`. slot identity is positional; `key(k):` opens a keyed group so loop iterations match
-  across reorders. scope identity is the calling site (`f_code`, `f_lasti` of the caller frame,
+  across reorders. a key marks the records emitted at the container depth the group was opened at
+  — its own children — and nothing nested inside them, so a keyed `Row` of two `Text`s carries one
+  key, on the row. scope identity is the calling site (`f_code`, `f_lasti` of the caller frame,
   ~240 ns, taken only for composable calls) plus the key and an ordinal; a transpiler pass in the
   fork injects a literal `_site=N` later, which also makes compiled composables possible
 - **recomposition** of a dirty scope runs it in isolation with its retained data arguments; its

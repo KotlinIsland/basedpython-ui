@@ -69,6 +69,7 @@ let R_CHECKBOX = 9
 let R_SPACER = 10
 let R_CANVAS = 11
 let R_LAYOUT = 12
+let R_SCROLL = 13
 
 let FLAG_KEYED = 1
 let FLAG_STR_KEY = 2
@@ -129,6 +130,8 @@ let live_runtimes: list[Runtime] = []
 # ------------------------------------------------------------ the current runtime
 
 var _current: Runtime? = None
+# the runtime whose input handler is running right now (see `input_modifiers`)
+var _dispatching: Runtime? = None
 var _ids: int = 0
 
 
@@ -144,6 +147,13 @@ def current_runtime() -> Runtime raises ...:
     if rt is None:
         raise CompositionError("called outside of a composition: builders, `state()` and the other slot functions only run inside a composable")
     return rt
+
+
+def input_modifiers() -> str:
+    """The modifier keys held during the input event whose handler is running:
+    "" or a `+`-joined subset of ctrl, alt, shift, cmd in that order ("shift+cmd")."""
+    rt = _dispatching
+    return rt.event_modifiers if rt is not None else ""
 
 
 # the qualified name of the lazy-import proxy's `__call__`: every generated
@@ -202,6 +212,18 @@ def is_stable_type(t: type) -> bool:
     return result
 
 
+let _PROXY_CLASS = "_LazyAttr"
+
+
+def unwrap(value: object) -> object:
+    """The object behind a lazy-import proxy (`from x import y` on python < 3.15 binds
+    one), else the value itself: what enters state or a comparison is the real value."""
+    if type(value).__name__ == _PROXY_CLASS:
+        resolved: dynamic = value
+        return resolved._by_resolve()
+    return value
+
+
 def check_state_value(value: object) raises TypeError:
     """The runtime half of `mutable-state-value`: refuse the values the lint
     cannot see (from `.py` callers or `dynamic`)."""
@@ -218,7 +240,12 @@ private def args_equal(old: (*: object), new: (*: object)) -> bool:
     for a, b in zip(old, new):
         if a === b:
             continue
-        if not is_stable_type(type(b)) or a != b:
+        if not is_stable_type(type(b)):
+            a = unwrap(a)
+            b = unwrap(b)
+            if not is_stable_type(type(b)):
+                return False
+        if a != b:
             return False
     return True
 
@@ -232,7 +259,12 @@ private def kwargs_equal(old: dict[str, object], new: dict[str, object]) -> bool
         a = old[name]
         if a === b:
             continue
-        if not is_stable_type(type(b)) or a != b:
+        if not is_stable_type(type(b)):
+            a = unwrap(a)
+            b = unwrap(b)
+            if not is_stable_type(type(b)):
+                return False
+        if a != b:
             return False
     return True
 
@@ -558,8 +590,9 @@ class State[T](Observable):
 
     init(self, initial: T):
         Observable.__init__(self)
-        check_state_value(initial)
-        self._value: T = initial
+        real: dynamic = unwrap(initial)
+        check_state_value(real)
+        self._value: T = real
 
     var value: T
         get() = self.get()
@@ -574,7 +607,8 @@ class State[T](Observable):
         # frames above `_apply`: this method, the setter / `set` / `update`, then the writer
         self.apply(lambda site: self.store(new, site), 3, "state set")
 
-    private def store(self, new: T, site: WriteSite?) raises TypeError:
+    private def store(self, value: T, site: WriteSite?) raises TypeError:
+        new: dynamic = unwrap(value)
         check_state_value(new)
         old = self._value
         if new === old or (is_stable_type(type(new)) and new == old):
@@ -597,9 +631,10 @@ class StateList[T](Observable):
 
     init(self, initial: Iterable[T] = ()):
         Observable.__init__(self)
-        self._items: list[T] = list(initial)
-        for item in self._items:
+        items: dynamic = [unwrap(item) for item in initial]
+        for item in items:
             check_state_value(item)
+        self._items: list[T] = items
 
     def __len__(self) -> int:
         self.track()
@@ -613,7 +648,8 @@ class StateList[T](Observable):
         self.track()
         return self._items[index]
 
-    def __setitem__(self, index: int, value: T) raises ...:
+    def __setitem__(self, index: int, item: T) raises ...:
+        value: dynamic = unwrap(item)
         check_state_value(value)
         self.apply(lambda site: self.replace(index, value, site), 2, "list set")
 
@@ -625,7 +661,8 @@ class StateList[T](Observable):
         items[index] = value
         self.notify("list", "set", index if index >= 0 else index + len(items), old, value, site)
 
-    def append(self, value: T) raises ...:
+    def append(self, item: T) raises ...:
+        value: dynamic = unwrap(item)
         check_state_value(value)
         self.apply(lambda site: self.push(value, site), 2, "list append")
 
@@ -635,7 +672,8 @@ class StateList[T](Observable):
         items.append(value)
         self.notify("list", "append", at, None, value, site)
 
-    def insert(self, index: int, value: T) raises ...:
+    def insert(self, index: int, item: T) raises ...:
+        value: dynamic = unwrap(item)
         check_state_value(value)
         self.apply(lambda site: self.insert_at(index, value, site), 2, "list insert")
 
@@ -746,7 +784,8 @@ class StateDict[K, V](Observable):
         self.track()
         return self._items[key]
 
-    def __setitem__(self, key: K, value: V) raises ...:
+    def __setitem__(self, key: K, item: V) raises ...:
+        value: dynamic = unwrap(item)
         check_state_value(value)
         self.apply(lambda site: self.put(key, value, site), 2, "dict put")
 
@@ -889,6 +928,7 @@ final class Scope(Tracker):
         self.old_children: dict[ChildKey, Scope] = {}
         self.site_counts: dict[(object, object), int] = {}
         self.handlers: list[int] = []
+        self.key_handlers: list[Handler] = []
         self.dirty: bool = False
         self.alive: bool = True
         self.inline: bool = False
@@ -973,6 +1013,14 @@ def builder[F](fn: F) -> F:
 def key(k: object, once content: () -> None) raises ...:
     """Open a child group identified by `k` rather than by position."""
     current_runtime().keyed(k, content)
+
+
+def on_key(handler: (str) -> bool) raises ...:
+    """Register a key handler for this composition of the enclosing scope. A chord the
+    window delivers ("cmd+x", "shift+up", "enter", "j") is offered to the handlers of the
+    deepest scopes first; a handler returns True to take it. Re-registered on every
+    recomposition, so it may close over the scope's current values."""
+    current_runtime().register_key_handler(handler)
 
 
 class Keyed[T]:
@@ -1181,9 +1229,11 @@ def ambient[T](default: T) -> Ambient[T]:
 
 def provide[T](which: Ambient[T], value: T, once content: () -> None) raises ...:
     rt = current_runtime()
-    cell = rt.slot(SLOT_PROVIDE, 1, lambda: ProvidedCell(value))
+    cell = rt.slot(SLOT_PROVIDE, 1, lambda: ProvidedCell(unwrap(value)))
     rt.set_provided(cell, value)
-    rt.ambient_stack.append((which, cell))
+    # readers compare the ambient by identity, so the real one goes on the stack, never the
+    # proxy an import may have bound `which` to
+    rt.ambient_stack.append((unwrap(which), cell))
     try:
         content()
     finally:
@@ -1215,6 +1265,9 @@ protocol NativeCore:
     def field_handler(self, placeholder: str) -> int
     def dump(self) -> str
     def node_count(self) -> int
+    def scroll(self, x: float, y: float, dy: float) -> bool
+    def hovered_handler(self) -> int
+    def first_scroll(self) -> tuple[int, float, float, float] | None
 
 
 final class Runtime:
@@ -1229,6 +1282,10 @@ final class Runtime:
         self.scopes: dict[int, Scope] = {}
         self.dirty_heap: list[(int, int)] = []
         self.key_stack: list[object] = []
+        # the container depth each key was opened at: a key applies to the records emitted
+        # at that depth — the group's own children — and not to anything nested in them
+        self.key_depths: list[int] = []
+        self.depth: int = 0
         self.ambient_stack: list[(object, ProvidedCell)] = []
         self.ints: list[int] = []
         self.floats: list[float] = []
@@ -1247,6 +1304,7 @@ final class Runtime:
         # will carry, in run order; a rollback cuts out the runs nested under it
         self.ran: list[Scope] = []
         self.posted: deque[() -> None] = deque()
+        self.event_modifiers: str = ""
         self.ui_thread: int = threading.get_ident()
         self.on_error: (BaseException, str) -> None = on_error if on_error is not None else default_on_error
         self.recompositions: dict[str, int] = {}
@@ -1342,9 +1400,59 @@ final class Runtime:
         if wake is not None:
             wake()
 
-    def set_provided(self, cell: ProvidedCell, value: object) raises TypeError:
+    def register_key_handler(self, handler: Handler) raises CompositionError:
+        scope = self.scope
+        if scope is None or self.phase != COMPOSING:
+            raise CompositionError("on_key only runs while a composable is composing")
+        scope.key_handlers.append(handler)
+
+    def dispatch_key(self, chord: str) -> bool raises CompositionError:
+        """Offer a key chord to the registered handlers, deepest scope first (later
+        registrations first within a scope); True when one took it. A handler that raises
+        is reported through `on_error` and counts as having taken the key."""
+        if self.phase == COMPOSING:
+            raise CompositionError("a key cannot be dispatched while composing")
+        candidates = [scope for scope in self.scopes.values() if scope.alive and scope.key_handlers]
+        candidates.sort(key=lambda scope: (-scope.depth, -scope.id))
+        for scope in candidates:
+            for handler in reversed(scope.key_handlers):
+                try:
+                    handled = handler(chord)
+                except BaseException as error:
+                    self.on_error(error, "key")
+                    return True
+                if handled:
+                    return True
+        return False
+
+    def dispatch(self, handler_idx: int, payload: object, modifiers: str = ""):
+        """Run an input handler from the handler table (a click, a text change), with the
+        event's modifier keys readable through `input_modifiers()` while it runs. A handler
+        that raises is reported through `on_error`; the composition is untouched."""
+        global _dispatching
+        if handler_idx < 0 or handler_idx >= len(self.handlers):
+            return
+        handler = self.handlers[handler_idx]
+        if handler is None:
+            return
+        previous = _dispatching
+        _dispatching = self
+        self.event_modifiers = modifiers
+        try:
+            if payload is None:
+                handler()
+            else:
+                handler(payload)
+        except BaseException as error:
+            self.on_error(error, "handler")
+        finally:
+            self.event_modifiers = ""
+            _dispatching = previous
+
+    def set_provided(self, cell: ProvidedCell, provided: object) raises TypeError:
         # a provider's cell is written during composition on purpose: readers
         # below it are invalidated and recompose later in this frame
+        value = unwrap(provided)
         old = cell.value
         if value === old or (is_stable_type(type(value)) and value == old):
             return
@@ -1384,16 +1492,19 @@ final class Runtime:
             value.decl = site
         return value
 
-    def keyed(self, k: object, once content: () -> None) raises ...:
+    def keyed(self, key: object, once content: () -> None) raises ...:
+        k = unwrap(key)
         # exact types: a `bool` is an `int` to `isinstance` and is refused all the same
         t = type(k)
         if t !== int and t !== str:
             raise CompositionError(f"a key must be an int or a str, not {t.__name__}")
         self.key_stack.append(k)
+        self.key_depths.append(self.depth)
         try:
             content()
         finally:
             self.key_stack.pop()
+            self.key_depths.pop()
 
     def call_composable(self, composable: Composable, args: (*: object), kwargs: dict[str, object], site: Site) raises ...:
         parent = self.scope
@@ -1484,10 +1595,14 @@ final class Runtime:
         outer_scope = self.scope
         outer_tracker = self.tracker
         outer_keys = self.key_stack
+        outer_key_depths = self.key_depths
+        outer_depth = self.depth
         outer_ambients = self.ambient_stack
         self.scope = scope
         self.tracker = scope.restart
         self.key_stack = []
+        self.key_depths = []
+        self.depth = 0
         try:
             self.run_scope_within(scope, cause, outer_scope)
         finally:
@@ -1498,6 +1613,8 @@ final class Runtime:
             self.scope = outer_scope
             self.tracker = outer_tracker
             self.key_stack = outer_keys
+            self.key_depths = outer_key_depths
+            self.depth = outer_depth
             self.ambient_stack = outer_ambients
 
     def run_scope_within(self, scope: Scope, cause: CauseTuple?, outer_scope: Scope?) raises ...:
@@ -1518,6 +1635,7 @@ final class Runtime:
         for h in scope.handlers:
             self.release_handler(h)
         scope.handlers = []
+        scope.key_handlers = []
         start = len(self.ints)
         float_start = len(self.floats)
         scope.start = start
@@ -1662,6 +1780,7 @@ final class Runtime:
         for h in scope.handlers:
             self.release_handler(h)
         scope.handlers = []
+        scope.key_handlers = []
         self.scopes.pop(scope.id, None)
         trace = self.trace
         if trace is not None:
@@ -1703,8 +1822,9 @@ final class Runtime:
         self.free_handlers.append(idx)
 
     def current_key_flags(self) -> (int, int):
-        """The key flags and key payload for a record emitted under `key(...)`."""
-        if not self.key_stack:
+        """The key flags and key payload for a record emitted under `key(...)`: only a
+        record at the depth the key was opened at carries it."""
+        if not self.key_stack or self.key_depths[-1] != self.depth:
             return (0, 0)
         k = self.key_stack[-1]
         if isinstance(k, str):

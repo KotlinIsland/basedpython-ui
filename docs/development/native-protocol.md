@@ -319,3 +319,69 @@ def layout(self, measure=None) -> None                       # amendment 2
 - the module declares `Py_MOD_GIL_NOT_USED` (`#[pymodule(gil_used = false)]`); `Core` is
   `Send + Sync` (its state is behind a mutex; the font database is process-wide behind another),
   `Window` too, but its loop is bound to the thread that calls `run`.
+
+## amendments (2026-09-04, for basedgit-ui)
+
+added for the first application built on the framework: a scroll container, decorated islands,
+hover, keyboard chords and the modifier keys of pointer events.
+
+### SCROLL (kind 13)
+
+a container; `a` = axis and must be 0 (vertical); children follow until END. children are laid
+out like a `Column` with an unbounded height, the node takes the height its constraints give it
+(`fill_max_height` / `weight` make it the viewport), and its painting, its children's painting
+and hit testing are clipped to its content rect. the core owns the scroll offset (clamped to
+`[0, content - viewport]` on every layout); `Core.scroll(x, y, dy)` moves the innermost
+container under the point that can still move that way and returns whether anything moved
+(the `Window` maps the mouse wheel onto it: one line = 40 logical pixels). a thin thumb is
+painted at the right edge while the content overflows. `dump()` shows `scroll=` and `content=`.
+
+### modifier ops 10–15
+
+| op | args | effect |
+|---|---|---|
+| 10 rounded | radius | corner radius for every background, border, shadow and hover layer after it in the chain |
+| 11 border | width, argb | a stroke inside the layer's rect (no layout effect) |
+| 12 hover | argb | painted over the chain's clickable layer while `hovered_handler()` is its handler |
+| 13 shadow | elevation, argb | a soft shadow under the layer's rect, painted before the layers after it |
+| 14 reveal | | when a node's modifier *gains* this op (a new node, or a modifier change), layout scrolls the nearest enclosing SCROLL so the node is inside its viewport, once |
+| 15 clip | | the node's own painting and its children are clipped to the node's rect |
+
+### style flags
+
+`new_styles` entries are `(id, size, argb, flags)`; `flags` is a bit set: 1 bold, 2 monospace
+family, 4 no-wrap (one line, clipped to the node's content rect when wider). other bits are a
+`ValueError`. `Style::DEFAULT` is unchanged (flags 0).
+
+### hover
+
+`Core.pointer(kind, x, y)` records the handler under the pointer for every kind (also 3, move);
+`Core.hovered_handler()` reads it. an enabled `Button` under the pointer is painted darker.
+the `Window` clears it when the cursor leaves the window.
+
+### events
+
+- kind **7 KEY_CHORD**: `(7, 0, 0, -1, chord)`. the `Window` emits it for every key pressed
+  while cmd, ctrl or alt is held, and for up / down / pageup / pagedown / f1–f12 always
+  (those keys mean nothing to a text field). the chord is `ctrl+alt+shift+cmd+<key>` with
+  only the held modifiers present and the key in lower case ("cmd+x", "shift+up",
+  "pagedown"). plain keys keep the kind-4 contract (typed text with the field's handler, or
+  handler -1 with the text / control character when nothing is focused); the python side
+  turns the unfocused kind-4 texts into chord names (`chord_of_text`).
+- pointer events (kinds 1, 2, 3) carry the held modifiers in `text` ("", "shift",
+  "shift+cmd", …) so a click handler can read them (`input_modifiers()`).
+
+### extra `Core` methods
+
+```
+def hovered_handler(self) -> int
+def scroll(self, x: float, y: float, dy: float) -> bool
+def scroll_offset(self, node_id: int) -> float | None          # SCROLL nodes only
+def first_scroll(self) -> tuple[int, float, float, float] | None   # (node id, offset, content, viewport), tests
+```
+
+### painting
+
+buttons, text fields and checkboxes have rounded corners; plain rectangles are clipped
+arithmetically, paths through a tiny-skia mask built once per distinct clip rect per frame,
+glyphs per pixel.
