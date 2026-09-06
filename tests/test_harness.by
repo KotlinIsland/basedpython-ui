@@ -7,6 +7,8 @@ from basedpython_ui import (
     chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
     State,
 )
+import time
+
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
 
@@ -628,6 +630,143 @@ def test_a_field_of_several_lines_takes_a_line_break():
     assert text.value == "first\nsecond", repr(text.value)
     let two_lines = t.rect_of("first\nsecond")
     assert two_lines.3 > one_line.3, (one_line, two_lines)
+    t.dispose()
+
+
+def test_a_field_keeps_the_caret_in_sight_and_takes_the_usual_shortcuts():
+    """text longer than the box used to be typed off the end of it, and the keys everyone
+    else has for moving about in it went to the window instead of into the field"""
+    let text = State("")
+    let t = compose_test(width=300, height=200):
+        Column(Modifier().fill_max_size()):
+            TextField(text.value, Modifier().width(120), placeholder="a short box"):
+                text.value = it
+    t.type_into("a short box", "the quick brown fox jumps over it")
+    t.advance()
+    t.core.paint()
+    let placed = t.caret()
+    assert placed is not None, "the field has focus"
+    assert placed.0 == len(text.value), "the caret is at the end of what was typed"
+    assert placed.2 > 0.0, f"and the field scrolled to keep it in sight: {placed}"
+
+    # ⌘← is the start of the line, and the field scrolls back with it — over a few frames,
+    # since it eases rather than jumping, so this paints until it has arrived
+    assert t.edit_chord("Left", meta=True)
+    t.advance()
+    var home = t.caret()
+    for _ in range(80):
+        t.core.paint()
+        home = t.caret()
+        if home is not None and home.2 == 0.0:
+            break
+        time.sleep(0.01)
+    assert home is not None and home.0 == 0, home
+    assert home.2 == 0.0, f"the field scrolled back to the start: {home}"
+
+    # ⌥→ moves a word at a time, and shift keeps the far end where it was
+    assert t.edit_chord("Right", alt=True)
+    let word = t.caret()
+    assert word is not None and word.0 == 3, f"past `the`: {word}"
+    assert t.edit_chord("Right", alt=True, shift=True)
+    let picked = t.caret()
+    assert picked is not None and picked.1 == 3 and picked.0 == 9, f"`quick` is selected: {picked}"
+
+    # typing replaces what is selected
+    t.type_more("X")
+    t.advance()
+    assert text.value.startswith("theX brown"), repr(text.value)
+
+    # a chord the field has no use for is left for the window
+    assert not t.edit_chord("R", meta=True), "the field leaves ⌘R alone"
+    t.dispose()
+
+
+def test_a_container_spaces_itself_and_a_press_shows_on_what_was_pressed():
+    """a gap written on the container is the space between each pair of its children, so the
+    number appears once instead of at every join; a press wash is the only sign a click has
+    landed before whatever it sets off comes back"""
+    let pressed = State(0)
+    let t = compose_test(width=200, height=200):
+        Column(Modifier().fill_max_width().gap(Dp(10.0))):
+            Text("one", Modifier().height(Dp(20.0)))
+            Text("two", Modifier().height(Dp(20.0)).pressed(Color(255, 0, 0)).clickable(lambda: pressed.set(pressed.value + 1)))
+            Text("three", Modifier().height(Dp(20.0)))
+    let one = t.rect_of("one")
+    let two = t.rect_of("two")
+    let three = t.rect_of("three")
+    assert two.1 - (one.1 + one.3) == 10.0, (one, two)
+    assert three.1 - (two.1 + two.3) == 10.0, (two, three)
+
+    # a weighted child is handed what is left *after* the gaps, so a row that spaces itself
+    # does not push its last control off its own edge
+    let spaced = compose_test(width=200, height=60):
+        Row(Modifier().fill_max_width().gap(Dp(10.0))):
+            Text("a", Modifier().width(Dp(40.0)))
+            Spacer(weight(1.0))
+            Text("b", Modifier().width(Dp(40.0)))
+    let last = spaced.rect_of("b")
+    assert last.0 + last.2 <= 200.0, f"the row stayed inside the window: {last}"
+    spaced.dispose()
+
+    # the press paints while the pointer is down and stops when it comes up
+    _ = t.core.pointer(1, two.0 + 2.0, two.1 + 2.0)
+    t.core.paint()
+    _ = t.core.pointer(2, two.0 + 2.0, two.1 + 2.0)
+    t.click("two")
+    t.advance()
+    assert pressed.value == 1, "and the click still lands"
+    t.dispose()
+
+
+def test_a_wide_container_pans_sideways_rather_than_cutting_its_content_off():
+    """a line wider than the viewport had nowhere to go: it was clipped at the edge, with
+    nothing to say so. a wide container lays its content out at the width the content wants"""
+    let t = compose_test(width=200, height=100):
+        Scroll(Modifier().fill_max_size().scrollbar(Color(0, 0, 0)), wide=True):
+            Text("a line far wider than two hundred logical pixels could ever hope to be", Modifier())
+            Text("short", Modifier())
+    let wide = t.rect_of("a line far wider than two hundred logical pixels could ever hope to be")
+    assert wide.2 > 200.0, f"the text kept its own width: {wide}"
+    let before = wide.0
+    # the wheel sideways moves it, and stops at the end of the content
+    assert t.core.scroll(100.0, 50.0, 0.0, 120.0), "it panned"
+    let after = t.rect_of("a line far wider than two hundred logical pixels could ever hope to be")
+    assert after.0 < before, (before, after)
+    # and back
+    _ = t.core.scroll(100.0, 50.0, 0.0, -400.0)
+    assert t.rect_of("a line far wider than two hundred logical pixels could ever hope to be").0 == before
+    t.dispose()
+
+
+def note(into: list[str], what: str):
+    """a handler writing to a list the composition never reads: the composition cannot
+    observe it, which is the point — it is the test that reads it, afterwards"""
+    into.append(what)
+
+
+def test_a_drag_says_what_it_was_let_go_on():
+    """`draggable` says where the pointer is and nothing about what is under it, so a drag
+    that moves a thing had nowhere to put it. a drop target is told when a drag comes over
+    it, when it leaves, and when it is let go there"""
+    said: list[str] = []
+    let t = compose_test(width=200, height=200):
+        Column(Modifier().fill_max_size()):
+            Text("handle", Modifier().fill_max_width().height(Dp(40.0)).draggable(lambda (what: str): None))
+            Text("here", Modifier().fill_max_width().height(Dp(40.0)).drop_target(lambda (what: str): note(said, f"here:{what}")))
+            Text("there", Modifier().fill_max_width().height(Dp(40.0)).drop_target(lambda (what: str): note(said, f"there:{what}")))
+    let handle = t.rect_of("handle")
+    let here = t.rect_of("here")
+    let there = t.rect_of("there")
+    _ = t.core.pointer(1, handle.0 + 5.0, handle.1 + 5.0)
+    t._deliver()
+    _ = t.core.pointer(3, here.0 + 5.0, here.1 + 5.0)
+    t._deliver()
+    _ = t.core.pointer(3, there.0 + 5.0, there.1 + 5.0)
+    t._deliver()
+    _ = t.core.pointer(2, there.0 + 5.0, there.1 + 5.0)
+    t._deliver()
+    t.advance()
+    assert said == ["here:over", "here:leave", "there:over", "there:drop"], said
     t.dispose()
 
 

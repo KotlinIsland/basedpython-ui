@@ -86,6 +86,12 @@ enum class ModOp:
     case Multiline
     # told when the pointer is pressed anywhere but here, without taking the press
     case Dismiss(on_dismiss: () -> None)
+    # space a row or column puts between its children
+    case Gap(value: Dp)
+    # painted over the clickable layer while the pointer is held down on it
+    case Pressed(color: Color)
+    # told when a drag passes over this node, leaves it, or is let go on it
+    case DropTarget(on_drop: (str) -> None)
 
 
 frozen data class Modifier:
@@ -174,6 +180,23 @@ frozen data class Modifier:
         not taken: it goes on to whatever it landed on, so a menu can close on a click that
         still does what it was aimed at."""
         return self.then(ModOp.Dismiss(on_dismiss))
+
+    def gap(self, size: Dp) -> Modifier:
+        """Space a `Row`, `Column` or `Scroll` puts between each pair of its children. The
+        container spaces itself, so the number is written once instead of at every join."""
+        return self.then(ModOp.Gap(size))
+
+    def pressed(self, color: Color) -> Modifier:
+        """Painted over this layer while the pointer is held down on it, the way `hover` is
+        painted while the pointer is over it. Without it a click has no feedback at all
+        between the press and whatever it sets off."""
+        return self.then(ModOp.Pressed(color))
+
+    def drop_target(self, on_drop: (str) -> None) -> Modifier:
+        """Called with "over" when a drag comes onto this node, "leave" when it goes off
+        again, and "drop" when it is let go here. `draggable` says where the pointer is;
+        this says what is under it, which is what a drag that moves a thing needs."""
+        return self.then(ModOp.DropTarget(on_drop))
 
     def multiline(self) -> Modifier:
         """A `TextField` that takes more than one line: it wraps inside the width it is

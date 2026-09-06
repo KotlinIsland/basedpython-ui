@@ -26,6 +26,8 @@ pub const EV_HOVER: i32 = 11;
 pub const EV_DRAG: i32 = 12;
 /// A press outside a `dismiss` layer: the layer's handler, with nothing to say.
 pub const EV_DISMISS: i32 = 13;
+/// A drag passing over, or let go on, a `drop_target`: "over", "leave" or "drop".
+pub const EV_DROP: i32 = 14;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;
@@ -62,6 +64,8 @@ pub enum Which {
     Drag,
     /// `selectable` layers only.
     Select,
+    /// `drop_target` layers only — where something being dragged may be let go.
+    Drop,
 }
 
 /// The result of a hit test.
@@ -151,6 +155,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
                 (Which::Hover, Layer::Hoverable { rect, handler }) => Some((rect, *handler)),
                 (Which::Drag, Layer::Drag { rect, handler }) => Some((rect, *handler)),
                 (Which::Select, Layer::Select { rect, .. }) => Some((rect, 0)),
+                (Which::Drop, Layer::Drop { rect, handler }) => Some((rect, *handler)),
                 _ => None,
             };
             if let Some((rect, handler)) = found {
@@ -217,12 +222,20 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
     let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
     if kind == EV_POINTER_DOWN && !dragging && !selecting {
         match hit.focus {
-            Some(field) => focus_field(inner, field),
+            Some(field) => focus_field_at(inner, field, x, y),
             None => inner.focus = None,
         }
     }
     if !secondary {
         inner.hover_node = hit.node;
+        // what the pointer is holding down, so the thing pressed can say so. a press that
+        // wanders off the node it started on stops showing, the way a button does
+        match kind {
+            EV_POINTER_DOWN => inner.pressed_node = hit.node,
+            EV_POINTER_UP => inner.pressed_node = None,
+            EV_POINTER_MOVE if inner.pressed_node.is_some() && inner.pressed_node != hit.node => inner.pressed_node = None,
+            _ => {}
+        }
     }
     update_hover_target(inner, x, y);
     Event::new(kind, x, y, if dragging || selecting { -1 } else { hit.handler }, String::new())
@@ -437,6 +450,17 @@ fn update_drag(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
         EV_POINTER_MOVE => match dragging_handler(inner) {
             Some(handler) => {
                 inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "move".to_string()));
+                // and what it is currently over, so the thing it would land on can say so
+                let over = hit_for(inner, x, y, Which::Drop).handler;
+                if over != inner.drop_node {
+                    if inner.drop_node >= 0 {
+                        inner.pending_events.push(Event::new(EV_DROP, x, y, inner.drop_node, "leave".to_string()));
+                    }
+                    if over >= 0 {
+                        inner.pending_events.push(Event::new(EV_DROP, x, y, over, "over".to_string()));
+                    }
+                    inner.drop_node = over;
+                }
                 true
             }
             None => false,
@@ -444,6 +468,16 @@ fn update_drag(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
         EV_POINTER_UP => {
             let handler = dragging_handler(inner);
             let dragging = inner.drag_node.is_some();
+            if dragging {
+                // where it was let go, which is the whole point of a drag that moves a thing
+                let onto = hit_for(inner, x, y, Which::Drop).handler;
+                if onto >= 0 {
+                    inner.pending_events.push(Event::new(EV_DROP, x, y, onto, "drop".to_string()));
+                } else if inner.drop_node >= 0 {
+                    inner.pending_events.push(Event::new(EV_DROP, x, y, inner.drop_node, "leave".to_string()));
+                }
+            }
+            inner.drop_node = -1;
             if let Some(handler) = handler {
                 inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "end".to_string()));
             }
@@ -523,21 +557,73 @@ pub fn pointer_left(inner: &mut Inner) {
 /// (positive = content moves up). Returns whether anything moved. Absolute rects and the
 /// hovered handler are brought up to date, so a repaint is all that is needed afterwards.
 pub fn scroll(inner: &mut Inner, x: f32, y: f32, dy: f32) -> bool {
-    if !dy.is_finite() || dy == 0.0 {
+    scroll_by(inner, x, y, 0.0, dy)
+}
+
+/// The same with a sideways component, for a container laid out at its content's own width.
+pub fn scroll_by(inner: &mut Inner, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+    let dx = if dx.is_finite() { dx } else { 0.0 };
+    let dy = if dy.is_finite() { dy } else { 0.0 };
+    if dx == 0.0 && dy == 0.0 {
         return false;
     }
     let root = inner.root;
-    let Some(target) = innermost_scrollable(inner, root, x, y, dy) else { return false };
-    let node = &mut inner.nodes[target];
-    let new = (node.scroll + dy).clamp(0.0, node.scroll_limit());
-    if new == node.scroll {
+    let mut moved = false;
+    if dy != 0.0 {
+        if let Some(target) = innermost_scrollable(inner, root, x, y, dy) {
+            let node = &mut inner.nodes[target];
+            let new = (node.scroll + dy).clamp(0.0, node.scroll_limit());
+            if new != node.scroll {
+                node.scroll = new;
+                moved = true;
+            }
+        }
+    }
+    if dx != 0.0 {
+        if let Some(target) = innermost_pannable(inner, root, x, y, dx) {
+            let node = &mut inner.nodes[target];
+            let new = (node.scroll_x + dx).clamp(0.0, node.scroll_limit_x());
+            if new != node.scroll_x {
+                node.scroll_x = new;
+                moved = true;
+            }
+        }
+    }
+    if !moved {
         return false;
     }
-    node.scroll = new;
     crate::layout::assign_abs(inner);
     inner.hover_node = hit_test(inner, x, y).node;
     update_hover_target(inner, x, y);
     true
+}
+
+/// The deepest SCROLL node under the point that can still move sideways.
+fn innermost_pannable(inner: &Inner, id: NodeId, x: f32, y: f32, dx: f32) -> Option<NodeId> {
+    let node = inner.nodes.get(id)?;
+    for &c in node.children.iter().rev() {
+        let Some(child) = inner.nodes.get(c) else { continue };
+        if child.is_group() {
+            if let Some(found) = innermost_pannable(inner, c, x, y, dx) {
+                return Some(found);
+            }
+            continue;
+        }
+        if !child.abs.contains(x, y) {
+            continue;
+        }
+        if let Some(found) = innermost_pannable(inner, c, x, y, dx) {
+            return Some(found);
+        }
+        if child.kind == Kind::Scroll {
+            let limit = child.scroll_limit_x();
+            let can_move = if dx > 0.0 { child.scroll_x < limit } else { child.scroll_x > 0.0 };
+            if limit > 0.0 && can_move {
+                return Some(c);
+            }
+        }
+    }
+    None
 }
 
 /// The deepest SCROLL node containing the point that can still move in the direction of `dy`;
@@ -596,8 +682,47 @@ fn focus_field(inner: &mut Inner, field: NodeId) {
     }
     let buffer = inner.nodes.get(field).map(|n| n.text_str().to_string()).unwrap_or_default();
     let caret = buffer.chars().count();
-    inner.focus = Some(Focus { node: field, buffer, caret });
+    inner.focus = Some(Focus::new(field, buffer, caret));
     inner.mark_dirty(field);
+}
+
+/// Focus a field and put the caret where the press landed, rather than at the end of the
+/// text — clicking into the middle of a word and typing at the end of it is nobody's idea of
+/// a text box. A press in a field that already has focus moves the caret the same way.
+fn focus_field_at(inner: &mut Inner, field: NodeId, x: f32, y: f32) {
+    focus_field(inner, field);
+    let Some(index) = field_caret_at(inner, field, x, y) else { return };
+    if let Some(f) = inner.focus.as_mut().filter(|f| f.node == field) {
+        f.caret = index.min(f.buffer.chars().count());
+        f.anchor = None;
+        f.touch();
+    }
+    inner.mark_dirty(field);
+}
+
+/// The char index a point falls on in a field, allowing for how far the field has scrolled.
+fn field_caret_at(inner: &mut Inner, field: NodeId, x: f32, y: f32) -> Option<usize> {
+    let (scroll, empty) = inner
+        .focus
+        .as_ref()
+        .filter(|f| f.node == field)
+        .map(|f| (f.scroll, f.buffer.is_empty()))
+        .unwrap_or(((0.0, 0.0), true));
+    if empty {
+        return Some(0);
+    }
+    let (key, origin) = {
+        let n = inner.nodes.get(field)?;
+        let content = n.content_rect();
+        (
+            n.text_key.clone()?,
+            (content.x + crate::layout::FIELD_PAD_X - scroll.0, content.y + crate::layout::FIELD_PAD_Y - scroll.1),
+        )
+    };
+    // the text system answers in bytes; a caret is a char index
+    let byte = inner.text.index_at(&key, x - origin.0, y - origin.1);
+    let text = inner.focus.as_ref()?.buffer.clone();
+    Some(text.char_indices().take_while(|(i, _)| *i < byte).count())
 }
 
 pub fn focused_handler(inner: &Inner) -> i32 {
@@ -617,92 +742,277 @@ pub fn key_text(inner: &mut Inner, text: &str) -> Option<Event> {
     if insert.is_empty() {
         return None;
     }
+    // typing with something selected replaces it, rather than pushing it along
+    take_selection(f);
     let at = byte_index(&f.buffer, f.caret);
     f.buffer.insert_str(at, &insert);
     f.caret += insert.chars().count();
+    f.touch();
     edited(inner)
 }
 
-/// Editing keys. Names: Backspace, Delete, Left, Right, Home, End, Escape, Tab, Enter.
+/// Which modifiers were held with an editing key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+impl Mods {
+    pub const NONE: Mods = Mods { ctrl: false, alt: false, shift: false, meta: false };
+}
+
+/// What a key press did to the focused field. `Ignored` means the field wants nothing to do
+/// with it, and the window is free to hand it to the application as a chord.
+pub enum Edit {
+    Ignored,
+    Took(Option<Event>),
+}
+
+/// Editing keys with nothing held. Names: Backspace, Delete, Left, Right, Up, Down, Home,
+/// End, Escape, Tab, Enter.
 pub fn key_named(inner: &mut Inner, name: &str) -> Option<Event> {
+    match key_edit(inner, name, Mods::NONE) {
+        Edit::Took(event) => event,
+        Edit::Ignored => None,
+    }
+}
+
+/// The same, with modifiers: ⌥ moves and deletes by word, ⌘ goes to the ends of the line,
+/// shift keeps the far end of the selection where it was — what the rest of the system does.
+pub fn key_edit(inner: &mut Inner, name: &str, mods: Mods) -> Edit {
     if inner.focus.is_none() {
+        if mods != Mods::NONE {
+            return Edit::Ignored;
+        }
         let text = match name {
             "Enter" => "\n",
-            "Tab" => "\t",
             "Escape" => "\x1b",
             "Backspace" => "\x08",
             "Delete" => "\x7f",
-            _ => return None,
+            _ => return Edit::Ignored,
         };
-        return Some(Event::new(EV_KEY_TEXT, 0.0, 0.0, -1, text.to_string()));
+        return Edit::Took(Some(Event::new(EV_KEY_TEXT, 0.0, 0.0, -1, text.to_string())));
     }
+    let by_word = mods.alt;
+    let to_edge = mods.meta;
+    let multiline = focused_multiline(inner);
     match name {
-        "Backspace" => {
-            let f = inner.focus.as_mut()?;
-            if f.caret == 0 {
-                return None;
+        "Backspace" | "Delete" => {
+            let forward = name == "Delete";
+            let f = inner.focus.as_mut().unwrap();
+            if take_selection(f) {
+                return Edit::Took(edited(inner));
             }
-            let start = byte_index(&f.buffer, f.caret - 1);
-            let end = byte_index(&f.buffer, f.caret);
-            f.buffer.replace_range(start..end, "");
-            f.caret -= 1;
-            edited(inner)
-        }
-        "Delete" => {
-            let f = inner.focus.as_mut()?;
             let len = f.buffer.chars().count();
-            if f.caret >= len {
-                return None;
+            let to = if by_word {
+                if forward { word_right(&f.buffer, f.caret) } else { word_left(&f.buffer, f.caret) }
+            } else if to_edge {
+                if forward { line_end(&f.buffer, f.caret, multiline) } else { line_start(&f.buffer, f.caret, multiline) }
+            } else if forward {
+                (f.caret + 1).min(len)
+            } else {
+                f.caret.saturating_sub(1)
+            };
+            if to == f.caret {
+                return Edit::Took(None);
             }
-            let start = byte_index(&f.buffer, f.caret);
-            let end = byte_index(&f.buffer, f.caret + 1);
+            let (a, b) = (to.min(f.caret), to.max(f.caret));
+            let (start, end) = (byte_index(&f.buffer, a), byte_index(&f.buffer, b));
             f.buffer.replace_range(start..end, "");
-            edited(inner)
+            f.caret = a;
+            f.anchor = None;
+            f.touch();
+            Edit::Took(edited(inner))
         }
-        "Left" => {
-            let f = inner.focus.as_mut()?;
-            f.caret = f.caret.saturating_sub(1);
-            None
+        "Left" | "Right" | "Up" | "Down" | "Home" | "End" => {
+            // up and down belong to the application unless the field has lines to move through
+            if matches!(name, "Up" | "Down") && !multiline && !to_edge {
+                return Edit::Ignored;
+            }
+            let target = caret_after_move(inner, name, by_word, to_edge, multiline);
+            let f = inner.focus.as_mut().unwrap();
+            let node = f.node;
+            if mods.shift {
+                // the anchor is where the selection started; it stays while this end moves
+                if f.anchor.is_none() {
+                    f.anchor = Some(f.caret);
+                }
+                f.caret = target;
+            } else if let Some((a, b)) = f.range() {
+                // a plain arrow with a selection collapses it to the end it points at
+                f.anchor = None;
+                f.caret = if matches!(name, "Left" | "Up" | "Home") { a } else { b };
+                if by_word || to_edge || matches!(name, "Up" | "Down" | "Home" | "End") {
+                    f.caret = target;
+                }
+            } else {
+                f.anchor = None;
+                f.caret = target;
+            }
+            f.touch();
+            inner.mark_dirty(node);
+            Edit::Took(None)
         }
-        "Right" => {
-            let f = inner.focus.as_mut()?;
-            f.caret = (f.caret + 1).min(f.buffer.chars().count());
-            None
-        }
-        "Home" => {
-            inner.focus.as_mut()?.caret = 0;
-            None
-        }
-        "End" => {
-            let f = inner.focus.as_mut()?;
+        "A" if mods.meta || mods.ctrl => {
+            let f = inner.focus.as_mut().unwrap();
+            f.anchor = Some(0);
             f.caret = f.buffer.chars().count();
-            None
+            f.touch();
+            let node = f.node;
+            inner.mark_dirty(node);
+            Edit::Took(None)
         }
         "Escape" => {
             if let Some(f) = inner.focus.take() {
                 inner.mark_dirty(f.node);
             }
-            None
+            Edit::Took(None)
         }
         "Enter" => {
             // a field of one line has nothing to do with Enter; one that takes several
             // gets a line break, which is the only way to type a paragraph
-            let f = inner.focus.as_ref()?;
-            if !inner.nodes.get(f.node).map(|n| n.modifier.multiline).unwrap_or(false) {
-                return None;
+            if !multiline || mods.meta || mods.ctrl {
+                return Edit::Ignored;
             }
-            let f = inner.focus.as_mut()?;
+            let f = inner.focus.as_mut().unwrap();
+            take_selection(f);
             let at = byte_index(&f.buffer, f.caret);
             f.buffer.insert(at, '\n');
             f.caret += 1;
-            edited(inner)
+            f.touch();
+            Edit::Took(edited(inner))
         }
         "Tab" => {
+            if mods != Mods::NONE {
+                return Edit::Ignored;
+            }
             focus_next_field(inner);
-            None
+            Edit::Took(None)
         }
-        _ => None,
+        _ => Edit::Ignored,
     }
+}
+
+fn focused_multiline(inner: &Inner) -> bool {
+    inner.focus.as_ref().and_then(|f| inner.nodes.get(f.node)).map(|n| n.modifier.multiline).unwrap_or(false)
+}
+
+/// Where an arrow key leaves the caret, before anything is done about the selection.
+fn caret_after_move(inner: &Inner, name: &str, by_word: bool, to_edge: bool, multiline: bool) -> usize {
+    let f = inner.focus.as_ref().unwrap();
+    let len = f.buffer.chars().count();
+    match name {
+        "Left" if by_word => word_left(&f.buffer, f.caret),
+        "Right" if by_word => word_right(&f.buffer, f.caret),
+        "Left" if to_edge => line_start(&f.buffer, f.caret, multiline),
+        "Right" if to_edge => line_end(&f.buffer, f.caret, multiline),
+        "Left" => f.caret.saturating_sub(1),
+        "Right" => (f.caret + 1).min(len),
+        "Home" => line_start(&f.buffer, f.caret, multiline),
+        "End" => line_end(&f.buffer, f.caret, multiline),
+        // the whole text, which is what ⌘↑ and ⌘↓ mean everywhere else
+        "Up" if to_edge => 0,
+        "Down" if to_edge => len,
+        "Up" => line_above(&f.buffer, f.caret),
+        "Down" => line_below(&f.buffer, f.caret),
+        _ => f.caret,
+    }
+}
+
+/// Cut whatever is selected out of the buffer. True when there was a selection to take.
+fn take_selection(f: &mut Focus) -> bool {
+    let Some((a, b)) = f.range() else {
+        f.anchor = None;
+        return false;
+    };
+    let (start, end) = (byte_index(&f.buffer, a), byte_index(&f.buffer, b));
+    f.buffer.replace_range(start..end, "");
+    f.caret = a;
+    f.anchor = None;
+    f.touch();
+    true
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The start of the word before the caret: back over any separators, then over the word.
+fn word_left(buffer: &str, caret: usize) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut at = caret.min(chars.len());
+    while at > 0 && !is_word(chars[at - 1]) {
+        at -= 1;
+    }
+    while at > 0 && is_word(chars[at - 1]) {
+        at -= 1;
+    }
+    at
+}
+
+fn word_right(buffer: &str, caret: usize) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut at = caret.min(chars.len());
+    while at < chars.len() && !is_word(chars[at]) {
+        at += 1;
+    }
+    while at < chars.len() && is_word(chars[at]) {
+        at += 1;
+    }
+    at
+}
+
+/// The start of the line the caret is on. A field of one line has one line, so it is 0.
+fn line_start(buffer: &str, caret: usize, multiline: bool) -> usize {
+    if !multiline {
+        return 0;
+    }
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut at = caret.min(chars.len());
+    while at > 0 && chars[at - 1] != '\n' {
+        at -= 1;
+    }
+    at
+}
+
+fn line_end(buffer: &str, caret: usize, multiline: bool) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    if !multiline {
+        return chars.len();
+    }
+    let mut at = caret.min(chars.len());
+    while at < chars.len() && chars[at] != '\n' {
+        at += 1;
+    }
+    at
+}
+
+/// The same column, one line up. These are the writer's own line breaks — a field that also
+/// wraps moves a wrapped line at a time only where the two agree, which is close enough to
+/// be useful and needs nothing from the shaper.
+fn line_above(buffer: &str, caret: usize) -> usize {
+    let start = line_start(buffer, caret, true);
+    if start == 0 {
+        return 0;
+    }
+    let column = caret - start;
+    let previous = line_start(buffer, start - 1, true);
+    (previous + column).min(start - 1)
+}
+
+fn line_below(buffer: &str, caret: usize) -> usize {
+    let len = buffer.chars().count();
+    let start = line_start(buffer, caret, true);
+    let end = line_end(buffer, caret, true);
+    if end >= len {
+        return len;
+    }
+    let column = caret - start;
+    let next_end = line_end(buffer, end + 1, true);
+    (end + 1 + column).min(next_end)
 }
 
 fn edited(inner: &mut Inner) -> Option<Event> {
@@ -1139,6 +1449,93 @@ mod tests {
         assert_eq!(modifier_text(false, false, false, false), "");
     }
 
+    /// A caret that moves by word and by line, and a selection that shift makes and typing
+    /// replaces: what every other text box on the machine does.
+    #[test]
+    fn the_editing_keys_move_by_word_and_select() {
+        let mut inner = build();
+        let col = inner.layout_children(inner.root)[0];
+        let kids = inner.layout_children(col);
+        let fr = inner.nodes[kids[2]].abs;
+        pointer(&mut inner, EV_POINTER_DOWN, fr.x + fr.w - 2.0, fr.y + 5.0);
+        assert_eq!(focused_handler(&inner), 3);
+        let alt = Mods { alt: true, ..Mods::NONE };
+        let meta = Mods { meta: true, ..Mods::NONE };
+        let shift = Mods { shift: true, ..Mods::NONE };
+
+        key_text(&mut inner, " one two three").unwrap();
+        assert_eq!(inner.focus.as_ref().unwrap().buffer, "hi one two three");
+
+        // ⌥← is a word back, twice over, and ⌘← is the start of the line
+        key_edit(&mut inner, "Left", alt);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 11);
+        key_edit(&mut inner, "Left", alt);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 7);
+        key_edit(&mut inner, "Left", meta);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 0);
+        key_edit(&mut inner, "Right", meta);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 16);
+
+        // shift keeps the far end where it was; a plain arrow lets the selection go
+        key_edit(&mut inner, "Left", Mods { alt: true, shift: true, ..Mods::NONE });
+        assert_eq!(inner.focus.as_ref().unwrap().range(), Some((11, 16)));
+        key_edit(&mut inner, "Right", Mods::NONE);
+        assert_eq!(inner.focus.as_ref().unwrap().range(), None);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 16);
+
+        // ⌘A takes the lot, and typing over a selection replaces it
+        key_edit(&mut inner, "A", meta);
+        assert_eq!(inner.focus.as_ref().unwrap().range(), Some((0, 16)));
+        let e = key_text(&mut inner, "x").unwrap();
+        assert_eq!(e.text, "x");
+
+        // ⌥⌫ takes the word before the caret
+        key_text(&mut inner, " a word").unwrap();
+        let e = key_edit_event(&mut inner, "Backspace", alt);
+        assert_eq!(e.unwrap().text, "x a ");
+
+        // a chord the field has no use for is left for the window to deal with
+        assert!(matches!(key_edit(&mut inner, "R", meta), Edit::Ignored));
+        // and up and down belong to the application while the field has one line
+        assert!(matches!(key_edit(&mut inner, "Up", Mods::NONE), Edit::Ignored));
+        // shift+arrow does not reach an unfocused field at all
+        key_edit(&mut inner, "Escape", Mods::NONE);
+        assert!(matches!(key_edit(&mut inner, "Left", shift), Edit::Ignored));
+    }
+
+    fn key_edit_event(inner: &mut Inner, name: &str, mods: Mods) -> Option<Event> {
+        match key_edit(inner, name, mods) {
+            Edit::Took(event) => event,
+            Edit::Ignored => None,
+        }
+    }
+
+    /// The caret holds solid while you type and fades afterwards, and the loop is told when
+    /// it next has to draw rather than being kept awake for it.
+    #[test]
+    fn the_caret_blinks_on_its_own_clock() {
+        use crate::tree::{caret_alpha, CARET_PERIOD, CARET_SOLID};
+        assert_eq!(caret_alpha(0.0), 1.0, "solid the moment it moves");
+        assert_eq!(caret_alpha(CARET_SOLID - 0.01), 1.0);
+        // half a period after the solid stretch it is out, and a period later back on
+        assert_eq!(caret_alpha(CARET_SOLID + CARET_PERIOD * 0.7), 0.0);
+        assert_eq!(caret_alpha(CARET_SOLID + CARET_PERIOD * 1.0), 1.0);
+        // and it passes through the middle rather than snapping: the fade runs into the
+        // half-way point, so half a fade before it the caret is neither on nor off
+        use crate::tree::CARET_FADE;
+        let edge = caret_alpha(CARET_SOLID + CARET_PERIOD * 0.5 - CARET_FADE * 0.5);
+        assert!(edge > 0.0 && edge < 1.0, "it fades: {edge}");
+
+        let mut inner = build();
+        assert!(inner.next_frame_in().is_none(), "nothing to draw with no field focused");
+        let col = inner.layout_children(inner.root)[0];
+        let kids = inner.layout_children(col);
+        let fr = inner.nodes[kids[2]].abs;
+        pointer(&mut inner, EV_POINTER_DOWN, fr.x + fr.w - 2.0, fr.y + 5.0);
+        let wait = inner.next_frame_in().expect("a focused field blinks");
+        assert!(wait.as_secs_f32() > 0.05, "and it waits for it rather than spinning: {wait:?}");
+    }
+
     #[test]
     fn focus_and_editing() {
         let mut inner = build();
@@ -1146,9 +1543,15 @@ mod tests {
         let kids = inner.layout_children(col);
         let fr = inner.nodes[kids[2]].abs;
         assert!(key_text(&mut inner, "x").is_some_and(|e| e.handler == -1 && e.text == "x"));
-        let down = pointer(&mut inner, EV_POINTER_DOWN, fr.x + 5.0, fr.y + 5.0);
+        // a press near the left edge lands before the first letter, which is where the caret
+        // goes: a field takes the caret from the pointer, not from the end of its text
+        let down = pointer(&mut inner, EV_POINTER_DOWN, fr.x + 1.0, fr.y + 5.0);
         assert_eq!(down.handler, -1);
         assert_eq!(focused_handler(&inner), 3);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 0);
+        // and one past the end of the text lands after it
+        pointer(&mut inner, EV_POINTER_DOWN, fr.x + fr.w - 2.0, fr.y + 5.0);
+        assert_eq!(inner.focus.as_ref().unwrap().caret, 2);
         let e = key_text(&mut inner, "!").unwrap();
         assert_eq!((e.kind, e.handler, e.text.as_str()), (4, 3, "hi!"));
         key_named(&mut inner, "Home");

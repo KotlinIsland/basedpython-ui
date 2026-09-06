@@ -8,13 +8,14 @@ use std::num::NonZeroU32;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Icon, Theme, Window as WinitWindow, WindowId};
@@ -309,6 +310,9 @@ struct Pane {
     cursor: (f32, f32),
     hover_handler: i32,
     cursor_kind: u32,
+    /// When this pane next has something to redraw of its own — a caret blinking, a field
+    /// still scrolling. `None` while nothing is moving, which is what lets the loop sleep.
+    next_frame: Option<Instant>,
 }
 
 impl Pane {
@@ -398,6 +402,9 @@ impl Pane {
             self.on_frame.call1(py, (core,))?.is_truthy(py)
         })?;
         self.blit()?;
+        // what the core says it still has to animate, asked once a frame rather than once a
+        // turn of the loop: crossing into python to find out is not free
+        self.next_frame = self.with_core(|inner| inner.next_frame_in())?.map(|d| Instant::now() + d);
         if again {
             self.request_redraw();
         }
@@ -526,6 +533,7 @@ impl App {
             cursor: (0.0, 0.0),
             hover_handler: -1,
             cursor_kind: 0,
+            next_frame: None,
         };
         pane.push(Event::new(EV_RESIZE, lw as f32, lh as f32, -1, String::new()));
         if let Some(theme) = window.theme() {
@@ -607,9 +615,13 @@ impl App {
         let chorded = m.super_key() || m.control_key() || m.alt_key();
         // keys the text field never uses go to the application as chords, with or without
         // modifiers; everything else is a chord only while a command modifier is held
+        // keys a focused field would use, which reach the application as chords when no
+        // field has one — that is what lets a list be walked with the arrows and with tab
         let navigation = matches!(
             &event.logical_key,
             Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::PageUp | NamedKey::PageDown)
+                | Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Home | NamedKey::End)
+                | Key::Named(NamedKey::Tab)
                 | Key::Named(NamedKey::F1 | NamedKey::F2 | NamedKey::F3 | NamedKey::F4 | NamedKey::F5 | NamedKey::F6)
                 | Key::Named(NamedKey::F7 | NamedKey::F8 | NamedKey::F9 | NamedKey::F10 | NamedKey::F11 | NamedKey::F12)
         );
@@ -631,7 +643,37 @@ impl App {
         } else {
             None
         };
+        // the name a focused field would know this key by: an editing key, or a bare letter
+        // for the chorded ones — `A` with a command modifier selects the text
+        let edit_name: Option<String> = named.map(str::to_string).or_else(|| {
+            let mut chars = event.text.as_ref()?.chars();
+            let c = chars.next()?;
+            chars.next().is_none().then(|| c.to_ascii_uppercase().to_string())
+        });
+        let mods = input::Mods { ctrl: m.control_key(), alt: m.alt_key(), shift: m.shift_key(), meta: m.super_key() };
         let Some(pane) = self.panes.get_mut(&id) else { return };
+        // a field being edited takes its own keys first, modifiers and all: while you are
+        // typing, ⌥← is a word back and ⌘A is the text, not whatever the window binds them to
+        if let Some(name) = edit_name.as_deref() {
+            let taken = pane.with_core(|inner| match input::key_edit(inner, name, mods) {
+                input::Edit::Took(event) => (true, event),
+                input::Edit::Ignored => (false, None),
+            });
+            match taken {
+                Ok((true, event)) => {
+                    if let Some(event) = event {
+                        pane.push(event);
+                    }
+                    pane.request_redraw();
+                    return;
+                }
+                Ok((false, _)) => {}
+                Err(e) => {
+                    self.fail(event_loop, e);
+                    return;
+                }
+            }
+        }
         if chorded || navigation {
             if let Some(text) = chord {
                 pane.push(Event::new(EV_KEY_CHORD, 0.0, 0.0, -1, text));
@@ -639,8 +681,8 @@ impl App {
             }
             return;
         }
-        let result = if let Some(name) = named {
-            pane.with_core(|inner| input::key_named(inner, name))
+        let result = if named.is_some() {
+            Ok(None)
         } else if let Some(text) = event.text.as_ref() {
             let text = text.to_string();
             pane.with_core(move |inner| input::key_text(inner, &text))
@@ -670,6 +712,31 @@ impl ApplicationHandler<UserEvent> for App {
         let (title, width, height) = (self.title.clone(), self.width, self.height);
         if let Err(e) = self.open_pane(event_loop, title, width, height, on_frame, on_events) {
             self.fail(event_loop, e);
+        }
+    }
+
+    /// A caret blinks and a field scrolls without anybody touching the keyboard, so the loop
+    /// cannot simply wait for the next event. Each pane says when it next has something to
+    /// draw; the loop sleeps until the soonest of them, and goes back to waiting outright
+    /// once nothing is moving. Redrawing at a fixed rate whether or not anything changed
+    /// would keep a whole window repainting for the sake of one blinking line.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let soonest = self.panes.values().filter_map(|pane| pane.next_frame).min();
+        match soonest {
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if !matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            return;
+        }
+        let now = Instant::now();
+        for pane in self.panes.values() {
+            if pane.next_frame.map(|at| at <= now).unwrap_or(false) {
+                pane.request_redraw();
+            }
         }
     }
 
@@ -732,12 +799,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let Some(pane) = self.panes.get_mut(&id) else { return };
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => -lines * WHEEL_LINE,
-                    MouseScrollDelta::PixelDelta(p) => -(p.y / pane.window.scale_factor().max(0.01)) as f32,
+                let scale = pane.window.scale_factor().max(0.01);
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(columns, lines) => (-columns * WHEEL_LINE, -lines * WHEEL_LINE),
+                    MouseScrollDelta::PixelDelta(p) => (-(p.x / scale) as f32, -(p.y / scale) as f32),
                 };
                 let (x, y) = pane.cursor;
-                match pane.with_core(|inner| input::scroll(inner, x, y, dy)) {
+                match pane.with_core(|inner| input::scroll_by(inner, x, y, dx, dy)) {
                     Ok(moved) => {
                         if moved {
                             // the content moved under the pointer: keep the hover state honest

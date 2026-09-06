@@ -30,6 +30,8 @@ class Core:
     def key_text(self, text: str) -> (int, float, float, int, str)?
     @ignorable_return_value
     def key_named(self, name: str) -> (int, float, float, int, str)?
+    def key_edit(self, name: str, ctrl: bool = False, alt: bool = False, shift: bool = False, meta: bool = False) -> (bool, (int, float, float, int, str)?)
+    def caret(self) -> (int, int, float, float)?
     def focused_handler(self) -> int
     def hovered_handler(self) -> int
     def hover_target(self) -> int
@@ -37,7 +39,8 @@ class Core:
     def selected_text(self) -> str
     def clear_selection(self)
     def take_events(self) -> list[tuple[int, float, float, int, str]]
-    def scroll(self, x: float, y: float, dy: float) -> bool
+    def scroll(self, x: float, y: float, dy: float, dx: float = 0.0) -> bool
+    def scroll_offset_x(self, node_id: int) -> float | None
     def scroll_offset(self, node_id: int) -> float | None
     def first_scroll(self) -> tuple[int, float, float, float] | None
 

@@ -57,7 +57,10 @@ class NullCore:
         return []
     def field_handler(self, placeholder: str) -> int:
         return -1
-    def scroll(self, x: float, y: float, dy: float) -> bool:
+    def scroll_offset_x(self, node_id: int) -> float | None:
+        return None
+
+    def scroll(self, x: float, y: float, dy: float, dx: float = 0.0) -> bool:
         return False
     def hovered_handler(self) -> int:
         return -1
@@ -78,6 +81,12 @@ class NullCore:
         return self.records
 
     def key_named(self, name: str) -> tuple[int, float, float, int, str] | None:
+        return None
+
+    def key_edit(self, name: str, ctrl: bool = False, alt: bool = False, shift: bool = False, meta: bool = False) -> tuple[bool, tuple[int, float, float, int, str] | None]:
+        return (False, None)
+
+    def caret(self) -> tuple[int, int, float, float] | None:
         return None
 
 

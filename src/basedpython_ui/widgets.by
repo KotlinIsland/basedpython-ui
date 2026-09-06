@@ -149,6 +149,12 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.append(22.0)
             case ModOp.Dismiss(on_dismiss):
                 ops.extend((23.0, float(rt.handler(lambda: on_dismiss()))))
+            case ModOp.Gap(value):
+                ops.extend((24.0, value.value))
+            case ModOp.Pressed(color):
+                ops.extend((25.0, float(color.argb())))
+            case ModOp.DropTarget(on_drop):
+                ops.extend((26.0, float(rt.handler(on_drop))))
     return ops
 
 
@@ -302,15 +308,18 @@ def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once 
 
 
 @builder
-def Scroll(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once content: ColumnScope.() -> None) raises ...:
+def Scroll(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, wide: bool = False, once content: ColumnScope.() -> None) raises ...:
     """A vertically scrolling column: the content may be taller than the node, which takes
     the height its constraints give it (`fill_max_height` / `weight` make it the viewport).
     The wheel scrolls it; a child with `Modifier().reveal()` is scrolled into view. Once the
     content overflows, it is laid out narrower by the width of the scrollbar, which
-    therefore never covers it."""
+    therefore never covers it.
+
+    `wide` also lays the content out at the width the content wants rather than at the width
+    of the viewport, and pans sideways — which is where a line wider than the window goes."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 0, k, alignment_code(alignment)))
+    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 1 if wide else 0, k, alignment_code(alignment)))
     rt.depth += 1
     content(_COLUMN_SCOPE)
     rt.depth -= 1

@@ -266,6 +266,9 @@ pub enum ModOp {
     /// A `TEXTFIELD` that holds more than one line: it wraps, it grows, and Enter puts a
     /// line break in rather than doing nothing.
     Multiline,
+    /// A handler told what a drag is over and where it was let go: without it a drag knows
+    /// where the pointer is and nothing about what is under it.
+    DropTarget(i32),
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -277,6 +280,9 @@ pub struct Modifier {
     pub weight: f32,
     pub align: Option<u8>,
     pub hover: Option<u32>,
+    /// Colour washed over the node's clickable layer while the pointer is held down on it.
+    /// Without it a button gives no sign at all that a click landed.
+    pub pressed: Option<u32>,
     pub scrollbar: Option<u32>,
     pub reveal: bool,
     pub clip: bool,
@@ -284,6 +290,9 @@ pub struct Modifier {
     pub cursor: u32,
     /// A text field that takes more than one line.
     pub multiline: bool,
+    /// Space a `Row` or `Column` puts between its children, so a container spaces itself
+    /// instead of every caller placing a spacer by hand.
+    pub gap: f32,
 }
 
 impl Modifier {
@@ -298,6 +307,8 @@ impl Modifier {
         let mut reveal = false;
         let mut clip = false;
         let mut cursor = 0u32;
+        let mut gap = 0.0f32;
+        let mut pressed = None;
         let mut multiline = false;
         while i < raw.len() {
             let op = raw[i];
@@ -441,6 +452,21 @@ impl Modifier {
                     ops.push(ModOp::Multiline);
                     i += 1;
                 }
+                x if x == 24.0 => {
+                    let a = take(1)?;
+                    gap = finite(a[0], "gap")?.max(0.0);
+                    i += 2;
+                }
+                x if x == 25.0 => {
+                    let a = take(1)?;
+                    pressed = Some(argb_from_f64(a[0])?);
+                    i += 2;
+                }
+                x if x == 26.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::DropTarget(handler_index(a[0], "drop_target")?));
+                    i += 2;
+                }
                 x if x == 21.0 => {
                     let a = take(1)?;
                     let kind = finite(a[0], "cursor")?;
@@ -454,7 +480,7 @@ impl Modifier {
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip, cursor, multiline })
+        Ok(Modifier { ops, weight, align, hover, pressed, scrollbar, reveal, clip, cursor, multiline, gap })
     }
 }
 
@@ -536,7 +562,9 @@ pub enum Layer {
     Shadow { rect: Rect, corners: Corners, elevation: f32, argb: u32 },
     Background { rect: Rect, argb: u32, corners: Corners },
     Border { rect: Rect, argb: u32, width: f32, corners: Corners },
-    Click { rect: Rect, handler: i32, hover: Option<u32>, corners: Corners },
+    Click { rect: Rect, handler: i32, hover: Option<u32>, pressed: Option<u32>, corners: Corners },
+    /// Where something being dragged may be let go.
+    Drop { rect: Rect, handler: i32 },
     /// The right button over this rect.
     Secondary { rect: Rect, handler: i32 },
     /// Told when the pointer enters and leaves this rect.

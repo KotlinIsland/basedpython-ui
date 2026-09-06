@@ -354,8 +354,10 @@ fn validate(
                             }
                         }
                         Kind::Scroll => {
-                            if r.a != 0 {
-                                bad!("record {}: scroll axis {} must be 0 (vertical)", i, r.a);
+                            // 0 scrolls down only; 1 also lays the content out at its own
+                            // width and pans sideways, which is where a long line goes
+                            if !(0..=1).contains(&r.a) {
+                                bad!("record {}: scroll axis {} must be 0 (down) or 1 (down and across)", i, r.a);
                             }
                             if !(0..=2).contains(&r.c) {
                                 bad!("record {}: cross-axis alignment {} must be 0..=2", i, r.c);
@@ -1052,8 +1054,10 @@ mod tests {
     fn scroll_records_and_reveal_are_tracked() {
         let mut inner = core();
         let strs = ["a"];
-        // a scroll container with a bad axis is rejected
+        // axis 1 also pans sideways; anything past that is rejected
         let ints = recs(&[[13, 0, -1, 0, -1, 1, 0, 0], END]);
+        assert!(do_commit(&mut inner, &ints, &strs, &[(0, 0, 2)]).is_ok());
+        let ints = recs(&[[13, 0, -1, 0, -1, 2, 0, 0], END]);
         assert!(do_commit(&mut inner, &ints, &strs, &[(0, 0, 2)]).is_err());
         let ints = recs(&[[13, 0, -1, 0, -1, 0, 0, 0], text(0), END]);
         do_commit(&mut inner, &ints, &strs, &[(0, 0, 3)]).unwrap();

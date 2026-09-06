@@ -263,7 +263,12 @@ fn layout_layer<H: MeasureHost>(
         }
         ModOp::Clickable(handler) => {
             let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
-            inner.nodes[id].layers.push(Layer::Click { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler, hover: m.hover, corners });
+            inner.nodes[id].layers.push(Layer::Click { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler, hover: m.hover, pressed: m.pressed, corners });
+            s
+        }
+        ModOp::DropTarget(handler) => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Drop { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
             s
         }
         ModOp::Rounded(r) => layout_layer(inner, id, m, i + 1, c, origin, r, host),
@@ -401,7 +406,12 @@ fn layout_flex<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, or
     let weights: Vec<f32> = children.iter().map(|&ch| inner.nodes[ch].modifier.weight).collect();
     let mut sizes = vec![Size::ZERO; n];
     let mut total_weight = 0.0f32;
-    let mut fixed_main = 0.0f32;
+    // the container's own spacing between children is spoken for before anything is
+    // measured: a weighted child handed the space the gaps also need pushes the row past
+    // its own edge, and the last control in it disappears
+    let own_gap = inner.nodes[id].modifier.gap;
+    let joins = if n > 1 { (n - 1) as f32 } else { 0.0 };
+    let mut fixed_main = own_gap * joins;
     let mut cross = 0.0f32;
     let mut volatile = false;
 
@@ -441,11 +451,11 @@ fn layout_flex<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, or
         }
     }
 
-    let main_total: f32 = sizes.iter().map(|&s| main_of(s)).sum();
+    let main_total: f32 = sizes.iter().map(|&s| main_of(s)).sum::<f32>() + own_gap * joins;
     let main_size = if total_weight > 0.0 && main_max.is_finite() { main_max.max(main_min) } else { clamp(main_total, main_min, main_max) };
     let cross_size = clamp(cross, cross_min, cross_max);
     let free = (main_size - main_total).max(0.0);
-    let (start, gap) = match arrangement {
+    let (start, spread) = match arrangement {
         1 => (free / 2.0, 0.0),
         2 => (free, 0.0),
         3 => if n > 1 { (0.0, free / (n as f32 - 1.0)) } else { (0.0, 0.0) },
@@ -455,6 +465,7 @@ fn layout_flex<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, or
         }
         _ => (0.0, 0.0),
     };
+    let gap = own_gap + spread;
     let mut pos = start;
     for i in 0..n {
         let s = sizes[i];
@@ -474,31 +485,43 @@ fn layout_flex<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, or
 fn layout_scroll<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, origin: (f32, f32), host: &mut H) -> Size {
     let children = inner.layout_children(id);
     let cross_align = inner.nodes[id].c.clamp(0, 2) as u8;
-    let (mut total, mut cross, mut sizes, mut volatile) = measure_column(inner, &children, c.max_w, host);
+    // the container's own spacing between children, as a `Column` has
+    let gap = inner.nodes[id].modifier.gap;
+    let joins = if children.len() > 1 { (children.len() - 1) as f32 } else { 0.0 };
+    // a container that pans sideways measures its content at the width the content wants,
+    // rather than at the width of the hole it is being looked at through
+    let wide = inner.nodes[id].a == 1;
+    let measure_w = if wide { f32::INFINITY } else { c.max_w };
+    let (mut total, mut cross, mut sizes, mut volatile) = measure_column(inner, &children, measure_w, host);
+    total += gap * joins;
     let mut size = c.constrain(Size::new(cross, total));
     // the thumb needs room of its own: a container whose content overflows lays that content
     // out one gutter narrower, so the two never overlap. narrowing can only make the content
     // taller, so an overflowing container still overflows and the second pass is the last
-    let gutter = if total > size.h && c.max_w.is_finite() && c.max_w > SCROLLBAR_GUTTER { SCROLLBAR_GUTTER } else { 0.0 };
+    let gutter = if total > size.h && !wide && c.max_w.is_finite() && c.max_w > SCROLLBAR_GUTTER { SCROLLBAR_GUTTER } else { 0.0 };
     if gutter > 0.0 {
         let (t, cr, s, v) = measure_column(inner, &children, c.max_w - gutter, host);
-        total = t;
+        total = t + gap * joins;
         cross = cr;
         sizes = s;
         volatile = v;
         size = c.constrain(Size::new(cross + gutter, total));
     }
-    let content_w = (size.w - gutter).max(0.0);
+    let content_w = if wide { cross } else { (size.w - gutter).max(0.0) };
     let mut pos = 0.0f32;
     for (i, &ch) in children.iter().enumerate() {
         let align = inner.nodes[ch].modifier.align.unwrap_or(cross_align);
         let cross_off = (content_w - sizes[i].w).max(0.0) * align_factor(align);
         inner.nodes[ch].offset = (origin.0 + cross_off, origin.1 + pos);
-        pos += sizes[i].h;
+        pos += sizes[i].h + gap;
     }
+    // a wide container takes the width it is given, however wide its content is
+    let size = if wide { c.constrain(Size::new(c.max_w, total)) } else { size };
     let node = &mut inner.nodes[id];
     node.content_len = total;
+    node.content_width = if wide { cross } else { 0.0 };
     node.scroll = node.scroll.clamp(0.0, (total - size.h).max(0.0));
+    node.scroll_x = node.scroll_x.clamp(0.0, (node.content_width - size.w).max(0.0));
     node.volatile = volatile;
     size
 }
@@ -583,21 +606,21 @@ fn layout_custom<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints, 
 /// on every scroll (no measuring).
 pub fn assign_abs(inner: &mut Inner) {
     let root = inner.root;
-    let mut stack: Vec<(NodeId, (f32, f32), f32)> = vec![(root, (0.0, 0.0), 0.0)];
+    let mut stack: Vec<(NodeId, (f32, f32), (f32, f32))> = vec![(root, (0.0, 0.0), (0.0, 0.0))];
     while let Some((id, base, scroll)) = stack.pop() {
         let Some(node) = inner.nodes.get_mut(id) else { continue };
         let (child_base, child_scroll) = if node.kind == Kind::Popup {
             // a popup hangs off the window, not off the container it was written in
             node.abs = Rect::new(node.popup_at.0, node.popup_at.1, node.size.w, node.size.h);
-            (node.popup_at, 0.0)
+            (node.popup_at, (0.0, 0.0))
         } else if node.is_group() {
             node.abs = Rect::new(base.0, base.1, 0.0, 0.0);
             (base, scroll)
         } else {
-            let x = base.0 + node.offset.0;
-            let y = base.1 + node.offset.1 - scroll;
+            let x = base.0 + node.offset.0 - scroll.0;
+            let y = base.1 + node.offset.1 - scroll.1;
             node.abs = Rect::new(x, y, node.size.w, node.size.h);
-            ((x, y), if node.kind == Kind::Scroll { node.scroll } else { 0.0 })
+            ((x, y), if node.kind == Kind::Scroll { (node.scroll_x, node.scroll) } else { (0.0, 0.0) })
         };
         if id == root {
             node.abs = Rect::new(0.0, 0.0, node.size.w, node.size.h);
@@ -852,7 +875,7 @@ mod tests {
         assert_eq!(layers[0], Layer::Shadow { rect, corners: Corners::NONE, elevation: 3.0, argb: 0x81000000 });
         assert_eq!(layers[1], Layer::Background { rect, argb: 0xFFFFFFFF, corners: top });
         assert_eq!(layers[2], Layer::Border { rect, argb: 0xFF000000, width: 1.0, corners: top });
-        assert_eq!(layers[3], Layer::Click { rect, handler: 3, hover: Some(0xFF00FF00), corners: top });
+        assert_eq!(layers[3], Layer::Click { rect, handler: 3, hover: Some(0xFF00FF00), pressed: None, corners: top });
     }
 
     #[test]

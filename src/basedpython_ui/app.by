@@ -113,6 +113,9 @@ class WindowEvents:
                     runtime.dispatch(handler_idx, text, "", (x, y))
                 case 13:
                     runtime.dispatch(handler_idx, None, "", (x, y))
+                case 14:
+                    # a drag over a drop target: "over", "leave" or "drop"
+                    runtime.dispatch(handler_idx, text, "", (x, y))
                 case _:
                     pass
 
@@ -360,6 +363,19 @@ class TestComposition:
     def edit_key(self, name: str):
         """An editing key by name (Enter, Backspace, Left, …) into the focused field."""
         self._typed(self.core.key_named(name), name)
+
+    def edit_chord(self, name: str, ctrl: bool = False, alt: bool = False, shift: bool = False, meta: bool = False) -> bool:
+        """The same with modifiers held, as the window sends them. False when the field left
+        the key alone, which is when the window makes it an application chord instead."""
+        taken, event = self.core.key_edit(name, ctrl, alt, shift, meta)
+        if taken and event is not None and event[3] >= 0:
+            self.runtime.dispatch(event[3], event[4])
+        return taken
+
+    def caret(self) -> tuple[int, int, float, float]?:
+        """where the caret is in the focused field, what it has selected, and how far the
+        field has scrolled to keep it in sight"""
+        return self.core.caret()
 
     def _typed(self, event: tuple[int, float, float, int, str]?, what: str):
         if event is None:

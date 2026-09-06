@@ -537,6 +537,30 @@ impl Core {
         self.with_state(true, |inner| Ok(input::key_named(inner, name).map(|e| e.tuple())))
     }
 
+    /// The same with modifiers held. Returns `(taken, event)`: `taken` is false when the
+    /// field wants nothing to do with the key, which is when the window turns it into an
+    /// application chord instead.
+    #[pyo3(signature = (name, ctrl=false, alt=false, shift=false, meta=false))]
+    fn key_edit(&self, name: &str, ctrl: bool, alt: bool, shift: bool, meta: bool) -> PyResult<(bool, Option<EventTuple>)> {
+        let mods = input::Mods { ctrl, alt, shift, meta };
+        self.with_state(true, |inner| {
+            Ok(match input::key_edit(inner, name, mods) {
+                input::Edit::Took(event) => (true, event.map(|e| e.tuple())),
+                input::Edit::Ignored => (false, None),
+            })
+        })
+    }
+
+    /// Where the caret is in the focused field, and what it has selected: `(caret, anchor,
+    /// scroll_x, scroll_y)` with `anchor` -1 when nothing is selected. None with no focus.
+    fn caret(&self) -> PyResult<Option<(usize, i64, f32, f32)>> {
+        self.with_state(false, |inner| {
+            Ok(inner.focus.as_ref().map(|f| {
+                (f.caret, f.anchor.map(|a| a as i64).unwrap_or(-1), f.scroll.0, f.scroll.1)
+            }))
+        })
+    }
+
     /// The events the pointer produced since the last call: kind 11 hover enters ("1") and
     /// leaves (""), and kind 12 drags ("start" / "move" / "end").
     fn take_events(&self) -> PyResult<Vec<EventTuple>> {
@@ -581,11 +605,20 @@ impl Core {
     /// Scroll the innermost scroll container under `(x, y)` by `dy` logical pixels (positive
     /// moves the content up). Returns whether anything moved; the `Window` uses this for the
     /// mouse wheel and headless tests can too.
-    fn scroll(&self, x: f64, y: f64, dy: f64) -> PyResult<bool> {
+    #[pyo3(signature = (x, y, dy, dx=0.0))]
+    fn scroll(&self, x: f64, y: f64, dy: f64, dx: f64) -> PyResult<bool> {
         let x = finite(x, "x")?;
         let y = finite(y, "y")?;
         let dy = finite(dy, "dy")?;
-        self.with_state(true, |inner| Ok(input::scroll(inner, x, y, dy)))
+        let dx = finite(dx, "dx")?;
+        self.with_state(true, |inner| Ok(input::scroll_by(inner, x, y, dx, dy)))
+    }
+
+    /// The sideways offset of a SCROLL node (`None` for anything else or a stale id).
+    fn scroll_offset_x(&self, node_id: u64) -> PyResult<Option<f64>> {
+        self.with_state(false, |inner| {
+            Ok(inner.nodes.get(NodeId::from_ffi(node_id)).filter(|n| n.kind == Kind::Scroll).map(|n| n.scroll_x as f64))
+        })
     }
 
     /// The scroll offset of a SCROLL node (`None` for anything else or a stale id).

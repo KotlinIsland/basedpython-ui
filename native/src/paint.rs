@@ -24,8 +24,46 @@ const TEXT_DISABLED: u32 = 0xFF9A_9A9A;
 const FIELD_BORDER: u32 = 0xFFA1_A1AA;
 const FIELD_BORDER_FOCUS: u32 = 0xFF3B_82F6;
 const FIELD_RADIUS: Corners = Corners::uniform(6.0);
+/// What a field highlights its own selection with, when no sweep has named a colour.
+const FIELD_SELECTION: u32 = 0x553B_82F6;
+/// How fast the caret slides to where it belongs, and a field scrolls to bring it in sight,
+/// in e-foldings a second: quick enough to feel immediate, slow enough to be followable.
+const CARET_RATE: f32 = 26.0;
+const SCROLL_RATE: f32 = 18.0;
 /// A placeholder is the field's own colour, worn down: it belongs to the field's palette,
 /// whatever that is, rather than to a grey nobody chose.
+/// `argb` at a fraction of its own opacity — what makes the caret fade rather than blink.
+fn with_alpha(argb: u32, alpha: f32) -> u32 {
+    let (a, r, g, b) = argb_channels(argb);
+    ((((a as f32) * alpha.clamp(0.0, 1.0)) as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+fn byte_at(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Where the caret belongs in a field, relative to the text's own origin.
+fn caret_position(inner: &mut Inner, id: NodeId, f: &crate::tree::Focus, style: Style, multiline: bool, line: f32) -> (f32, f32) {
+    let prefix: String = f.buffer.chars().take(f.caret).collect();
+    if !multiline {
+        let w = if prefix.is_empty() {
+            0.0
+        } else {
+            inner.text.measure(&TextKey::new(prefix.into(), style, f32::INFINITY)).w
+        };
+        return (w, 0.0);
+    }
+    // where the text itself put the last glyph before the caret, so a line the field
+    // wrapped counts the same as one the writer broke
+    let key = inner.nodes[id].text_key.clone();
+    let rect = key.and_then(|k| inner.text.rects_for(&k, 0, prefix.len()).last().copied());
+    match rect {
+        Some(r) if prefix.ends_with('\n') => (0.0, r.y + line),
+        Some(r) => (r.x + r.w, r.y),
+        None => (0.0, 0.0),
+    }
+}
+
 fn fade(argb: u32) -> u32 {
     let (a, r, g, b) = argb_channels(argb);
     (((a as u32 * 55) / 100) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
@@ -201,6 +239,13 @@ pub fn paint(inner: &mut Inner) {
     if needs_alloc {
         inner.pixmap = Pixmap::new(pw, ph);
     }
+    // how long since the last frame: what the caret and a field's scrolling move by, so the
+    // same motion comes out of a slow frame and a fast one. anything longer than a few
+    // frames was the loop asleep, and the animation would leap — it lands instead
+    let now = std::time::Instant::now();
+    inner.frame_dt = now.duration_since(inner.painted_at).as_secs_f32().min(0.1);
+    inner.painted_at = now;
+    inner.settling = false;
     let Some(mut pixmap) = inner.pixmap.take() else { return };
     pixmap.fill(to_color(WINDOW_BACKGROUND));
     let mut painter = Painter { pixmap, scale: inner.scale, masks: Vec::new() };
@@ -254,6 +299,9 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             Some(Layer::Shadow { rect, corners, elevation, argb }) => painter.shadow(rect.translated(abs.x, abs.y), corners, elevation, argb, &own_clip),
             Some(Layer::Background { rect, argb, corners }) => painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip),
             Some(Layer::Border { rect, argb, width, corners }) => painter.stroke_rect(rect.translated(abs.x, abs.y), argb, width, corners, &own_clip),
+            Some(Layer::Click { rect, pressed: Some(argb), corners, .. }) if inner.pressed_node == Some(id) => {
+                painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip)
+            }
             Some(Layer::Click { rect, hover: Some(argb), corners, .. }) if hovered => {
                 painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip)
             }
@@ -329,34 +377,70 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             } else if !decorated.1 {
                 painter.stroke_rect(content, FIELD_BORDER, 1.0, FIELD_RADIUS, &own_clip);
             }
-            let text_origin = (content.x + crate::layout::FIELD_PAD_X, content.y + crate::layout::FIELD_PAD_Y);
+            let pad = (crate::layout::FIELD_PAD_X, crate::layout::FIELD_PAD_Y);
             let text_clip = content.intersect(&own_clip);
-            if let Some(key) = key {
-                let argb = if is_placeholder { fade(style.argb) } else { style.argb };
-                painter.draw_text(inner, &key, text_origin, argb, &text_clip);
-            }
-            if let Some(f) = focused {
-                let line = crate::text::TextSystem::line_height(style);
-                let prefix: String = f.buffer.chars().take(f.caret).collect();
-                let (dx, dy) = if !multiline {
-                    let w = if prefix.is_empty() {
-                        0.0
-                    } else {
-                        inner.text.measure(&TextKey::new(prefix.into(), style, f32::INFINITY)).w
-                    };
-                    (w, 0.0)
-                } else {
-                    // where the text itself put the last glyph before the caret, so a line
-                    // the field wrapped counts the same as one the writer broke
-                    let key = inner.nodes[id].text_key.clone();
-                    let rect = key.and_then(|k| inner.text.rects_for(&k, 0, prefix.len()).last().copied());
-                    match rect {
-                        Some(r) if prefix.ends_with('\n') => (0.0, r.y + line),
-                        Some(r) => (r.x + r.w, r.y),
-                        None => (0.0, 0.0),
+            match focused {
+                // a field nobody is editing draws where it always did
+                None => {
+                    if let Some(key) = key {
+                        let argb = if is_placeholder { fade(style.argb) } else { style.argb };
+                        painter.draw_text(inner, &key, (content.x + pad.0, content.y + pad.1), argb, &text_clip);
                     }
-                };
-                painter.fill_rect(Rect::new(text_origin.0 + dx, text_origin.1 + dy, 1.0, line), style.argb, Corners::NONE, &text_clip);
+                }
+                Some(f) => {
+                    let line = crate::text::TextSystem::line_height(style);
+                    let caret_to = caret_position(inner, id, &f, style, multiline, line);
+                    // what the box can show, and what it has to scroll for the caret to be
+                    // inside it: a field of one line slides sideways, one that wraps down
+                    let view = (content.w - 2.0 * pad.0, content.h - 2.0 * pad.1);
+                    let mut want = f.scroll_to;
+                    if multiline {
+                        want.0 = 0.0;
+                        want.1 = want.1.min(caret_to.1).max(caret_to.1 + line - view.1).max(0.0);
+                    } else {
+                        want.1 = 0.0;
+                        // a pixel of room on the right, so the caret is not clipped away
+                        want.0 = want.0.min(caret_to.0).max(caret_to.0 + 1.5 - view.0).max(0.0);
+                    }
+                    let dt = inner.frame_dt;
+                    let scroll = (
+                        crate::tree::approach(f.scroll.0, want.0, dt, SCROLL_RATE),
+                        crate::tree::approach(f.scroll.1, want.1, dt, SCROLL_RATE),
+                    );
+                    let from = f.drawn.unwrap_or(caret_to);
+                    let drawn = (
+                        crate::tree::approach(from.0, caret_to.0, dt, CARET_RATE),
+                        crate::tree::approach(from.1, caret_to.1, dt, CARET_RATE),
+                    );
+                    if scroll != want || drawn != caret_to {
+                        inner.settling = true;
+                    }
+                    if let Some(live) = inner.focus.as_mut().filter(|live| live.node == id) {
+                        live.scroll = scroll;
+                        live.scroll_to = want;
+                        live.drawn = Some(drawn);
+                    }
+                    let origin = (content.x + pad.0 - scroll.0, content.y + pad.1 - scroll.1);
+                    // what is selected, behind the text it covers
+                    if let (Some((a, b)), Some(key)) = (f.range(), inner.nodes[id].text_key.clone()) {
+                        let (from_byte, to_byte) = (byte_at(&f.buffer, a), byte_at(&f.buffer, b));
+                        let argb = inner.selection.map(|s| s.argb).unwrap_or(FIELD_SELECTION);
+                        for rect in inner.text.rects_for(&key, from_byte, to_byte) {
+                            painter.fill_rect(rect.translated(origin.0, origin.1), argb, Corners::NONE, &text_clip);
+                        }
+                    }
+                    if let Some(key) = key {
+                        let argb = if is_placeholder { fade(style.argb) } else { style.argb };
+                        painter.draw_text(inner, &key, origin, argb, &text_clip);
+                    }
+                    // the caret fades rather than snapping, and holds solid for a moment
+                    // after every keystroke — one that blinks out as you type is one you chase
+                    let alpha = crate::tree::caret_alpha(f.moved_at.elapsed().as_secs_f32());
+                    if alpha > 0.004 {
+                        let argb = with_alpha(style.argb, alpha);
+                        painter.fill_rect(Rect::new(origin.0 + drawn.0, origin.1 + drawn.1, 1.5, line), argb, Corners::NONE, &text_clip);
+                    }
+                }
             }
         }
         Kind::Checkbox => {
@@ -408,6 +492,7 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             paint_children(inner, id, painter, &child_clip);
         }
         paint_scrollbar(inner, id, painter, &own_clip);
+        paint_scrollbar_x(inner, id, painter, &own_clip);
     } else {
         paint_children(inner, id, painter, &own_clip);
     }
@@ -429,6 +514,25 @@ fn paint_scrollbar(inner: &Inner, id: NodeId, painter: &mut Painter, clip: &Rect
     let thumb_h = (track * viewport.h / node.content_len).clamp(SCROLLBAR_MIN.min(track), track);
     let thumb_y = viewport.y + SCROLLBAR_INSET + (track - thumb_h) * (node.scroll / limit);
     let rect = Rect::new(viewport.x + viewport.w - SCROLLBAR_WIDTH - SCROLLBAR_INSET, thumb_y, SCROLLBAR_WIDTH, thumb_h);
+    painter.fill_rect(rect, colour, Corners::uniform(SCROLLBAR_WIDTH / 2.0), clip);
+}
+
+/// The same along the bottom edge, for a container laid out at its content's own width.
+fn paint_scrollbar_x(inner: &Inner, id: NodeId, painter: &mut Painter, clip: &Rect) {
+    let node = &inner.nodes[id];
+    let colour = node.modifier.scrollbar.unwrap_or(SCROLLBAR);
+    let limit = node.scroll_limit_x();
+    if limit <= 0.0 {
+        return;
+    }
+    let viewport = node.content_rect();
+    let track = (viewport.w - 2.0 * SCROLLBAR_INSET).max(0.0);
+    if track <= 0.0 {
+        return;
+    }
+    let thumb_w = (track * viewport.w / node.content_width).clamp(SCROLLBAR_MIN.min(track), track);
+    let thumb_x = viewport.x + SCROLLBAR_INSET + (track - thumb_w) * (node.scroll_x / limit);
+    let rect = Rect::new(thumb_x, viewport.y + viewport.h - SCROLLBAR_WIDTH - SCROLLBAR_INSET, thumb_w, SCROLLBAR_WIDTH);
     painter.fill_rect(rect, colour, Corners::uniform(SCROLLBAR_WIDTH / 2.0), clip);
 }
 

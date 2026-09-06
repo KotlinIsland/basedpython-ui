@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use slotmap::SlotMap;
 
@@ -47,6 +48,10 @@ pub struct Node {
     /// SCROLL: the current offset of the content (logical pixels, >= 0) and its full length.
     pub scroll: f32,
     pub content_len: f32,
+    /// SCROLL, sideways: the same pair for a container that also pans horizontally, which is
+    /// what gives a line wider than the viewport somewhere to go.
+    pub scroll_x: f32,
+    pub content_width: f32,
     /// POPUP: where its content sits in the window, after clamping it into view.
     pub popup_at: (f32, f32),
     /// Commit serial of the last reconciliation that reused this node (see `commit.rs`).
@@ -95,6 +100,8 @@ impl Node {
             canvas: None,
             canvas_pending: false,
             scroll: 0.0,
+            scroll_x: 0.0,
+            content_width: 0.0,
             content_len: 0.0,
             popup_at: (0.0, 0.0),
             mark: 0,
@@ -144,6 +151,11 @@ impl Node {
     pub fn scroll_limit(&self) -> f32 {
         (self.content_len - self.content_size.h).max(0.0)
     }
+
+    /// The same sideways, for a container laid out at its content's natural width.
+    pub fn scroll_limit_x(&self) -> f32 {
+        (self.content_width - self.content_size.w).max(0.0)
+    }
 }
 
 /// One end of a text selection: a text node and a byte index into its text.
@@ -171,6 +183,84 @@ pub struct Focus {
     pub buffer: String,
     /// Caret as a char index into `buffer`.
     pub caret: usize,
+    /// The other end of the selection, when the caret has been shifted or dragged away from
+    /// somewhere. `None` is a plain caret with nothing selected.
+    pub anchor: Option<usize>,
+    /// What the field has scrolled by to keep the caret in sight, and what it is easing
+    /// toward. Text longer than the box would otherwise be typed off the end of it.
+    pub scroll: (f32, f32),
+    pub scroll_to: (f32, f32),
+    /// Where the caret is drawn. It slides to where it belongs rather than jumping, so a
+    /// long move reads as a move; `None` until the first paint places it.
+    pub drawn: Option<(f32, f32)>,
+    /// When the caret last moved. The blink holds solid for a moment afterwards, so it is
+    /// never invisible in the middle of typing.
+    pub moved_at: Instant,
+}
+
+impl Focus {
+    pub fn new(node: NodeId, buffer: String, caret: usize) -> Focus {
+        Focus {
+            node,
+            buffer,
+            caret,
+            anchor: None,
+            scroll: (0.0, 0.0),
+            scroll_to: (0.0, 0.0),
+            drawn: None,
+            moved_at: Instant::now(),
+        }
+    }
+
+    /// The selection in reading order, when there is one and it is not empty.
+    pub fn range(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let (a, b) = (anchor.min(self.caret), anchor.max(self.caret));
+        if a == b { None } else { Some((a, b)) }
+    }
+
+    /// The caret moved: the blink restarts solid, so typing never blinks out under you.
+    pub fn touch(&mut self) {
+        self.moved_at = Instant::now();
+    }
+}
+
+/// How long one blink takes, and how much of it the caret spends fading in or out. A caret
+/// that snaps between on and off flickers; one that fades reads as a pulse.
+pub const CARET_PERIOD: f32 = 1.06;
+pub const CARET_FADE: f32 = 0.16;
+/// How long the caret stays solid after it moves.
+pub const CARET_SOLID: f32 = 0.5;
+
+/// How opaque the caret is, `seconds` after it last moved.
+pub fn caret_alpha(seconds: f32) -> f32 {
+    if seconds < CARET_SOLID {
+        return 1.0;
+    }
+    let phase = ((seconds - CARET_SOLID) % CARET_PERIOD) / CARET_PERIOD;
+    let fade = CARET_FADE / CARET_PERIOD;
+    let smooth = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    if phase < 0.5 - fade {
+        1.0
+    } else if phase < 0.5 {
+        smooth((0.5 - phase) / fade)
+    } else if phase < 1.0 - fade {
+        0.0
+    } else {
+        smooth((phase - (1.0 - fade)) / fade)
+    }
+}
+
+/// Move `current` a fraction of the way to `target`, framerate-independently: `rate` is how
+/// many e-foldings a second, so the same motion comes out of a slow frame and a fast one.
+pub fn approach(current: f32, target: f32, dt: f32, rate: f32) -> f32 {
+    if (target - current).abs() < 0.2 {
+        return target;
+    }
+    current + (target - current) * (1.0 - (-rate * dt).exp())
 }
 
 /// Everything the core retains. Owned by the Python `Core` object (behind a mutex).
@@ -203,6 +293,10 @@ pub struct Inner {
     /// The node a drag started on, while the pointer is still down: until it comes up, every
     /// move belongs to that node however far the pointer travels.
     pub drag_node: Option<NodeId>,
+    /// What the pointer is currently holding down, so a press shows on the thing pressed.
+    pub pressed_node: Option<NodeId>,
+    /// The `drop_target` handler a drag is currently over, or -1.
+    pub drop_node: i32,
     /// The text the pointer has selected, and whether it is still being dragged out.
     pub selection: Option<Selection>,
     pub selecting: bool,
@@ -213,9 +307,41 @@ pub struct Inner {
     pub commit_serial: u32,
     /// Bumped by every commit; text cache entries older than this may be swept.
     pub layout_epoch: u64,
+    /// When the last paint ran, so an animation moves by elapsed time rather than by frame.
+    pub painted_at: Instant,
+    /// How long the last frame took, which is what an animation moves by.
+    pub frame_dt: f32,
+    /// Set by paint while the caret or a field's scroll is still on its way.
+    pub settling: bool,
 }
 
 impl Inner {
+    /// How long until the next frame would look different: a caret easing into place or a
+    /// field still scrolling wants one straight away; a caret sitting still wants one only
+    /// when its blink is next about to change. `None` when nothing is moving at all, which
+    /// is what lets the event loop go back to sleep.
+    pub fn next_frame_in(&self) -> Option<Duration> {
+        let f = self.focus.as_ref()?;
+        if self.settling {
+            return Some(Duration::from_millis(8));
+        }
+        let seconds = f.moved_at.elapsed().as_secs_f32();
+        if seconds < CARET_SOLID {
+            return Some(Duration::from_secs_f32(CARET_SOLID - seconds));
+        }
+        // inside a fade every frame counts; on a plateau only the moment it ends does
+        let phase = ((seconds - CARET_SOLID) % CARET_PERIOD) / CARET_PERIOD;
+        let fade = CARET_FADE / CARET_PERIOD;
+        let until = if phase < 0.5 - fade {
+            0.5 - fade - phase
+        } else if phase >= 0.5 && phase < 1.0 - fade {
+            1.0 - fade - phase
+        } else {
+            return Some(Duration::from_millis(8));
+        };
+        Some(Duration::from_secs_f32(until * CARET_PERIOD))
+    }
+
     pub fn new(width: f32, height: f32, scale: f32, text: TextSystem) -> Inner {
         let empty_modifier = Arc::new(Modifier::default());
         let mut nodes = SlotMap::with_key();
@@ -248,12 +374,17 @@ impl Inner {
             hover_node: None,
             hover_target_node: None,
             drag_node: None,
+            pressed_node: None,
+            drop_node: -1,
             selection: None,
             selecting: false,
             pending_events: Vec::new(),
             timings: [0.0; 3],
             commit_serial: 0,
             layout_epoch: 0,
+            painted_at: Instant::now(),
+            frame_dt: 0.0,
+            settling: false,
         };
         inner.resize(width, height, scale);
         inner
