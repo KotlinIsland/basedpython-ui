@@ -88,6 +88,7 @@ a buffer of `f64` (python `array('d')`). canvas draw commands are runs of `[op, 
 | 2 circle | cx, cy, r, argb |
 | 3 line | x1, y1, x2, y2, argb, stroke |
 | 4 text | x, y, text_idx, style id |
+| 5 curve | x1, y1, cx, cy, x2, y2, argb, stroke |
 
 ## `ranges`
 
@@ -362,6 +363,8 @@ taller, so the second measuring pass is always the last. `dump()` shows `scroll=
 | 19 draggable | handler index | told when the pointer is pressed here and dragged; the core holds the pointer until it comes up |
 | 20 selectable | argb | the `TEXT` under this node can be selected by sweeping the pointer over it; the colour is the highlight's |
 | 21 cursor | shape | what the pointer looks like over this node: 0 the platform's own, 1 a hand, 2 a text bar, 3 a column-resize arrow, 4 a grabbing hand. the innermost one under the pointer wins (`Core.cursor_at(x, y)`) |
+| 22 multiline | — | a `TEXTFIELD` that holds more than one line: it wraps in the width it is given, grows down, and Enter inserts a break |
+| 23 dismiss | handler index | told when the pointer is pressed anywhere outside this node; the press itself is not taken, so a menu can close on a click that still lands |
 
 ### style flags
 
@@ -427,7 +430,8 @@ ordinary pointer events for them report handler -1, so nothing else reads them a
   falling through buttons, checkboxes and text fields, so a row can offer a menu without every
   widget on it forwarding one. python dispatches on the up when it lands on the same handler
   as the down, exactly as it does for the left button.
-- kind **11** is a hover enter or leave, and kind **12** a drag step (see above).
+- kind **11** is a hover enter or leave, kind **12** a drag step (see above), and kind **13**
+  a press outside a `dismiss` layer — the press itself still goes to whatever it landed on.
 - kind **8 THEME**: `(8, 0, 0, -1, "light" | "dark")`, the appearance the window follows,
   sent when the window opens (when the platform reports one) and on every change; the
   python side keeps it in `basedpython_ui.app.system_theme`, a `State[str]`; the resize

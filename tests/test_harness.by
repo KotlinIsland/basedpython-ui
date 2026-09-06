@@ -5,6 +5,7 @@ from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
     chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
+    State,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -603,6 +604,30 @@ def test_text_is_selected_by_sweeping_and_read_from_a_key_handler():
     # a click elsewhere in the same text clears it
     t.click_at(1.0, 1.0)
     assert t.selected_text() == ""
+    t.dispose()
+
+
+@composable
+def Paragraph(box: State[str]):
+    TextField(box.value, Modifier().fill_max_width().multiline(), placeholder="say something"):
+        box.value = it
+
+
+def test_a_field_of_several_lines_takes_a_line_break():
+    let text = State("")
+    let t = compose_test(width=300, height=200):
+        Paragraph(text)
+    t.type_into("say something", "first")
+    t.advance()
+    let one_line = t.rect_of("first")
+    # Enter is a line break in a field that takes several, and the field grows to hold it
+    t.edit_key("Enter")
+    t.advance()
+    t.type_more("second")
+    t.advance()
+    assert text.value == "first\nsecond", repr(text.value)
+    let two_lines = t.rect_of("first\nsecond")
+    assert two_lines.3 > one_line.3, (one_line, two_lines)
     t.dispose()
 
 

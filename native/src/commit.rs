@@ -837,6 +837,19 @@ pub fn parse_canvas(inner: &Inner, floats: &[f64], strs: &[&str]) -> Result<Vec<
                 stroke: fin(a[5], "stroke", i)?.max(0.0),
             });
             i += 7;
+        } else if op == 5.0 {
+            let a = need(8)?;
+            out.push(CanvasCmd::Curve {
+                x1: fin(a[0], "x1", i)?,
+                y1: fin(a[1], "y1", i)?,
+                cx: fin(a[2], "cx", i)?,
+                cy: fin(a[3], "cy", i)?,
+                x2: fin(a[4], "x2", i)?,
+                y2: fin(a[5], "y2", i)?,
+                argb: argb_from_f64(a[6]).map_err(InputError)?,
+                stroke: fin(a[7], "stroke", i)?.max(0.0),
+            });
+            i += 9;
         } else if op == 4.0 {
             let a = need(4)?;
             let ti = a[2];

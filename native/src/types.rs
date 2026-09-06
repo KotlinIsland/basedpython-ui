@@ -254,12 +254,18 @@ pub enum ModOp {
     /// A handler told when the pointer is pressed on the layer and dragged, wherever it
     /// then goes: the core holds the pointer for the duration.
     Drag(i32),
+    /// A handler told when the pointer is pressed outside this node, without taking the
+    /// press: what a menu closes on.
+    Dismiss(i32),
     /// The text under this layer can be selected with the pointer; the colour is the
     /// highlight's.
     Selectable(u32),
     /// What the pointer looks like over this node: 0 the platform's own, 1 a hand, 2 a text
     /// bar, 3 a column-resize arrow, 4 a grabbing hand.
     Cursor(u32),
+    /// A `TEXTFIELD` that holds more than one line: it wraps, it grows, and Enter puts a
+    /// line break in rather than doing nothing.
+    Multiline,
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -276,6 +282,8 @@ pub struct Modifier {
     pub clip: bool,
     /// What the pointer looks like over this node; 0 is the platform's own.
     pub cursor: u32,
+    /// A text field that takes more than one line.
+    pub multiline: bool,
 }
 
 impl Modifier {
@@ -290,6 +298,7 @@ impl Modifier {
         let mut reveal = false;
         let mut clip = false;
         let mut cursor = 0u32;
+        let mut multiline = false;
         while i < raw.len() {
             let op = raw[i];
             let take = |n: usize| -> Result<&[f64], String> {
@@ -422,6 +431,16 @@ impl Modifier {
                     ops.push(ModOp::Selectable(argb_from_f64(a[0])?));
                     i += 2;
                 }
+                x if x == 23.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Dismiss(handler_index(a[0], "dismiss")?));
+                    i += 2;
+                }
+                x if x == 22.0 => {
+                    multiline = true;
+                    ops.push(ModOp::Multiline);
+                    i += 1;
+                }
                 x if x == 21.0 => {
                     let a = take(1)?;
                     let kind = finite(a[0], "cursor")?;
@@ -435,7 +454,7 @@ impl Modifier {
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip, cursor })
+        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip, cursor, multiline })
     }
 }
 
@@ -526,6 +545,9 @@ pub enum Layer {
     Drag { rect: Rect, handler: i32 },
     /// The text inside here can be selected; `argb` is the highlight's colour.
     Select { rect: Rect, argb: u32 },
+    /// Told when the pointer is pressed anywhere but inside this rect. The press itself goes
+    /// on to whatever it landed on, so a menu can close and the click still count.
+    Dismiss { rect: Rect, handler: i32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.
@@ -534,6 +556,8 @@ pub enum CanvasCmd {
     Rect { x: f32, y: f32, w: f32, h: f32, argb: u32 },
     Circle { cx: f32, cy: f32, r: f32, argb: u32 },
     Line { x1: f32, y1: f32, x2: f32, y2: f32, argb: u32, stroke: f32 },
+    /// A quadratic curve from one point to another, bending towards `(cx, cy)`.
+    Curve { x1: f32, y1: f32, cx: f32, cy: f32, x2: f32, y2: f32, argb: u32, stroke: f32 },
     Text { x: f32, y: f32, text: Arc<str>, style: Style },
 }
 

@@ -465,6 +465,11 @@ impl Inner {
     }
 
     /// Nodes in pre-order.
+    /// Every node, including the ones inside popups: what a whole-tree sweep walks.
+    pub fn all_nodes(&self) -> Vec<NodeId> {
+        self.preorder()
+    }
+
     fn preorder(&self) -> Vec<NodeId> {
         let mut stack = vec![self.root];
         let mut order = Vec::with_capacity(self.nodes.len());

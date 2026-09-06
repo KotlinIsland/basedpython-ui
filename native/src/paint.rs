@@ -155,6 +155,16 @@ impl Painter {
         self.stroke_path(&path, argb, width, clip);
     }
 
+    /// A quadratic curve, which is what a branch line uses to bend from one column into
+    /// another without a corner.
+    fn stroke_curve(&mut self, a: (f32, f32), c: (f32, f32), b: (f32, f32), argb: u32, width: f32, clip: &Rect) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(a.0 * self.scale, a.1 * self.scale);
+        pb.quad_to(c.0 * self.scale, c.1 * self.scale, b.0 * self.scale, b.1 * self.scale);
+        let Some(path) = pb.finish() else { return };
+        self.stroke_path(&path, argb, width, clip);
+    }
+
     /// A soft shadow: a few stacked translucent rounded rects, each a little larger and
     /// lower than the last, so the edge fades instead of stepping.
     fn shadow(&mut self, r: Rect, corners: Corners, elevation: f32, argb: u32, clip: &Rect) {
@@ -291,20 +301,31 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
         }
         Kind::TextField => {
             let focused = inner.focus.as_ref().filter(|f| f.node == id).cloned();
-            let (key, is_placeholder, style, decorated) = {
+            let (key, is_placeholder, style, decorated, multiline, own_border) = {
                 let n = &inner.nodes[id];
                 let placeholder = focused.is_none() && n.text.as_deref().map(|t| t.is_empty()).unwrap_or(true);
                 // a field the chain has already dressed keeps its own colours: the plain
                 // white box below is the look of an undecorated one
                 let background = n.layers.iter().any(|l| matches!(l, Layer::Background { .. }));
                 let border = n.layers.iter().any(|l| matches!(l, Layer::Border { .. }));
-                (n.text_key.clone(), placeholder, n.style, (background, border))
+                let own = n.layers.iter().rev().find_map(|l| match l {
+                    Layer::Border { rect, width, corners, .. } => Some((*rect, *width, *corners)),
+                    _ => None,
+                });
+                (n.text_key.clone(), placeholder, n.style, (background, border), n.modifier.multiline, own)
             };
             if !decorated.0 {
                 painter.fill_rect(content, 0xFFFF_FFFF, FIELD_RADIUS, &own_clip);
             }
             if focused.is_some() {
-                painter.stroke_rect(content, FIELD_BORDER_FOCUS, 2.0, FIELD_RADIUS, &own_clip);
+                // a field the chain gave a border keeps that outline and only changes its
+                // colour: a second ring inside the first is a rim, not a highlight
+                match own_border {
+                    Some((rect, width, corners)) => {
+                        painter.stroke_rect(rect.translated(abs.x, abs.y), FIELD_BORDER_FOCUS, width, corners, &own_clip)
+                    }
+                    None => painter.stroke_rect(content, FIELD_BORDER_FOCUS, 2.0, FIELD_RADIUS, &own_clip),
+                }
             } else if !decorated.1 {
                 painter.stroke_rect(content, FIELD_BORDER, 1.0, FIELD_RADIUS, &own_clip);
             }
@@ -315,14 +336,27 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                 painter.draw_text(inner, &key, text_origin, argb, &text_clip);
             }
             if let Some(f) = focused {
-                let prefix: String = f.buffer.chars().take(f.caret).collect();
-                let w = if prefix.is_empty() {
-                    0.0
-                } else {
-                    inner.text.measure(&TextKey::new(prefix.into(), style, f32::INFINITY)).w
-                };
                 let line = crate::text::TextSystem::line_height(style);
-                painter.fill_rect(Rect::new(text_origin.0 + w, text_origin.1, 1.0, line), style.argb, Corners::NONE, &text_clip);
+                let prefix: String = f.buffer.chars().take(f.caret).collect();
+                let (dx, dy) = if !multiline {
+                    let w = if prefix.is_empty() {
+                        0.0
+                    } else {
+                        inner.text.measure(&TextKey::new(prefix.into(), style, f32::INFINITY)).w
+                    };
+                    (w, 0.0)
+                } else {
+                    // where the text itself put the last glyph before the caret, so a line
+                    // the field wrapped counts the same as one the writer broke
+                    let key = inner.nodes[id].text_key.clone();
+                    let rect = key.and_then(|k| inner.text.rects_for(&k, 0, prefix.len()).last().copied());
+                    match rect {
+                        Some(r) if prefix.ends_with('\n') => (0.0, r.y + line),
+                        Some(r) => (r.x + r.w, r.y),
+                        None => (0.0, 0.0),
+                    }
+                };
+                painter.fill_rect(Rect::new(text_origin.0 + dx, text_origin.1 + dy, 1.0, line), style.argb, Corners::NONE, &text_clip);
             }
         }
         Kind::Checkbox => {
@@ -405,6 +439,14 @@ fn paint_canvas_cmd(inner: &mut Inner, painter: &mut Painter, cmd: &CanvasCmd, o
         CanvasCmd::Line { x1, y1, x2, y2, argb, stroke } => {
             painter.stroke_line((origin.0 + x1, origin.1 + y1), (origin.0 + x2, origin.1 + y2), *argb, *stroke, clip)
         }
+        CanvasCmd::Curve { x1, y1, cx, cy, x2, y2, argb, stroke } => painter.stroke_curve(
+            (origin.0 + x1, origin.1 + y1),
+            (origin.0 + cx, origin.1 + cy),
+            (origin.0 + x2, origin.1 + y2),
+            *argb,
+            *stroke,
+            clip,
+        ),
         CanvasCmd::Text { x, y, text, style } => {
             let key = TextKey::new(text.clone(), *style, f32::INFINITY);
             painter.draw_text(inner, &key, (origin.0 + x, origin.1 + y), style.argb, clip);

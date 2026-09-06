@@ -82,6 +82,10 @@ enum class ModOp:
     case Selectable(color: Color)
     # what the pointer looks like over this node
     case Cursor(shape: CursorShape)
+    # a text field that holds more than one line
+    case Multiline
+    # told when the pointer is pressed anywhere but here, without taking the press
+    case Dismiss(on_dismiss: () -> None)
 
 
 frozen data class Modifier:
@@ -164,6 +168,17 @@ frozen data class Modifier:
     def scrollbar(self, color: Color) -> Modifier:
         """The colour of this `Scroll`'s thumb, for a theme the default does not suit."""
         return self.then(ModOp.Scrollbar(color))
+
+    def dismiss(self, on_dismiss: () -> None) -> Modifier:
+        """Told when the pointer is pressed anywhere outside this node. The press itself is
+        not taken: it goes on to whatever it landed on, so a menu can close on a click that
+        still does what it was aimed at."""
+        return self.then(ModOp.Dismiss(on_dismiss))
+
+    def multiline(self) -> Modifier:
+        """A `TextField` that takes more than one line: it wraps inside the width it is
+        given, grows down as it fills, and Enter puts a line break in."""
+        return self.then(ModOp.Multiline)
 
     def cursor(self, shape: CursorShape) -> Modifier:
         """What the pointer looks like over this node. The innermost one under the pointer

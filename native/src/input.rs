@@ -24,6 +24,8 @@ pub const EV_HOVER: i32 = 11;
 /// A drag on a node carrying a `draggable` modifier: `text` is "start", "move" or "end",
 /// `x` / `y` where the pointer is, `handler` that node's drag handler.
 pub const EV_DRAG: i32 = 12;
+/// A press outside a `dismiss` layer: the layer's handler, with nothing to say.
+pub const EV_DISMISS: i32 = 13;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;
@@ -209,6 +211,9 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
     // the release are the drag's rather than anything else's
     let dragging = !secondary && update_drag(inner, kind, x, y);
     let selecting = !secondary && !dragging && update_selection(inner, kind, x, y);
+    if kind == EV_POINTER_DOWN || kind == EV_SECONDARY_DOWN {
+        dismiss_outside(inner, x, y);
+    }
     let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
     if kind == EV_POINTER_DOWN && !dragging && !selecting {
         match hit.focus {
@@ -232,6 +237,40 @@ fn over_popup(inner: &Inner, x: f32, y: f32) -> bool {
         .live_popups()
         .into_iter()
         .any(|p| inner.nodes.get(p).map(|n| n.abs.contains(x, y)).unwrap_or(false))
+}
+
+/// Tell every `dismiss` layer that does not contain the point about the press. The press is
+/// not taken: it goes on to whatever it landed on, so a click that closes a menu still does
+/// what it would have done.
+fn dismiss_outside(inner: &mut Inner, x: f32, y: f32) {
+    let mut handlers = Vec::new();
+    for id in inner.all_nodes() {
+        let Some(node) = inner.nodes.get(id) else { continue };
+        for layer in node.layers.iter() {
+            if let Layer::Dismiss { rect, handler } = layer {
+                if *handler >= 0 && !rect.translated(node.abs.x, node.abs.y).contains(x, y) {
+                    handlers.push(*handler);
+                }
+            }
+        }
+    }
+    for handler in handlers {
+        inner.pending_events.push(Event::new(EV_DISMISS, x, y, handler, String::new()));
+    }
+}
+
+/// The hoverable under the pointer inside a live popup, ignoring the tree below it.
+fn hover_in_popups(inner: &Inner, x: f32, y: f32) -> Option<NodeId> {
+    for popup in inner.live_popups().into_iter().rev() {
+        let Some(node) = inner.nodes.get(popup) else { continue };
+        if !node.abs.contains(x, y) {
+            continue;
+        }
+        if let Some(hit) = hit_children(inner, popup, x, y, Which::Hover) {
+            return hit.node;
+        }
+    }
+    None
 }
 
 /// Start, extend or finish a text selection. A press inside a `selectable` node puts the
@@ -444,7 +483,13 @@ pub fn hover_target(inner: &Inner) -> i32 {
 /// handler each event carries is read now rather than remembered, so a node whose scope
 /// recomposed while the pointer sat on it is still told when the pointer leaves.
 pub fn update_hover_target(inner: &mut Inner, x: f32, y: f32) {
-    let target = hit_for(inner, x, y, Which::Hover).node;
+    // a popup covers what is under it: a menu over a row must not leave the row explaining
+    // itself, so hover only reaches into the popup the pointer is actually over
+    let target = if over_popup(inner, x, y) {
+        hover_in_popups(inner, x, y)
+    } else {
+        hit_for(inner, x, y, Which::Hover).node
+    };
     if target == inner.hover_target_node {
         return;
     }
@@ -638,6 +683,19 @@ pub fn key_named(inner: &mut Inner, name: &str) -> Option<Event> {
                 inner.mark_dirty(f.node);
             }
             None
+        }
+        "Enter" => {
+            // a field of one line has nothing to do with Enter; one that takes several
+            // gets a line break, which is the only way to type a paragraph
+            let f = inner.focus.as_ref()?;
+            if !inner.nodes.get(f.node).map(|n| n.modifier.multiline).unwrap_or(false) {
+                return None;
+            }
+            let f = inner.focus.as_mut()?;
+            let at = byte_index(&f.buffer, f.caret);
+            f.buffer.insert(at, '\n');
+            f.caret += 1;
+            edited(inner)
         }
         "Tab" => {
             focus_next_field(inner);
@@ -995,6 +1053,43 @@ mod tests {
         pointer(&mut inner, EV_POINTER_UP, advance * 8.0, line * 0.5);
         pointer(&mut inner, EV_POINTER_DOWN, 290.0, 190.0);
         assert_eq!(selected_text(&inner), "");
+    }
+
+    #[test]
+    fn a_press_outside_a_dismiss_layer_is_reported_without_being_taken() {
+        let mut inner = Inner::new(300.0, 200.0, 1.0, TextSystem::monospace_only());
+        // a clickable row under a popup that asks to be told about presses elsewhere
+        let mods = vec![
+            (1, vec![2.0, 300.0, 3.0, 200.0]),
+            (2, vec![2.0, 300.0, 3.0, 40.0, 9.0, 5.0]),
+            (3, vec![2.0, 80.0, 3.0, 30.0, 23.0, 7.0]),
+        ];
+        let ints: Vec<i32> = [
+            [3, 0, -1, 1, -1, 0, 0, 0],  // column
+            [10, 0, -1, 2, -1, 0, 0, 0], // a clickable row, handler 5
+            [14, 0, -1, 0, -1, 0, 0, 0], // popup
+            [10, 0, -1, 3, -1, 0, 0, 0], // the menu inside it, dismiss handler 7
+            [0, 0, -1, 0, -1, 0, 0, 0],  // end of the popup
+            [0, 0, -1, 0, -1, 0, 0, 0],  // end of the column
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &[], &[(0, 0, 6)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+
+        // a press inside the menu is the menu's: nothing is dismissed
+        pointer(&mut inner, EV_POINTER_DOWN, 10.0, 10.0);
+        assert!(take_events(&mut inner).is_empty());
+
+        // a press outside it tells the layer, and still lands on the row underneath
+        let ev = pointer(&mut inner, EV_POINTER_DOWN, 200.0, 20.0);
+        assert_eq!(ev.handler, 5, "the press went to the row, not to the menu");
+        let events = take_events(&mut inner);
+        assert_eq!(events.len(), 1, "{:?}", events);
+        assert_eq!(events[0].kind, EV_DISMISS);
+        assert_eq!(events[0].handler, 7);
     }
 
     #[test]

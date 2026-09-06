@@ -72,6 +72,10 @@ class DrawScope:
     def line(self, x1: float, y1: float, x2: float, y2: float, color: Color, stroke: Dp = ONE_DP):
         self.recorder.floats.extend((3.0, x1, y1, x2, y2, float(color.argb()), stroke.value))
 
+    def curve(self, x1: float, y1: float, cx: float, cy: float, x2: float, y2: float, color: Color, stroke: Dp = ONE_DP):
+        """A quadratic curve from `(x1, y1)` to `(x2, y2)`, bending towards `(cx, cy)`."""
+        self.recorder.floats.extend((5.0, x1, y1, cx, cy, x2, y2, float(color.argb()), stroke.value))
+
     def text(self, text: str, x: float, y: float, style: TextStyle = DEFAULT_TEXT_STYLE):
         idx = len(self.recorder.strs)
         self.recorder.strs.append(text)
@@ -141,6 +145,10 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((20.0, float(color.argb())))
             case ModOp.Cursor(shape):
                 ops.extend((21.0, float(cursor_code(shape))))
+            case ModOp.Multiline:
+                ops.append(22.0)
+            case ModOp.Dismiss(on_dismiss):
+                ops.extend((23.0, float(rt.handler(lambda: on_dismiss()))))
     return ops
 
 

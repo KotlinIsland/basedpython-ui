@@ -1290,6 +1290,8 @@ protocol NativeCore:
     def pointer(self, kind: int, x: float, y: float) -> (int, float, float, int, str)
     @ignorable_return_value
     def key_text(self, text: str) -> (int, float, float, int, str)?
+    @ignorable_return_value
+    def key_named(self, name: str) -> (int, float, float, int, str)?
     def find_text(self, text: str) -> (int, float, float, float, float)?
     def all_text(self) -> list[str]
     def field_handler(self, placeholder: str) -> int

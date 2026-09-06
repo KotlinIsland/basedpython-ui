@@ -297,7 +297,19 @@ fn layout_layer<H: MeasureHost>(
             inner.nodes[id].layers.push(Layer::Select { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb });
             s
         }
-        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Scrollbar(_) | ModOp::Reveal | ModOp::Clip | ModOp::Cursor(_) => {
+        ModOp::Dismiss(handler) => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Dismiss { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
+            s
+        }
+        ModOp::Weight(_)
+        | ModOp::Align(_)
+        | ModOp::Hover(_)
+        | ModOp::Scrollbar(_)
+        | ModOp::Reveal
+        | ModOp::Clip
+        | ModOp::Cursor(_)
+        | ModOp::Multiline => {
             layout_layer(inner, id, m, i + 1, c, origin, corners, host)
         }
     }
@@ -339,7 +351,15 @@ fn layout_content<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints,
                     _ => node.placeholder.clone().unwrap_or_else(|| inner.empty_text.clone()),
                 },
             };
-            let key = TextKey::new(shown, node.style, f32::INFINITY);
+            // a field of one line is measured unwrapped and is as wide as it needs to be;
+            // one that takes several wraps inside the width it was given and grows down
+            let multiline = node.modifier.multiline;
+            let wrap = if multiline && c.max_w.is_finite() {
+                (c.max_w - 2.0 * FIELD_PAD_X).max(FIELD_MIN_WIDTH)
+            } else {
+                f32::INFINITY
+            };
+            let key = TextKey::new(shown, node.style, wrap);
             let s = inner.text.measure(&key);
             inner.nodes[id].text_key = Some(key);
             let line = crate::text::TextSystem::line_height(inner.nodes[id].style);

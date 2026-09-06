@@ -77,6 +77,9 @@ class NullCore:
     def node_count(self) -> int:
         return self.records
 
+    def key_named(self, name: str) -> tuple[int, float, float, int, str] | None:
+        return None
+
 
 @composable
 def LeafScope(row: int, col: int):

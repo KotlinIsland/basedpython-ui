@@ -43,7 +43,8 @@ class Core:
 
 
 class Window:
-    def __init__(self, title: str, width: float, height: float, icon: bytes? = None)
+    def __init__(self, title: str, width: float, height: float, icon: bytes? = None, name: str? = None)
     def run(self, on_frame: (Core) -> bool, on_events: (list[(int, float, float, int, str)]) -> None)
+    def open(self, title: str, width: float, height: float, on_frame: (Core) -> bool, on_events: (list[(int, float, float, int, str)]) -> None)
     def request_frame(self)
     def close(self)

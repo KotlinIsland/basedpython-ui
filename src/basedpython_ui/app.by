@@ -111,19 +111,58 @@ class WindowEvents:
                     runtime.dispatch(handler_idx, text == "1", "", (x, y))
                 case 12:
                     runtime.dispatch(handler_idx, text, "", (x, y))
+                case 13:
+                    runtime.dispatch(handler_idx, None, "", (x, y))
                 case _:
                     pass
 
 
-def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, icon: bytes? = None, trace: bool = True, root: () -> None) raises ...:
-    """Open a window, compose `root` into it and drive frames until the
-    window closes. Owns the main thread (the window system requires it).
+# the window this process is running, while it runs: what another window is asked of
+private var running_window: dynamic = None
+private var running_tasks: dynamic = None
+
+
+def open_window(title: str, width: int, height: int, trace: bool = True, root: () -> None) raises RuntimeError:
+    """Open another window of the same application, composing `root` into it. One process,
+    one event loop, one icon: the windows are siblings, not separate applications. Closing
+    the last one ends the application. `trace=False` turns the recomposition trace off for
+    this window's runtime."""
+    let window: dynamic = running_window
+    if window is None:
+        raise RuntimeError("no window is running: open_window belongs inside run_app")
+    let tasks: dynamic = running_tasks
+    let events = WindowEvents()
+    var measure: object = None
+
+    def on_frame(core: NativeCore) -> bool:
+        nonlocal measure
+        rt = events.runtime
+        if rt is None:
+            rt = Runtime(core, trace=trace)
+            if tasks is not None:
+                rt.task_runner = tasks.run
+            rt.wake = window.request_frame
+            measure = measure_dispatcher(rt, core)
+            rt.set_root(root)
+            events.runtime = rt
+        rt.frame(measure)
+        core.paint()
+        return not rt.is_idle()
+
+    window.open(title, float(width), float(height), on_frame, events.handle)
+
+
+def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, icon: bytes? = None, name: str? = None, trace: bool = True, root: () -> None) raises ...:
+    """Open a window, compose `root` into it and drive frames until the last window closes.
+    Owns the main thread (the window system requires it).
 
     `icon` is an 8-bit rgba png: the window's icon where the platform has one, and the
-    application's icon (the dock) on macos. `trace=False` turns the recomposition trace
-    off for this runtime."""
+    application's icon (the dock) on macos. `name` is what the application is called there,
+    where `title` is what this window is showing. `open_window` opens another one alongside
+    it. `trace=False` turns the recomposition trace off for this runtime."""
+    global running_window, running_tasks
     native = load_native()
-    window = native.Window(title, float(width), float(height), icon)
+    window = native.Window(title, float(width), float(height), icon, name)
     tasks = _TaskThread()
     events = WindowEvents()
     measure: object = None
@@ -142,9 +181,13 @@ def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, 
         core.paint()
         return not rt.is_idle()
 
+    running_window = window
+    running_tasks = tasks
     try:
         window.run(on_frame, events.handle)
     finally:
+        running_window = None
+        running_tasks = None
         tasks.stop()
 
 
@@ -194,11 +237,14 @@ class TestComposition:
         cx, cy = self._centre(label)
         down = self.core.pointer(1, cx, cy)
         up = self.core.pointer(2, cx, cy)
-        self._deliver()
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
+            self._deliver()
             raise AssertionError(f"{label!r} is not clickable; tree:\n{self.dump()}")
+        # the click first, then what it produced along the way: the order a window uses,
+        # which is what lets a press close a menu and still do what it was aimed at
         self.runtime.dispatch(handler_idx, None, modifiers, (cx, cy))
+        self._deliver()
 
     def right_click(self, label: str):
         """The right button over the node showing `label`: what opens a context menu."""
@@ -212,10 +258,11 @@ class TestComposition:
         self.runtime.dispatch(handler_idx, None, "", (cx, cy))
 
     def _deliver(self):
-        """Dispatch what the last pointer event produced: hover enters and leaves, and the
-        steps of a drag."""
+        """Dispatch what the last pointer event produced: hover enters and leaves, the steps
+        of a drag, and the presses that landed outside a `dismiss` layer."""
         for kind, x, y, handler_idx, text in self.core.take_events():
-            self.runtime.dispatch(handler_idx, text == "1" if kind == 11 else text, "", (x, y))
+            payload: object = None if kind == 13 else (text == "1" if kind == 11 else text)
+            self.runtime.dispatch(handler_idx, payload, "", (x, y))
 
     def drag(self, label: str, dx: float, dy: float, steps: int = 2):
         """Press the node showing `label`, move by `(dx, dy)` and release: the whole drag,
@@ -305,6 +352,20 @@ class TestComposition:
         if event is None or event[3] < 0:
             raise AssertionError(f"{placeholder!r} did not take focus; tree:\n{self.dump()}")
         self.runtime.dispatch(event[3], event[4])
+
+    def type_more(self, text: str):
+        """Type into whatever field already has focus."""
+        self._typed(self.core.key_text(text), text)
+
+    def edit_key(self, name: str):
+        """An editing key by name (Enter, Backspace, Left, …) into the focused field."""
+        self._typed(self.core.key_named(name), name)
+
+    def _typed(self, event: tuple[int, float, float, int, str]?, what: str):
+        if event is None:
+            raise AssertionError(f"{what!r} went nowhere: no field has focus")
+        if event[3] >= 0:
+            self.runtime.dispatch(event[3], event[4])
 
     def recompositions(self, fn: object) -> int:
         name = getattr(fn, "__name__", str(fn))
