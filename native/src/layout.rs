@@ -286,6 +286,11 @@ fn layout_layer<H: MeasureHost>(
             inner.nodes[id].layers.push(Layer::Border { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb, width, corners });
             s
         }
+        ModOp::Rule { side, width, argb } => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Rule { rect: Rect::new(origin.0, origin.1, s.w, s.h), side, width, argb });
+            s
+        }
         ModOp::Shadow { elevation, argb } => {
             let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
             inner.nodes[id].layers.push(Layer::Shadow { rect: Rect::new(origin.0, origin.1, s.w, s.h), corners, elevation, argb });
@@ -381,6 +386,22 @@ fn layout_content<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints,
         }
         Kind::Checkbox => c.constrain(Size::new(CHECKBOX_SIZE, CHECKBOX_SIZE)),
         Kind::Spacer | Kind::Canvas => Size::new(c.min_w, c.min_h),
+        Kind::Image => {
+            // its own size, scaled down to fit what it is given, keeping its shape: an image
+            // stretched to a box is a lie about the file
+            let (iw, ih) = inner
+                .images
+                .get(&inner.nodes[id].a)
+                .map(|image| (image.width as f32, image.height as f32))
+                .unwrap_or((0.0, 0.0));
+            if iw <= 0.0 || ih <= 0.0 {
+                Size::new(c.min_w, c.min_h)
+            } else {
+                let scale = (c.max_w / iw).min(c.max_h / ih).min(1.0).max(0.0);
+                let (w, h) = if scale.is_finite() { (iw * scale, ih * scale) } else { (iw, ih) };
+                Size::new(w.max(c.min_w), h.max(c.min_h))
+            }
+        }
         Kind::Column | Kind::Row => layout_flex(inner, id, c, origin, kind == Kind::Column, host),
         Kind::Box => layout_box(inner, id, c, origin, host),
         Kind::Layout => layout_custom(inner, id, c, origin, host),

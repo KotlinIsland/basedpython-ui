@@ -38,11 +38,13 @@ class Core:
     def cursor_at(self, x: float, y: float) -> int
     def selected_text(self) -> str
     def clear_selection(self)
-    def take_events(self) -> list[tuple[int, float, float, int, str]]
+    def take_events(self) -> list[(int, float, float, int, str)]
     def scroll(self, x: float, y: float, dy: float, dx: float = 0.0) -> bool
-    def scroll_offset_x(self, node_id: int) -> float | None
-    def scroll_offset(self, node_id: int) -> float | None
-    def first_scroll(self) -> tuple[int, float, float, float] | None
+    def scroll_offset_x(self, node_id: int) -> float?
+    def scroll_offset(self, node_id: int) -> float?
+    def first_scroll(self) -> (int, float, float, float)?
+    def load_image(self, data: bytes) -> (int, int, int)
+    def drop_image(self, id: int)
 
 
 class Window:

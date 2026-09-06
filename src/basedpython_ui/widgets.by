@@ -9,7 +9,7 @@ from array import array
 from . import modifier as _modifier
 from . import runtime as _runtime
 from .geometry import Dp, Size, Constraints, Color, ONE_DP, ZERO_DP
-from .modifier import Modifier, ModOp, Alignment, Arrangement, CursorShape, TextStyle, cursor_code
+from .modifier import Modifier, ModOp, Alignment, Arrangement, CursorShape, Side, TextStyle, cursor_code
 from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError, builder, input_position
 
 # imports are lazy proxies; the values used on every builder call are bound
@@ -29,6 +29,7 @@ let R_CANVAS = _runtime.R_CANVAS
 let R_LAYOUT = _runtime.R_LAYOUT
 let R_SCROLL = _runtime.R_SCROLL
 let R_POPUP = _runtime.R_POPUP
+let R_IMAGE = _runtime.R_IMAGE
 
 
 class ColumnScope:
@@ -76,7 +77,7 @@ class DrawScope:
         """A quadratic curve from `(x1, y1)` to `(x2, y2)`, bending towards `(cx, cy)`."""
         self.recorder.floats.extend((5.0, x1, y1, cx, cy, x2, y2, float(color.argb()), stroke.value))
 
-    def path(self, points: tuple[tuple[float, float], ...], color: Color, stroke: Dp = ZERO_DP):
+    def path(self, points: (*: (float, float)), color: Color, stroke: Dp = ZERO_DP):
         """An arbitrary closed polygon: filled when `stroke` is zero, outlined otherwise.
         What a mark that is not a circle, a line or a box is drawn with."""
         if len(points) < 2:
@@ -172,6 +173,10 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.append(28.0)
             case ModOp.Mark(start, end, color):
                 ops.extend((29.0, float(start), float(end), float(color.argb())))
+            case ModOp.Tint(start, end, color):
+                ops.extend((30.0, float(start), float(end), float(color.argb())))
+            case ModOp.Rule(side, width, color):
+                ops.extend((31.0, float(side_code(side)), width.value, float(color.argb())))
     return ops
 
 
@@ -179,6 +184,18 @@ private def encode_style(style: object) -> (float, float, int):
     s = style cast! TextStyle
     flags = (1 if s.bold else 0) | (2 if s.mono else 0) | (4 if s.nowrap else 0)
     return (s.size.value, float(s.color.argb()), flags)
+
+
+private def side_code(side: Side) -> int:
+    match side:
+        case Side.Leading:
+            return 0
+        case Side.Top:
+            return 1
+        case Side.Trailing:
+            return 2
+        case Side.Bottom:
+            return 3
 
 
 private def alignment_code(alignment: Alignment) -> int:
@@ -380,6 +397,43 @@ def Canvas(modifier: Modifier = NONE, on_draw: DrawScope.() -> None) raises ...:
         on_draw(DrawScope(Size(recorder.width, recorder.height), recorder))
 
     rt.emit(R_CANVAS, flags, -1, intern_modifier(rt, modifier), rt.handler(draw), 0, k, 0)
+
+
+frozen data class Picture:
+    """an image the core has decoded and is holding: what `Image` draws, how big it is in its
+    own pixels, and the core holding it — so it can be given back from anywhere, including a
+    scope being disposed of long after the frame that made it"""
+
+    id: int
+    width: int
+    height: int
+    # what gives the pixels back, so the core does not have to be found again later
+    release: () -> None
+
+
+def load_image(data: bytes) -> Picture raises ...:
+    """Decode a png and keep it in the core, which hands back what `Image` draws. Call it
+    once — from `remember` or a `disposable_effect`, say — rather than every frame: the
+    decoding is not free, and the core holds the pixels until `forget_image`."""
+    rt = composing()
+    id, width, height = rt.core.load_image(data)
+    let core = rt.core
+    return Picture(id, width, height, lambda: core.drop_image(id))
+
+
+def forget_image(picture: Picture):
+    """Give an image's pixels back. Safe from anywhere, which is what a scope leaving the
+    composition needs — by then there is no composition to ask for the core."""
+    picture.release()
+
+
+@builder
+def Image(picture: Picture, modifier: Modifier = NONE) raises ...:
+    """An image, as big as it is, scaled down to fit what it is given and keeping its shape.
+    `picture` comes from `load_image`."""
+    rt = composing()
+    flags, k = key_flags(rt)
+    rt.emit(R_IMAGE, flags, -1, intern_modifier(rt, modifier), -1, picture.id, k, 0)
 
 
 @builder

@@ -16,6 +16,7 @@ pub enum Kind {
     Checkbox,
     Spacer,
     Canvas,
+    Image,
     Layout,
     Scroll,
     Popup,
@@ -38,6 +39,7 @@ impl Kind {
             9 => Kind::Checkbox,
             10 => Kind::Spacer,
             11 => Kind::Canvas,
+            15 => Kind::Image,
             12 => Kind::Layout,
             13 => Kind::Scroll,
             14 => Kind::Popup,
@@ -65,6 +67,7 @@ impl Kind {
             Kind::Checkbox => "Checkbox",
             Kind::Spacer => "Spacer",
             Kind::Canvas => "Canvas",
+            Kind::Image => "Image",
             Kind::Layout => "Layout",
             Kind::Scroll => "Scroll",
             Kind::Popup => "Popup",
@@ -272,6 +275,9 @@ pub enum ModOp {
     /// A handler told when a press lands inside this node, so a key can mean one thing in
     /// one part of a window and something else in another.
     FocusRegion(i32),
+    /// A bar along one edge of this node — 0 leading, 1 top, 2 trailing, 3 bottom — inside
+    /// its rect. What a row that is selected, or a notice that is a warning, is marked with.
+    Rule { side: u8, width: f32, argb: u32 },
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -302,6 +308,9 @@ pub struct Modifier {
     /// Runs of this node's own text painted with a colour behind them, as byte offsets into
     /// it: what says *these* words of the line are the ones that changed.
     pub marks: Vec<(usize, usize, u32)>,
+    /// Runs of this node's own text drawn in a colour of their own, as byte offsets: what a
+    /// line of code coloured by what its words are is made of.
+    pub tints: Vec<(usize, usize, u32)>,
 }
 
 impl Modifier {
@@ -321,6 +330,7 @@ impl Modifier {
         let mut unselectable = false;
         let mut multiline = false;
         let mut marks: Vec<(usize, usize, u32)> = Vec::new();
+        let mut tints: Vec<(usize, usize, u32)> = Vec::new();
         while i < raw.len() {
             let op = raw[i];
             let take = |n: usize| -> Result<&[f64], String> {
@@ -496,6 +506,28 @@ impl Modifier {
                     }
                     i += 4;
                 }
+                x if x == 31.0 => {
+                    let a = take(3)?;
+                    let side = finite(a[0], "rule")?;
+                    if !(0.0..=3.0).contains(&side) || side.fract() != 0.0 {
+                        return Err(format!("rule side must be 0..=3, got {}", side));
+                    }
+                    ops.push(ModOp::Rule {
+                        side: side as u8,
+                        width: non_negative(a[1], "rule")?,
+                        argb: argb_from_f64(a[2])?,
+                    });
+                    i += 4;
+                }
+                x if x == 30.0 => {
+                    let a = take(3)?;
+                    let from = non_negative(a[0], "tint")? as usize;
+                    let to = non_negative(a[1], "tint")? as usize;
+                    if to > from {
+                        tints.push((from, to, argb_from_f64(a[2])?));
+                    }
+                    i += 4;
+                }
                 x if x == 21.0 => {
                     let a = take(1)?;
                     let kind = finite(a[0], "cursor")?;
@@ -509,7 +541,7 @@ impl Modifier {
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, pressed, scrollbar, reveal, clip, cursor, multiline, unselectable, gap, marks })
+        Ok(Modifier { ops, weight, align, hover, pressed, scrollbar, reveal, clip, cursor, multiline, unselectable, gap, marks, tints })
     }
 }
 
@@ -607,6 +639,8 @@ pub enum Layer {
     /// Told when the pointer is pressed anywhere but inside this rect. The press itself goes
     /// on to whatever it landed on, so a menu can close and the click still count.
     Dismiss { rect: Rect, handler: i32 },
+    /// A bar along one edge, inside the rect: 0 leading, 1 top, 2 trailing, 3 bottom.
+    Rule { rect: Rect, side: u8, width: f32, argb: u32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.

@@ -265,6 +265,25 @@ impl TextSystem {
         target_h: u32,
         clip: Option<(i32, i32, i32, i32)>,
     ) {
+        self.draw_tinted(key, origin, scale, argb, &[], target, target_w, target_h, clip)
+    }
+
+    /// The same, with runs of the text drawn in a colour of their own: `tints` are byte
+    /// ranges into the text, and a glyph inside one takes that colour instead of `argb`.
+    /// What a line of code coloured by what its words are is made of.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_tinted(
+        &mut self,
+        key: &TextKey,
+        origin: (f32, f32),
+        scale: f32,
+        argb: u32,
+        tints: &[(usize, usize, u32)],
+        target: &mut [u8],
+        target_w: u32,
+        target_h: u32,
+        clip: Option<(i32, i32, i32, i32)>,
+    ) {
         let epoch = self.epoch;
         let own = &mut self.own_fonts;
         let swash = &mut self.swash;
@@ -288,6 +307,12 @@ impl TextSystem {
         }
         for run in entry.buffer.layout_runs() {
             for glyph in run.glyphs {
+                // the colour of the run this glyph belongs to, if any: the first that covers
+                // where it started in the text
+                let (a, r, g, b) = match tints.iter().find(|(from, to, _)| glyph.start >= *from && glyph.start < *to) {
+                    Some(&(_, _, tint)) => crate::types::argb_channels(tint),
+                    None => (a, r, g, b),
+                };
                 // `physical` scales the glyph's own position but adds the offset as given, so
                 // the origin has to be handed over in physical pixels
                 let phys = glyph.physical((origin.0 * scale, (origin.1 + run.line_y) * scale), scale);

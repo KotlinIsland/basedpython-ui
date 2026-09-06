@@ -221,10 +221,49 @@ impl Painter {
         }
     }
 
+    /// An image, scaled into `r` and clipped: its own pixels, filtered as they are stretched
+    /// so a screenshot shrunk to fit does not come out speckled.
+    fn draw_image(&mut self, image: &crate::tree::Image, r: Rect, clip: &Rect) {
+        if image.width == 0 || image.height == 0 || !r.intersects(clip) {
+            return;
+        }
+        let Some(mut pixmap) = tiny_skia::Pixmap::new(image.width, image.height) else { return };
+        // tiny-skia paints premultiplied; the decoder hands back straight rgba
+        for (out, px) in pixmap.pixels_mut().iter_mut().zip(image.rgba.chunks_exact(4)) {
+            *out = tiny_skia::ColorU8::from_rgba(px[0], px[1], px[2], px[3]).premultiply();
+        }
+        let scale_x = (r.w * self.scale) / image.width as f32;
+        let scale_y = (r.h * self.scale) / image.height as f32;
+        let transform = Transform::from_row(scale_x, 0.0, 0.0, scale_y, r.x * self.scale, r.y * self.scale);
+        let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+        let mask = self.mask_for(clip);
+        match mask {
+            Some(i) => {
+                let (masks, target) = (&self.masks, &mut self.pixmap);
+                target.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, Some(&masks[i].1));
+            }
+            None => self.pixmap.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, None),
+        }
+    }
+
     fn draw_text(&mut self, inner: &mut Inner, key: &TextKey, origin: (f32, f32), argb: u32, clip: &Rect) {
         let px = self.clip_px(clip);
         let (w, h) = (self.pixmap.width(), self.pixmap.height());
         inner.text.draw(key, origin, self.scale, argb, self.pixmap.data_mut(), w, h, Some(px));
+    }
+
+    fn draw_tinted_text(
+        &mut self,
+        inner: &mut Inner,
+        key: &TextKey,
+        origin: (f32, f32),
+        argb: u32,
+        tints: &[(usize, usize, u32)],
+        clip: &Rect,
+    ) {
+        let px = self.clip_px(clip);
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        inner.text.draw_tinted(key, origin, self.scale, argb, tints, self.pixmap.data_mut(), w, h, Some(px));
     }
 }
 
@@ -299,6 +338,18 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             Some(Layer::Shadow { rect, corners, elevation, argb }) => painter.shadow(rect.translated(abs.x, abs.y), corners, elevation, argb, &own_clip),
             Some(Layer::Background { rect, argb, corners }) => painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip),
             Some(Layer::Border { rect, argb, width, corners }) => painter.stroke_rect(rect.translated(abs.x, abs.y), argb, width, corners, &own_clip),
+            Some(Layer::Rule { rect, side, width, argb }) => {
+                let r = rect.translated(abs.x, abs.y);
+                let w = width.min(r.w);
+                let h = width.min(r.h);
+                let bar = match side {
+                    0 => Rect::new(r.x, r.y, w, r.h),
+                    1 => Rect::new(r.x, r.y, r.w, h),
+                    2 => Rect::new(r.x + r.w - w, r.y, w, r.h),
+                    _ => Rect::new(r.x, r.y + r.h - h, r.w, h),
+                };
+                painter.fill_rect(bar, argb, Corners::NONE, &own_clip);
+            }
             Some(Layer::Click { rect, pressed: Some(argb), corners, .. }) if inner.pressed_node == Some(id) => {
                 painter.fill_rect(rect.translated(abs.x, abs.y), argb, corners, &own_clip)
             }
@@ -329,7 +380,12 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                         painter.fill_rect(rect.translated(content.x, content.y), selection.argb, Corners::NONE, &text_clip);
                     }
                 }
-                painter.draw_text(inner, &key, (content.x, content.y), argb, &text_clip);
+                let tints = inner.nodes[id].modifier.tints.clone();
+                if tints.is_empty() {
+                    painter.draw_text(inner, &key, (content.x, content.y), argb, &text_clip);
+                } else {
+                    painter.draw_tinted_text(inner, &key, (content.x, content.y), argb, &tints, &text_clip);
+                }
             }
         }
         Kind::Button => {
@@ -474,6 +530,12 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             } else {
                 painter.fill_rect(b, fill, Corners::uniform(4.0), &own_clip);
                 painter.stroke_rect(b, line, 1.0, Corners::uniform(4.0), &own_clip);
+            }
+        }
+        Kind::Image => {
+            let key = inner.nodes[id].a;
+            if let Some(image) = inner.images.get(&key) {
+                painter.draw_image(image, content, &own_clip);
             }
         }
         Kind::Canvas => {

@@ -368,6 +368,11 @@ fn validate(
                                 bad!("record {}: popup position ({}, {}) is out of range", i, r.a, r.c);
                             }
                         }
+                        Kind::Image => {
+                            if !inner.images.contains_key(&r.a) {
+                                bad!("record {}: no image {} — load_image hands back the id to draw", i, r.a);
+                            }
+                        }
                         Kind::Spacer | Kind::Canvas | Kind::Scope => {}
                     }
                     if kind.has_children() {

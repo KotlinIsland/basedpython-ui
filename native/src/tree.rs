@@ -264,6 +264,13 @@ pub fn approach(current: f32, target: f32, dt: f32, rate: f32) -> f32 {
 }
 
 /// Everything the core retains. Owned by the Python `Core` object (behind a mutex).
+/// One decoded image: straight rgba, its own size in pixels.
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 pub struct Inner {
     pub nodes: SlotMap<NodeId, Node>,
     pub root: NodeId,
@@ -281,6 +288,10 @@ pub struct Inner {
     pub focus: Option<Focus>,
     /// Canvas nodes whose draw block must run again (flag `canvas_pending` on the node too).
     pub canvas_pending: Vec<NodeId>,
+    /// Decoded images by the id `load_image` handed back, kept until the core goes: an image
+    /// is shown again every frame, and decoding it every frame is not free.
+    pub images: HashMap<i32, Image>,
+    pub next_image: i32,
     /// Popups, in creation order: laid out against the window, painted last, hit first.
     pub popups: Vec<NodeId>,
     /// Nodes whose modifier gained `reveal` this commit: layout scrolls them into view.
@@ -373,6 +384,8 @@ impl Inner {
             pixmap: None,
             focus: None,
             canvas_pending: Vec::new(),
+            images: HashMap::new(),
+            next_image: 1,
             popups: Vec::new(),
             reveal_pending: Vec::new(),
             hover_node: None,

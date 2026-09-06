@@ -27,6 +27,13 @@ let DEFAULT_TEXT_STYLE = TextStyle()
 let SHADOW_COLOR = Color(0, 0, 0, 40)
 
 
+enum class Side:
+    """which edge of a node something is drawn along. `Leading` is the left in the layouts
+    this framework has, and is named for what it means rather than for where it is"""
+
+    case Leading, Top, Trailing, Bottom
+
+
 enum class CursorShape:
     """What the pointer looks like: the platform's own arrow, the hand it shows over
     something to click, the bar it shows over text, the arrow it shows over a column edge
@@ -98,6 +105,10 @@ enum class ModOp:
     case Unselectable
     # a run of this node's own text painted with a colour behind it
     case Mark(start: int, end: int, color: Color)
+    # a run of this node's own text drawn in a colour of its own
+    case Tint(start: int, end: int, color: Color)
+    # a bar along one edge of this node, inside its rect
+    case Rule(side: Side, width: Dp, color: Color)
 
 
 frozen data class Modifier:
@@ -221,6 +232,18 @@ frozen data class Modifier:
         with it. A line of a diff is one text node so that a sweep of the pointer copies it
         as a line; this is how the words inside it that changed can still be picked out."""
         return self.then(ModOp.Mark(start, end, color))
+
+    def rule(self, side: Side, width: Dp, color: Color) -> Modifier:
+        """A bar along one edge of this node, painted inside its rect. What a row that is
+        selected, a notice that is a warning, or a diff line that changed is marked with —
+        without a spacer of its own inside every row of the list."""
+        return self.then(ModOp.Rule(side, width, color))
+
+    def tint(self, start: int, end: int, color: Color) -> Modifier:
+        """Draws the bytes `start..end` of this node's own `Text` in `color` rather than in
+        the style's. A line of code is one text node — so a sweep of the pointer copies it as
+        a line — and this is how the words inside it can be coloured for what they are."""
+        return self.then(ModOp.Tint(start, end, color))
 
     def multiline(self) -> Modifier:
         """A `TextField` that takes more than one line: it wraps inside the width it is

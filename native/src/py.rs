@@ -567,6 +567,65 @@ impl Core {
         self.with_state(true, |inner| Ok(input::take_events(inner).iter().map(|e| e.tuple()).collect()))
     }
 
+    /// Decode a png and keep it: hands back the id an `IMAGE` record draws, and its size in
+    /// pixels. The core holds it until `drop_image`, because an image is drawn every frame
+    /// and decoding it every frame is not free.
+    fn load_image(&self, data: &[u8]) -> PyResult<(i32, u32, u32)> {
+        let decoder = png::Decoder::new(std::io::Cursor::new(data));
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| PyValueError::new_err(format!("not a readable png: {}", e)))?;
+        let mut buffer = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+        let info = reader
+            .next_frame(&mut buffer)
+            .map_err(|e| PyValueError::new_err(format!("the png could not be decoded: {}", e)))?;
+        buffer.truncate(info.buffer_size());
+        let rgba = match (info.color_type, info.bit_depth) {
+            (png::ColorType::Rgba, png::BitDepth::Eight) => buffer,
+            (png::ColorType::Rgb, png::BitDepth::Eight) => {
+                let mut out = Vec::with_capacity(buffer.len() / 3 * 4);
+                for px in buffer.chunks_exact(3) {
+                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                out
+            }
+            (png::ColorType::Grayscale, png::BitDepth::Eight) => {
+                let mut out = Vec::with_capacity(buffer.len() * 4);
+                for &v in buffer.iter() {
+                    out.extend_from_slice(&[v, v, v, 255]);
+                }
+                out
+            }
+            (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
+                let mut out = Vec::with_capacity(buffer.len() * 2);
+                for px in buffer.chunks_exact(2) {
+                    out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+                }
+                out
+            }
+            (colour, depth) => {
+                return Err(PyValueError::new_err(format!(
+                    "an 8-bit png is what this reads, not {:?} at {:?}",
+                    colour, depth
+                )))
+            }
+        };
+        self.with_state(true, |inner| {
+            let id = inner.next_image;
+            inner.next_image += 1;
+            inner.images.insert(id, crate::tree::Image { width: info.width, height: info.height, rgba });
+            Ok((id, info.width, info.height))
+        })
+    }
+
+    /// Forget an image loaded with `load_image`.
+    fn drop_image(&self, id: i32) -> PyResult<()> {
+        self.with_state(true, |inner| {
+            inner.images.remove(&id);
+            Ok(())
+        })
+    }
+
     /// What the pointer has selected in a `selectable` node, one text per line, or "".
     fn selected_text(&self) -> PyResult<String> {
         self.with_state(false, |inner| Ok(input::selected_text(inner)))

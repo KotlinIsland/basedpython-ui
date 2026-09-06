@@ -71,6 +71,7 @@ let R_CANVAS = 11
 let R_LAYOUT = 12
 let R_SCROLL = 13
 let R_POPUP = 14
+let R_IMAGE = 15
 
 let FLAG_KEYED = 1
 let FLAG_STR_KEY = 2
@@ -188,6 +189,7 @@ private def user_frame(depth: int) -> types.FrameType:
     over the lazy-import proxy's `__call__`: a name bound by `from m import x`
     in generated code calls through that proxy, and a site must always be
     in the code that wrote the call, never in the proxy."""
+
     frame = _getframe(depth + 1)
     while frame.f_code.co_qualname == _PROXY_CALL:
         back = frame.f_back
@@ -1300,15 +1302,17 @@ protocol NativeCore:
     def dump(self) -> str
     def node_count(self) -> int
     def scroll(self, x: float, y: float, dy: float, dx: float = 0.0) -> bool
-    def scroll_offset_x(self, node_id: int) -> float | None
+    def scroll_offset_x(self, node_id: int) -> float?
     def hovered_handler(self) -> int
-    def first_scroll(self) -> tuple[int, float, float, float] | None
+    def first_scroll(self) -> (int, float, float, float)?
     def resize(self, width: float, height: float, scale: float)
-    def take_events(self) -> list[tuple[int, float, float, int, str]]
+    def take_events(self) -> list[(int, float, float, int, str)]
     def hover_target(self) -> int
     def cursor_at(self, x: float, y: float) -> int
     def selected_text(self) -> str
     def clear_selection(self)
+    def load_image(self, data: bytes) -> (int, int, int)
+    def drop_image(self, id: int)
 
 
 final class Runtime:
@@ -1346,7 +1350,7 @@ final class Runtime:
         self.ran: list[Scope] = []
         self.posted: deque[() -> None] = deque()
         self.event_modifiers: str = ""
-        self.event_position: tuple[float, float] = (0.0, 0.0)
+        self.event_position: (float, float) = (0.0, 0.0)
         self.ui_thread: int = threading.get_ident()
         self.on_error: (BaseException, str) -> None = on_error if on_error is not None else default_on_error
         self.recompositions: dict[str, int] = {}
@@ -1386,6 +1390,15 @@ final class Runtime:
         de-duplication, so a handler that writes three cells produces three
         causes on one run; no cause means a manual invalidation."""
         target = scope.restart
+        # a scope the core has never seen has no group of its own to replace: what it emitted
+        # is still inside the records of the parent that made it, so that parent is what has
+        # to run again. without this, a scope invalidated in the same frame it was created in
+        # is offered to the core as a range over a group that does not exist yet
+        while not target.committed:
+            parent = target.parent
+            if parent is None:
+                break
+            target = parent.restart
         if not target.alive:
             return
         if self.trace is not None:
@@ -1473,7 +1486,7 @@ final class Runtime:
         finally:
             _dispatching = previous
 
-    def dispatch(self, handler_idx: int, payload: object, modifiers: str = "", position: tuple[float, float] = (0.0, 0.0)):
+    def dispatch(self, handler_idx: int, payload: object, modifiers: str = "", position: (float, float) = (0.0, 0.0)):
         """Run an input handler from the handler table (a click, a text change), with the
         event's modifier keys and pointer position readable through `input_modifiers()` and
         `input_position()` while it runs. A handler that raises is reported through

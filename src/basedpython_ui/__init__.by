@@ -1,7 +1,7 @@
 """basedpython-ui: a compose / swiftui / flutter inspired ui framework."""
 
 from .geometry export Dp, Size, Offset, Rect, Constraints, Color, ZERO_DP, ONE_DP, BLACK, WHITE, TRANSPARENT
-from .modifier export Modifier, ModOp, Alignment, Arrangement, CursorShape, TextStyle, NONE, DEFAULT_TEXT_STYLE, SHADOW_COLOR
+from .modifier export Modifier, ModOp, Alignment, Arrangement, CursorShape, Side, TextStyle, NONE, DEFAULT_TEXT_STYLE, SHADOW_COLOR
 from .runtime export (
     State,
     StateList,
@@ -53,6 +53,10 @@ from .widgets export (
     Scroll,
     Popup,
     Canvas,
+    Image,
+    Picture,
+    load_image,
+    forget_image,
     Layout,
 )
 from .lazy export LazyColumn

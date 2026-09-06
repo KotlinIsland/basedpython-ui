@@ -5,7 +5,7 @@ from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
     chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
-    State, LazyColumn,
+    State, LazyColumn, Image, load_image, remember, Side,
 )
 import time
 
@@ -167,7 +167,6 @@ def test_compose_test_without_tracing():
     t.advance()
     assert t.find_text("count = 2"), t.dump()
     assert t.why(Counter) == () and t.runtime.trace is None
-
 
 @composable
 def Rows():
@@ -381,7 +380,7 @@ let PLAIN = Color(255, 255, 255)
 
 
 @composable
-def Bubble(rows: tuple[str, ...], selected: tuple[str, ...]):
+def Bubble(rows: (*: str), selected: (*: str)):
     Column:
         keyed(rows).each_indexed(key=lambda name: name):
             let row = it
@@ -563,7 +562,7 @@ def test_a_text_field_takes_a_style_and_its_own_decoration():
     width, height = core.pixel_size()
     let pixels: bytes = core.pixels()
 
-    def at(x: int, y: int) -> tuple[int, int, int]:
+    def at(x: int, y: int) -> (int, int, int):
         let offset = (y * width + x) * 4
         return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
 
@@ -758,14 +757,14 @@ def test_a_drag_says_what_it_was_let_go_on():
     let here = t.rect_of("here")
     let there = t.rect_of("there")
     _ = t.core.pointer(1, handle.0 + 5.0, handle.1 + 5.0)
-    t._deliver()
+    t.deliver()
     # a press that has not travelled is still a press: the drag starts once it moves
     _ = t.core.pointer(3, here.0 + 5.0, here.1 + 5.0)
-    t._deliver()
+    t.deliver()
     _ = t.core.pointer(3, there.0 + 5.0, there.1 + 5.0)
-    t._deliver()
+    t.deliver()
     _ = t.core.pointer(2, there.0 + 5.0, there.1 + 5.0)
-    t._deliver()
+    t.deliver()
     t.advance()
     assert said == ["here:over", "here:leave", "there:over", "there:drop"], said
     t.dispose()
@@ -787,7 +786,7 @@ def test_a_lazy_list_composes_only_the_rows_in_view():
 
     # scrolling down composes a different window of them, and the list is still a thousand tall
     _ = t.core.scroll(100.0, 50.0, 4000.0)
-    t._deliver()
+    t.deliver()
     t.advance()
     t.advance()
     let later = [line for line in t.all_text() if line.startswith("row ")]
@@ -808,9 +807,9 @@ def test_a_press_says_which_part_of_the_window_the_keyboard_belongs_to():
     def press_on(label: str):
         let box = t.rect_of(label)
         _ = t.core.pointer(1, box.0 + 5.0, box.1 + 5.0)
-        t._deliver()
+        t.deliver()
         _ = t.core.pointer(2, box.0 + 5.0, box.1 + 5.0)
-        t._deliver()
+        t.deliver()
 
     press_on("left")
     t.advance()
@@ -835,7 +834,7 @@ def test_a_canvas_draws_an_arbitrary_shape():
     width, height = core.pixel_size()
     let pixels: bytes = core.pixels()
 
-    def at(x: int, y: int) -> tuple[int, int, int]:
+    def at(x: int, y: int) -> (int, int, int):
         let offset = (y * width + x) * 4
         return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
 
@@ -892,7 +891,7 @@ def test_a_run_of_a_line_can_be_painted_behind_without_splitting_it_up():
     width, height = core.pixel_size()
     let pixels: bytes = core.pixels()
 
-    def at(x: int, y: int) -> tuple[int, int, int]:
+    def at(x: int, y: int) -> (int, int, int):
         let offset = (y * width + x) * 4
         return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
 
@@ -903,4 +902,159 @@ def test_a_run_of_a_line_can_be_painted_behind_without_splitting_it_up():
     assert at(int(line.0 + line.2 * 0.75), middle)[0] == 255
     assert at(int(line.0 + line.2 * 0.75), middle)[1] == 0
     assert at(int(line.0 + line.2 * 0.25), middle)[1] == 255, "the untouched half is still white"
+    t.dispose()
+
+
+@composable
+def Labelled(text: str):
+    Text(text, Modifier())
+
+
+def test_a_scope_invalidated_before_it_was_ever_committed_restarts_its_parent():
+    """a scope the core has not seen yet has no group of its own to replace: what it emitted
+    is still inside its parent's records. offering the core a range over it — which is what
+    invalidating it in the frame that made it used to do — is a commit it cannot apply"""
+    let t = compose_test(width=200, height=100):
+        Column(Modifier().fill_max_size()):
+            Labelled("here")
+    let root = t.runtime.root
+    assert root is not None
+    # the text's own scope, made and committed by the frame above
+    let scopes = [scope for scope in t.runtime.scopes.values() if scope.id != 0]
+    assert scopes, "the root made at least one scope"
+    let child = scopes[-1]
+    assert child.committed, "which the core has seen"
+    # one that has not been committed is not asked to run on its own: its parent is
+    child.committed = False
+    child.dirty = False
+    t.runtime.invalidate(child)
+    assert not child.dirty, "the child was not queued"
+    let up = child.parent
+    assert up is not None and (up.dirty or up.parent is None), "its parent was, instead"
+    t.dispose()
+
+
+def test_a_run_of_a_line_can_be_drawn_in_a_colour_of_its_own():
+    """syntax colouring inside one text node: the line stays one node, so a sweep of the
+    pointer still copies it as a line"""
+    let t = compose_test(width=300, height=80):
+        Column(Modifier().fill_max_size().background(Color(255, 255, 255))):
+            Text(
+                "aaaaaaaaaabbbbbbbbbb",
+                Modifier().tint(10, 20, Color(220, 0, 0)),
+                style=TextStyle(Dp(13.0), Color(0, 0, 0), False, True),
+            )
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+    let line = t.rect_of("aaaaaaaaaabbbbbbbbbb")
+
+    def reddest(from_x: float, to_x: float) -> (int, int, int):
+        """the most coloured pixel of the glyphs in that stretch of the line"""
+        best = (255, 255, 255)
+        for x in range(int(line.0 + from_x), int(line.0 + to_x)):
+            for y in range(int(line.1), int(line.1 + line.3)):
+                let offset = (y * width + x) * 4
+                let pixel = (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+                if pixel[0] - pixel[2] > best[0] - best[2]:
+                    best = pixel
+        return best
+
+    let coloured = reddest(line.2 / 2.0, line.2)
+    let plain = reddest(0.0, line.2 / 2.0)
+    assert coloured[0] - coloured[2] > 60, f"the tinted half is red: {coloured}"
+    assert plain[0] - plain[2] < 10, f"and the other half is not: {plain}"
+    t.dispose()
+
+
+def _png(width: int, height: int, pixel: (int, int, int)) -> bytes:
+    """a png of one colour, written by hand: the tests draw one rather than carry a file"""
+    import struct
+    import zlib
+
+    raw = bytearray()
+    for _ in range(height):
+        raw.append(0)
+        for _ in range(width):
+            raw.extend((pixel[0], pixel[1], pixel[2], 255))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_an_image_is_drawn_at_its_own_shape_inside_what_it_is_given():
+    """a png the core decodes once and draws every frame: as big as it is, scaled down to fit,
+    and never stretched — an image squeezed into a box is a lie about the file"""
+    let data = _png(40, 20, (200, 30, 30))
+    let t = compose_test(width=200, height=120):
+        Column(Modifier().fill_max_size().background(Color(255, 255, 255))):
+            let picture = remember(lambda: load_image(data))
+            Image(picture, Modifier())
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> (int, int, int):
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    # its own forty by twenty, since the window has room for it
+    assert at(4, 4)[0] > 150 and at(4, 4)[1] < 90, f"the image is painted: {at(4, 4)}"
+    assert at(4, 30) == (255, 255, 255), "and stops where it ends"
+    assert at(60, 4) == (255, 255, 255)
+    t.dispose()
+
+
+def test_an_image_larger_than_its_room_is_scaled_down_and_keeps_its_shape():
+    let data = _png(400, 200, (30, 160, 60))
+    let t = compose_test(width=100, height=100):
+        Column(Modifier().fill_max_size().background(Color(255, 255, 255))):
+            let picture = remember(lambda: load_image(data))
+            Image(picture, Modifier())
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> (int, int, int):
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    # a hundred wide and, keeping two-to-one, fifty tall
+    assert at(50, 25)[1] > 120, f"the middle of it: {at(50, 25)}"
+    assert at(50, 70) == (255, 255, 255), "and nothing below where it ends"
+    t.dispose()
+
+
+def test_a_bar_along_one_edge_is_the_nodes_own():
+    """what a selected row is marked with, without a spacer of its own inside every row"""
+    let t = compose_test(width=200, height=60):
+        Column(Modifier().fill_max_size().background(Color(255, 255, 255))):
+            Text(
+                "marked",
+                Modifier().fill_max_width().height(Dp(30.0)).rule(Side.Leading, Dp(4.0), Color(0, 120, 255)),
+            )
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> (int, int, int):
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    assert at(1, 15) == (0, 120, 255), f"the bar is on the leading edge: {at(1, 15)}"
+    assert at(3, 15) == (0, 120, 255), "four wide"
+    assert at(6, 15) == (255, 255, 255), "and no wider"
+    assert at(1, 45) == (255, 255, 255), "and only as tall as the node"
     t.dispose()
