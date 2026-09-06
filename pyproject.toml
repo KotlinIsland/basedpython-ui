@@ -11,6 +11,16 @@ dependencies = []
 
 [dependency-groups]
 dev = ["pytest>=8", "maturin>=1.15,<2"]
+docs = [
+    "zensical",
+    # the pygments lexer that highlights `by` code blocks in the docs
+    "basedpython-pygments",
+]
+
+[tool.uv.sources]
+# the sibling basedpython checkout on this machine; a git source or a published
+# wheel replaces this before a ci job can build the docs with `by` highlighting
+basedpython-pygments = { path = "../basedpython/python/basedpython-pygments" }
 
 [tool.basedpython.run]
 main = "examples.counter"

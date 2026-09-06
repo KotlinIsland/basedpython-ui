@@ -1,0 +1,41 @@
+/* basedpython-ui documentation theme
+ *
+ * the theme this builds on is already what we want, so everything here is
+ * something the theme has no concept of: the inlay-hint notation the guide
+ * writes into `by` fences, and cards used as a link index
+ */
+
+/* --- cards ------------------------------------------------------------- */
+
+/* the theme colours a card's leading icon like body text; an accent makes a
+   grid of them scannable */
+.md-typeset .grid.cards > ul > li > p:first-child .twemoji {
+  color: var(--md-accent-fg-color);
+}
+
+/* a card's heading is also its link. underlining it makes a grid of cards
+   read as a list of links rather than as a set of headings */
+.md-typeset .grid.cards > ul > li > p:first-child > strong > a {
+  color: var(--md-default-fg-color);
+  text-decoration: none;
+}
+
+.md-typeset .grid.cards > ul > li:hover > p:first-child > strong > a {
+  color: var(--md-accent-fg-color);
+}
+
+/* --- inlay hints -------------------------------------------------------- */
+
+/* the docs write what an editor renders — `⟨ reads count⟩` on a composable's
+ * header, `⟨ invalidates Counter⟩` after a state write — between angle
+ * brackets. the `by` lexer gives that its own token (`Comment.Special`, class
+ * `cs`) so it can look like the hint it stands for, and not like source.
+ * `.err` is here for the same notation in a fence no lexer knows */
+.md-typeset .highlight .cs,
+.md-typeset .highlight .err {
+  background-color: var(--md-default-fg-color--lightest);
+  border-radius: 0.2rem;
+  color: var(--md-default-fg-color--light);
+  font-style: normal;
+  padding: 0 0.2em;
+}

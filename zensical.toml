@@ -1,0 +1,78 @@
+[project]
+site_name = "basedpython-ui"
+site_description = "a compose / swiftui / flutter inspired ui framework for basedpython"
+site_author = "Morgan Bartholomew"
+# placeholders: this checkout has no remote yet. replace both with the eventual
+# repository's pages url and clone url in one edit, and `README.md` follows
+site_url = "https://kotlinisland.github.io/basedpython-ui/"
+docs_dir = "docs"
+repo_url = "https://github.com/KotlinIsland/basedpython-ui"
+repo_name = "KotlinIsland/basedpython-ui"
+edit_uri = "edit/main/docs"
+extra_css = ["stylesheets/extra.css"]
+
+[project.theme]
+features = [
+    # a click swaps the page in place instead of reloading the whole document,
+    # and a hovered link is fetched before the click lands
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.instant.progress",
+    "navigation.tracking",
+    "navigation.path",
+    "navigation.indexes",
+    "navigation.footer",
+    "navigation.top",
+    "toc.follow",
+    "content.code.copy",
+    "content.code.annotate",
+    "content.tabs.link",
+    "content.action.edit",
+    "search.highlight",
+]
+
+[project.theme.icon]
+logo = "lucide/layout-dashboard"
+repo = "fontawesome/brands/github"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "black"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "black"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/KotlinIsland/basedpython-ui"
+name = "basedpython-ui on GitHub"
+
+[[project.nav]]
+basedpython-ui = "index.md"
+
+[[project.nav]]
+guide = [
+    "guide/index.md",
+    { "state and mutation safety" = "guide/state.md" },
+    { "the compiler's rules" = "guide/lints.md" },
+    { "inlay hints" = "guide/inlay-hints.md" },
+    { "why did this rerender" = "guide/why-did-this-rerender.md" },
+    { "the debugger" = "guide/debugger.md" },
+    { "testing" = "guide/testing.md" },
+]
+
+[[project.nav]]
+development = [
+    "development/design.md",
+    "development/native-protocol.md",
+    "development/trace-protocol.md",
+]

@@ -1,5 +1,7 @@
 # basedpython-ui — design
 
+*the user-facing parts of this document are carried by the guide — [state and mutation safety](../guide/state.md) for §3 and §4, [the compiler's rules](../guide/lints.md) for §4.3 and what used to be `docs/lints.md`, [inlay hints](../guide/inlay-hints.md) for §5, [testing](../guide/testing.md) for the headless test of §2 — and this page is kept as it was written*
+
 *status: design settled 2026-09-02; the api surface in `src/basedpython_ui/` and every example in
 `examples/` type-check with the real compiler and execute through the skeleton runtime. this
 document records what was decided, why, and what remains to build.*
@@ -377,7 +379,9 @@ loop capturing the loop variable; a missing `context` argument.
   `set`, `bytearray`, non-frozen dataclasses) — the defence for `.py` callers and `dynamic` values
   the lints cannot see
 - slot kind/order mismatch on recomposition raises with the composable's path
-- writes from a thread other than the ui thread are posted, never applied in place
+- writes from a thread other than the ui thread are posted, never applied in place — including a
+  write made while the ui thread is composing, which is posted rather than refused (the worker
+  cannot know the phase; the ui thread refuses only its own writes during composition)
 - a `Derived` that reads itself raises
 - a user exception during composition discards that scope's output, keeps the previously committed
   subtree, reports through `on_error`, and never touches the retained tree
@@ -404,6 +408,17 @@ loop capturing the loop variable; a missing `context` argument.
   `raises` inference (`exceptions.rs`), with the same cheap negative path
 - **per `derived`**: `depends on` over the lambda body
 - **per parameter**: `stable` / `unstable`
+- **per state write** (F11): `invalidates` — the inverse of `reads`, at every observable write that
+  runs after composition (a handler block, an `on_x=lambda`, a nested def, an effect block): the
+  composables and derived computations whose composition depends on the place written, or
+  `invalidates nothing` when no reader exists. computed hint-only (never from the lint walk) in
+  `state_invalidations.rs`: the owner's own-scope reads (plain callees followed, composable callees
+  stopped at, so a child that reads its parameter is named instead of the parent that forwards it;
+  a child that takes a content block is inline and names its parent too), nested composables
+  capturing the slot, composable callees handed the place one hop at a time, `derived` bindings
+  whose lambda reads it and their readers, `root` for a `run_app` / `compose_test` / `set_root`
+  block, an alias followed one binding deep, and a same-file sweep for module-level and
+  parameter-rooted places, which always end in `…` because a reader in another file cannot be seen
 
 rendering, in the harness's `[..]` notation — the first three lines are the fork's actual output on
 `examples/counter.by`, `todo.by` and `form.by` (snapshot tests `basedpython_ui_*_example` in
@@ -419,13 +434,26 @@ def TodoList([unstable ]items: list[str])[ reads items]:
 def opaque(cell: State[int], thing: dynamic) -> int[ reads cell, …]:
 ```
 
-settings: `inlayHints.inferredReads`, `inlayHints.parameterStability`, `inlayHints.derivedDependencies`
-(all on by default); the pycharm plugin classifies them by the prefixes `reads `, `unstable`,
-`depends on `.
+the write side, from the same snapshots (`basedpython_invalidations` and the counter example):
+
+```
+            Button("+"):
+                count.value += step[ invalidates Counter]
+            count.value += step[ invalidates Child, Display, Counter, total]
+        Button("reset", on_click=lambda: count.set(0))[ invalidates Child, Display, Counter, total]
+            unread.set(1)[ invalidates nothing]
+    Button("click", on_click=lambda: CLICKS.set(1))[ invalidates Themed, Other, …]
+```
+
+settings: `inlayHints.inferredReads`, `inlayHints.parameterStability`, `inlayHints.derivedDependencies`,
+`inlayHints.inferredInvalidations` (all on by default); the pycharm plugin classifies them by the
+prefixes `reads `, `unstable`, `depends on `, `invalidates `.
 
 each name is a label part that navigates to its declaration. the static set is a superset
 approximation used only for hints and lints; invalidation always uses the exact runtime read set,
-so imprecision can never cause a missed re-render. opaque callees add `…` to the hint.
+so imprecision can never cause a missed re-render. opaque callees add `…` to the hint. the
+`invalidates` set inherits the same property in the other direction: it may name a scope that the
+runtime, with its exact read set, does not re-run, and the trace (§6.7) is the exact answer.
 
 ## 6. runtime architecture
 
@@ -510,6 +538,24 @@ per frame and touches no user object: arenas, reconciliation, layout, text, pain
 test, window, timers. the boundary carries ints, floats and strings only, once per frame in each
 direction.
 
+### 6.7 the trace: why a scope ran
+
+the runtime keeps a bounded ring of records — one per scope run (its origin and every cause: a
+state write with old and new value and the writer's site and thread, a derived recompute, an
+argument that differed, an inline restart, a recovery), one per state write, one per frame, one
+per error and per refused write — as exact-builtin tuples whose layout is
+[the trace protocol](trace-protocol.md) (`TRACE_FORMAT`). causes are threaded from the public
+mutator through `changed(cause)` → `on_dep_changed(cell, cause)` → `invalidate(scope, cause)` and
+recorded *before* the dirty de-duplication, so one run carries every write that caused it. every
+append is announced with `sys.audit("basedpython_ui.trace", record)`; `bpd` hooks that natively
+and forwards records while a client watches through a bounded queue that never blocks the ui
+thread, and reads the ring off `live_runtimes` at a stop through storage alone. in process,
+`Runtime.explain()` renders the ring and `TestComposition.why(fn)` returns the records of one
+composable, matched by identity, with locations mapped to `.by` lines through `_by_sourcemap` when
+its digests still match. tracing is on by default; `trace=False` costs one attribute test per run
+and per write. the user-facing account is the guide page `docs/guide/why-did-this-rerender.md`; the
+debugger and editor surfaces are `docs/guide/debugger.md`
+
 ## 7. performance
 
 measured on this machine (apple silicon, cpython 3.14.7) during design:
@@ -533,6 +579,21 @@ off), after binding hot names eagerly and caching interned styles by identity:
 |---|---|---|---|
 | 10k nodes in 100 scopes | 1.4 µs / node | 0.72 µs / node | ~1.5 µs |
 | one scope per leaf node | 3.2 µs / node | 2.7 µs / node | ~1.5 µs |
+
+the trace (§6.7) is on by default; measured in the same bench with tracing on and off, each mode in
+its own process, two runs each, before the machine was loaded by other builds:
+
+| shape | tracing | first composition | recompose everything | skip an unchanged child scope |
+|---|---|---|---|---|
+| 10k nodes in 100 scopes | off | 1.32–1.37 µs / node | 0.71–0.75 µs / node | ~1.8 µs |
+| 10k nodes in 100 scopes | on | 1.21–1.27 µs / node | 0.73–0.78 µs / node | ~1.8–2.1 µs |
+| one scope per leaf node | off | 4.0–4.1 µs / node | 3.2–3.4 µs / node | ~12–16 µs (dominated by the per-frame scope loop) |
+| one scope per leaf node | on | 5.3–5.4 µs / node | 3.9–4.1 µs / node | ~12–14 µs |
+
+so a scope pays roughly 0.7 µs per run for its record (two `perf_counter_ns` calls, the 15-slot
+tuple, the ring append, one `sys.audit`), which is noise for scopes of tens of nodes and +20–30 % for
+the pathological one-scope-per-leaf shape; an app with thousands of one-node scopes can pass
+`run_app(trace=False)`. the cProfile top twelve with tracing off contains no trace function.
 
 the default runtime soundness wrappers (`_soundness_iter`, `_soundness_parametric`, … — see
 `by build --soundness`) cost about 30 % on composition (0.77 µs against 0.60 µs per node on a full
@@ -582,6 +643,8 @@ recognition and guarantees (in order):
 | F7 | optional sugar: `composable def` modifier keyword lowered to `@composable` | 1 d |
 | F8 | later: interprocedural `mutates` fact for `silent-mutation` across files (message quality only: the read side is closed by F10) | 5 d |
 | F9 | lazy-import proxies rebind the importing module's global on first resolution (removes a python call per use of every imported name; measured as the largest single cost in the emitter) | 1 d |
+| F11 | *done* — the `Invalidates` inlay hint (`inferredInvalidations`): at every observable write that runs after composition, ` invalidates Counter, total` or ` invalidates nothing`, the inverse of the read set computed by hint-only salsa queries in `state_invalidations.rs` (owner, inline children and their parent, nested composables, composable callees handed the place, derived transitivity, aliases one binding deep, same-file sweep with `…`); `open_window` dead code removed | 2 d |
+| F12 | *done* — the transpiler's line map for hoisted trailing-lambda blocks (`by_transforms/src/source_map.rs`): a replacement remembers the runs it was assembled from (copied source, generated text with an anchor) and each output line is charged to the first copied text on it, else to the anchor of the generated text; before, every line of a hoisted block mapped to the block-owning statement's line, so a handler write, a traceback and a breakpoint inside a handler all landed on the wrong `.by` line | 1 d |
 | F10 | *done* — `unobservable-dependency`, the read-side rule of §4.2 (`composition.rs`, `Composition::read_timing`, `dependency_kind` over the place tables; `derived` / `remember` lambdas registered as standalone expressions by `ty_python_core/src/builder.rs`), the corrected `unstable-parameter` message, ten mdtest sections including the cross-file case | 2 d |
 
 nothing framework-specific is encoded in the fork beyond "these names are observables / this
