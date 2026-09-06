@@ -138,7 +138,7 @@ fn apply_reveals(inner: &mut Inner) {
     // a list that draws only what is in view is told where the view is, every time the tree
     // is laid out — the content it was measuring against may have changed under it
     let root = inner.root;
-    crate::input::announce_scroll(inner, root, 0.0, 0.0);
+    crate::input::announce_scroll(inner, root);
     let pending = std::mem::take(&mut inner.reveal_pending);
     let mut changed = false;
     for id in pending {

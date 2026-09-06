@@ -264,11 +264,12 @@ pub fn approach(current: f32, target: f32, dt: f32, rate: f32) -> f32 {
 }
 
 /// Everything the core retains. Owned by the Python `Core` object (behind a mutex).
-/// One decoded image: straight rgba, its own size in pixels.
+/// One decoded image, ready to draw: premultiplied at load, because it is drawn every
+/// frame and the conversion is the same every time.
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub pixmap: tiny_skia::Pixmap,
 }
 
 pub struct Inner {

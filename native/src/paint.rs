@@ -222,16 +222,13 @@ impl Painter {
     }
 
     /// An image, scaled into `r` and clipped: its own pixels, filtered as they are stretched
-    /// so a screenshot shrunk to fit does not come out speckled.
+    /// so a screenshot shrunk to fit does not come out speckled. The pixels were
+    /// premultiplied when the image was loaded, so a frame only scales and blits them.
     fn draw_image(&mut self, image: &crate::tree::Image, r: Rect, clip: &Rect) {
         if image.width == 0 || image.height == 0 || !r.intersects(clip) {
             return;
         }
-        let Some(mut pixmap) = tiny_skia::Pixmap::new(image.width, image.height) else { return };
-        // tiny-skia paints premultiplied; the decoder hands back straight rgba
-        for (out, px) in pixmap.pixels_mut().iter_mut().zip(image.rgba.chunks_exact(4)) {
-            *out = tiny_skia::ColorU8::from_rgba(px[0], px[1], px[2], px[3]).premultiply();
-        }
+        let pixmap = &image.pixmap;
         let scale_x = (r.w * self.scale) / image.width as f32;
         let scale_y = (r.h * self.scale) / image.height as f32;
         let transform = Transform::from_row(scale_x, 0.0, 0.0, scale_y, r.x * self.scale, r.y * self.scale);
@@ -368,8 +365,12 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             if let Some(key) = key {
                 // a single-line text is cut off at its own edge rather than spilling over
                 let text_clip = if nowrap { content.intersect(&own_clip) } else { own_clip };
+                // the chain itself rather than a copy of its runs: a diff view marks every
+                // line it shows, and cloning two vectors per line per frame is the cost of
+                // the borrow, not of the drawing
+                let chain = inner.nodes[id].modifier.clone();
                 // what changed inside the line, under the glyphs and under the selection
-                for (from, to, argb) in inner.nodes[id].modifier.marks.clone() {
+                for &(from, to, argb) in chain.marks.iter() {
                     for rect in inner.text.rects_for(&key, from, to) {
                         painter.fill_rect(rect.translated(content.x, content.y), argb, Corners::NONE, &text_clip);
                     }
@@ -380,11 +381,10 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                         painter.fill_rect(rect.translated(content.x, content.y), selection.argb, Corners::NONE, &text_clip);
                     }
                 }
-                let tints = inner.nodes[id].modifier.tints.clone();
-                if tints.is_empty() {
+                if chain.tints.is_empty() {
                     painter.draw_text(inner, &key, (content.x, content.y), argb, &text_clip);
                 } else {
-                    painter.draw_tinted_text(inner, &key, (content.x, content.y), argb, &tints, &text_clip);
+                    painter.draw_tinted_text(inner, &key, (content.x, content.y), argb, &chain.tints, &text_clip);
                 }
             }
         }

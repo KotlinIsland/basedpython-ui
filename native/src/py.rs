@@ -610,10 +610,19 @@ impl Core {
                 )))
             }
         };
+        // premultiplied here rather than at every frame that draws it: tiny-skia paints
+        // premultiplied, the decoder hands back straight rgba, and the conversion of a
+        // screenshot-sized image is millions of pixels a frame otherwise
+        let Some(mut pixmap) = tiny_skia::Pixmap::new(info.width, info.height) else {
+            return Err(PyValueError::new_err(format!("an image of {}x{} is too big to hold", info.width, info.height)));
+        };
+        for (out, px) in pixmap.pixels_mut().iter_mut().zip(rgba.chunks_exact(4)) {
+            *out = tiny_skia::ColorU8::from_rgba(px[0], px[1], px[2], px[3]).premultiply();
+        }
         self.with_state(true, |inner| {
             let id = inner.next_image;
             inner.next_image += 1;
-            inner.images.insert(id, crate::tree::Image { width: info.width, height: info.height, rgba });
+            inner.images.insert(id, crate::tree::Image { width: info.width, height: info.height, pixmap });
             Ok((id, info.width, info.height))
         })
     }

@@ -792,6 +792,20 @@ impl ApplicationHandler<UserEvent> for App {
                     self.fail(event_loop, e);
                 }
             }
+            // the window lost focus with a button down: no release will arrive, so the
+            // gesture is ended rather than left holding the pointer until the next one
+            WindowEvent::Focused(false) => {
+                let Some(pane) = self.panes.get_mut(&id) else { return };
+                let (x, y) = pane.cursor;
+                if let Err(e) = pane.with_core(|inner| input::pointer_cancelled(inner, x, y)) {
+                    self.fail(event_loop, e);
+                    return;
+                }
+                pane.hover_handler = -1;
+                if pane.push_hover() {
+                    pane.request_redraw();
+                }
+            }
             WindowEvent::CursorLeft { .. } => {
                 let Some(pane) = self.panes.get_mut(&id) else { return };
                 let changed = pane.hover_handler != -1;

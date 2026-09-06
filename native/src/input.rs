@@ -600,6 +600,26 @@ pub fn pointer_left(inner: &mut Inner) {
     }
 }
 
+/// The pointer is gone for good — the window lost focus mid-gesture, say. A drag holds the
+/// pointer until it is let go, and a release that never arrives would leave it holding it
+/// forever, so the drag is ended here as if it had been: what it was over is told it left,
+/// and the handler is told it ended, at the last place the pointer was.
+pub fn pointer_cancelled(inner: &mut Inner, x: f32, y: f32) {
+    let handler = dragging_handler(inner);
+    if inner.drag_node.is_some() && inner.drop_node >= 0 {
+        inner.pending_events.push(Event::new(EV_DROP, x, y, inner.drop_node, "leave".to_string()));
+    }
+    inner.drop_node = -1;
+    if let Some(handler) = handler {
+        inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "end".to_string()));
+    }
+    inner.drag_node = None;
+    inner.drag_armed = None;
+    inner.pressed_node = None;
+    inner.selecting = false;
+    pointer_left(inner);
+}
+
 /// Scroll the innermost scrollable container under `(x, y)` by `dy` logical pixels
 /// (positive = content moves up). Returns whether anything moved. Absolute rects and the
 /// hovered handler are brought up to date, so a repaint is all that is needed afterwards.
@@ -639,7 +659,7 @@ pub fn scroll_by(inner: &mut Inner, x: f32, y: f32, dx: f32, dy: f32) -> bool {
     if !moved {
         return false;
     }
-    announce_scroll(inner, root, x, y);
+    announce_scroll(inner, root);
     crate::layout::assign_abs(inner);
     inner.hover_node = hit_test(inner, x, y).node;
     update_hover_target(inner, x, y);
@@ -648,7 +668,7 @@ pub fn scroll_by(inner: &mut Inner, x: f32, y: f32, dx: f32, dy: f32) -> bool {
 
 /// Tell a scroll container that asked how far it has moved and how tall its viewport is —
 /// which is everything a list needs to draw only the rows that are in view.
-pub fn announce_scroll(inner: &mut Inner, root: NodeId, x: f32, y: f32) {
+pub fn announce_scroll(inner: &mut Inner, root: NodeId) {
     let mut found: Vec<(i32, f32, f32)> = Vec::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -1349,10 +1369,9 @@ mod tests {
         assert_eq!((events[0].handler, events[0].text.as_str()), (4, ""));
     }
 
-    #[test]
-    fn a_drag_follows_the_pointer_off_the_node_it_started_on() {
+    /// a 20x200 draggable strip (handler 7) beside a 180x200 clickable one (handler 1)
+    fn drag_tree() -> Inner {
         let mut inner = Inner::new(200.0, 200.0, 1.0, TextSystem::monospace_only());
-        // a 20x200 draggable strip (handler 7) beside a 180x200 clickable one (handler 1)
         let mods = vec![
             (1, vec![2.0, 20.0, 3.0, 200.0, 19.0, 7.0]),
             (2, vec![2.0, 180.0, 3.0, 200.0, 9.0, 1.0]),
@@ -1369,6 +1388,12 @@ mod tests {
         .collect();
         commit(&mut inner, &ints, &[], &[(0, 0, 4)], &mods, &[]).unwrap();
         layout_tree(&mut inner, &mut NoHost::default());
+        inner
+    }
+
+    #[test]
+    fn a_drag_follows_the_pointer_off_the_node_it_started_on() {
+        let mut inner = drag_tree();
 
         // pressing the strip arms a drag; until the pointer travels it is still a press
         pointer(&mut inner, EV_POINTER_DOWN, 10.0, 100.0);
@@ -1391,6 +1416,28 @@ mod tests {
         // afterwards the other strip clicks again
         assert_eq!(pointer(&mut inner, EV_POINTER_DOWN, 150.0, 40.0).handler, 1);
         assert!(take_events(&mut inner).is_empty());
+    }
+
+    #[test]
+    fn a_drag_that_never_gets_its_release_is_ended_rather_than_left_holding_the_pointer() {
+        let mut inner = drag_tree();
+        pointer(&mut inner, EV_POINTER_DOWN, 10.0, 100.0);
+        pointer(&mut inner, EV_POINTER_MOVE, 150.0, 40.0);
+        assert!(inner.drag_node.is_some(), "the drag started");
+        let _ = take_events(&mut inner);
+
+        // the window lost focus with the button down: no release will ever arrive
+        pointer_cancelled(&mut inner, 150.0, 40.0);
+        let ended: Vec<String> = take_events(&mut inner)
+            .into_iter()
+            .filter(|e| e.kind == EV_DRAG)
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(ended, vec!["end".to_string()], "the handler is told the drag ended");
+        assert!(inner.drag_node.is_none() && inner.drag_armed.is_none(), "and it holds the pointer no longer");
+
+        // the next press is a press again, not the continuation of a drag nobody let go of
+        assert_eq!(pointer(&mut inner, EV_POINTER_DOWN, 150.0, 40.0).handler, 1);
     }
 
     #[test]
