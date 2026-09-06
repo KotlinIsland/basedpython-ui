@@ -256,13 +256,16 @@ class TestComposition:
         `input_modifiers()` reports inside the handler ("shift", "shift+cmd", …)."""
         cx, cy = self.centre(label)
         down = self.core.pointer(1, cx, cy)
+        # what the press produced before the release is answered, which is the order the
+        # window delivers them in: it drains the core after every pointer event, so a
+        # dismiss the press set off is in the batch ahead of the release. a menu therefore
+        # closes first and the click it was aimed at still lands, and lands last
+        self.deliver()
         up = self.core.pointer(2, cx, cy)
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
             self.deliver()
             raise AssertionError(f"{label!r} is not clickable; tree:\n{self.dump()}")
-        # the click first, then what it produced along the way: the order a window uses,
-        # which is what lets a press close a menu and still do what it was aimed at
         self.runtime.dispatch(handler_idx, None, modifiers, (cx, cy))
         self.deliver()
 
@@ -270,12 +273,14 @@ class TestComposition:
         """The right button over the node showing `label`: what opens a context menu."""
         cx, cy = self.centre(label)
         down = self.core.pointer(9, cx, cy)
-        up = self.core.pointer(10, cx, cy)
         self.deliver()
+        up = self.core.pointer(10, cx, cy)
         handler_idx = up[3]
         if handler_idx < 0 or handler_idx != down[3]:
+            self.deliver()
             raise AssertionError(f"{label!r} offers no menu; tree:\n{self.dump()}")
         self.runtime.dispatch(handler_idx, None, "", (cx, cy))
+        self.deliver()
 
     def deliver(self):
         """Dispatch what the last pointer event produced: hover enters and leaves, the steps
@@ -343,10 +348,11 @@ class TestComposition:
         """Press and release at a point rather than on a node — what dismisses a menu or a
         selection."""
         down = self.core.pointer(1, x, y)
-        up = self.core.pointer(2, x, y)
         self.deliver()
+        up = self.core.pointer(2, x, y)
         if up[3] >= 0 and up[3] == down[3]:
             self.runtime.dispatch(up[3], None, "", (x, y))
+        self.deliver()
 
     def hovered_handler(self) -> int:
         return self.core.hovered_handler()

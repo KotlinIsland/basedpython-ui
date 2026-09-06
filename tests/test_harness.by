@@ -501,6 +501,52 @@ def test_a_keyed_popup_does_not_key_its_own_children():
     t.dispose()
 
 
+@composable
+def Dismissed():
+    """a layer that wants to know about a press outside it, over a button that wants the
+    press: closing a menu and doing what the click was aimed at are one gesture. the order
+    they were answered in is written into the tree, which is where a test can read it"""
+    let order = state("")
+    Column(Modifier().size(200, 100)):
+        Text(f"order:{order.value}")
+        Text(
+            "outside",
+            Modifier().height(40).fill_max_width().dismiss(lambda: order.set(order.value + " dismiss")),
+        )
+        Button("go", on_click=lambda: order.set(order.value + " click"))
+
+
+def test_the_harness_answers_a_click_in_the_order_the_window_does():
+    """the window drains the core after every pointer event and hands the batch over in
+    order, so a dismiss the press set off is answered before the release. the harness
+    synthesises both halves of the gesture itself and has to keep that order, or a test
+    passes on a sequence the application never sees"""
+    let t = compose_test(width=200, height=100):
+        Dismissed()
+    t.click("go")
+    t.advance()
+    assert t.find_text("order: dismiss click"), f"the harness:\n{t.dump()}"
+
+    # the same gesture through the window's own path: the core's queue drained after each
+    # pointer event, the whole batch handed to `WindowEvents` in one go
+    let w = compose_test(width=200, height=100):
+        Dismissed()
+    let box = w.rect_of("go")
+    let cx = box.0 + box.2 / 2.0
+    let cy = box.1 + box.3 / 2.0
+    var batch: list[(int, float, float, int, str)] = [w.core.pointer(1, cx, cy)]
+    batch += w.core.take_events()
+    batch.append(w.core.pointer(2, cx, cy))
+    batch += w.core.take_events()
+    let events = WindowEvents()
+    events.runtime = w.runtime
+    events.handle(batch)
+    w.advance()
+    assert w.find_text("order: dismiss click"), f"the window:\n{w.dump()}"
+    t.dispose()
+    w.dispose()
+
+
 private def chain_of(which: str) -> Modifier:
     """a chain of `which`, built fresh — the closure inside it is a new object every call,
     which is exactly the case interning has to survive"""
