@@ -249,6 +249,36 @@ class TestComposition:
     def hover_target(self) -> int:
         return self.core.hover_target()
 
+    def select(self, from_label: str, to_label: str) -> str:
+        """Sweep the pointer from the start of one text to the end of another, as a person
+        selecting them would, and hand back what that picked out."""
+        fx, fy, _, fh = self.rect_of(from_label)
+        tx, ty, tw, th = self.rect_of(to_label)
+        self.core.pointer(1, fx + 1.0, fy + fh / 2.0)
+        self._deliver()
+        self.core.pointer(3, tx + tw, ty + th / 2.0)
+        self._deliver()
+        self.core.pointer(2, tx + tw, ty + th / 2.0)
+        self._deliver()
+        return self.core.selected_text()
+
+    def selected_text(self) -> str:
+        return self.core.selected_text()
+
+    def cursor_at(self, x: float, y: float) -> int:
+        """What the pointer would look like at a point: 0 the platform's own, 1 a hand,
+        2 a text bar, 3 a column-resize arrow, 4 a grabbing hand."""
+        return self.core.cursor_at(x, y)
+
+    def click_at(self, x: float, y: float):
+        """Press and release at a point rather than on a node — what dismisses a menu or a
+        selection."""
+        down = self.core.pointer(1, x, y)
+        up = self.core.pointer(2, x, y)
+        self._deliver()
+        if up[3] >= 0 and up[3] == down[3]:
+            self.runtime.dispatch(up[3], None, "", (x, y))
+
     def hovered_handler(self) -> int:
         return self.core.hovered_handler()
 

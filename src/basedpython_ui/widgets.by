@@ -9,7 +9,7 @@ from array import array
 from . import modifier as _modifier
 from . import runtime as _runtime
 from .geometry import Dp, Size, Constraints, Color, ONE_DP
-from .modifier import Modifier, ModOp, Alignment, Arrangement, TextStyle
+from .modifier import Modifier, ModOp, Alignment, Arrangement, CursorShape, TextStyle, cursor_code
 from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError, builder
 
 # imports are lazy proxies; the values used on every builder call are bound
@@ -137,6 +137,10 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((18.0, float(color.argb())))
             case ModOp.Drag(on_drag):
                 ops.extend((19.0, float(rt.handler(on_drag))))
+            case ModOp.Selectable(color):
+                ops.extend((20.0, float(color.argb())))
+            case ModOp.Cursor(shape):
+                ops.extend((21.0, float(cursor_code(shape))))
     return ops
 
 
@@ -228,10 +232,13 @@ def Button(label: str, modifier: Modifier = NONE, enabled: bool = True, on_click
 
 
 @builder
-def TextField(value: str, modifier: Modifier = NONE, placeholder: str = "", on_change: (str) -> None) raises ...:
+def TextField(value: str, modifier: Modifier = NONE, placeholder: str = "", style: TextStyle = DEFAULT_TEXT_STYLE, on_change: (str) -> None) raises ...:
+    """An editable line. `style` is what it is written in — its colour is the caret's too,
+    and a worn-down version of it is the placeholder's. A chain that gives the field a
+    background or a border replaces the plain box it is drawn in otherwise."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_TEXTFIELD, flags, intern_text(rt, value), optional_modifier(rt, modifier), rt.handler(on_change), 0, intern_text(rt, placeholder) if placeholder else -1, k))
+    rt.ints.extend((R_TEXTFIELD, flags, intern_text(rt, value), optional_modifier(rt, modifier), rt.handler(on_change), intern_style(rt, style), intern_text(rt, placeholder) if placeholder else -1, k))
 
 
 @builder

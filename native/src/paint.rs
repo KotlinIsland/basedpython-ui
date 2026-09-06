@@ -24,7 +24,12 @@ const TEXT_DISABLED: u32 = 0xFF9A_9A9A;
 const FIELD_BORDER: u32 = 0xFFA1_A1AA;
 const FIELD_BORDER_FOCUS: u32 = 0xFF3B_82F6;
 const FIELD_RADIUS: Corners = Corners::uniform(6.0);
-const PLACEHOLDER: u32 = 0xFF9C_A3AF;
+/// A placeholder is the field's own colour, worn down: it belongs to the field's palette,
+/// whatever that is, rather than to a grey nobody chose.
+fn fade(argb: u32) -> u32 {
+    let (a, r, g, b) = argb_channels(argb);
+    (((a as u32 * 55) / 100) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
 const ACCENT: u32 = 0xFF3B_82F6;
 /// The thumb's colour when a scroll container does not name one (`Modifier.scrollbar`).
 const SCROLLBAR: u32 = 0x5A00_0000;
@@ -254,6 +259,12 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             if let Some(key) = key {
                 // a single-line text is cut off at its own edge rather than spilling over
                 let text_clip = if nowrap { content.intersect(&own_clip) } else { own_clip };
+                // the highlight goes under the glyphs
+                if let (Some(selection), Some((from, to))) = (inner.selection, crate::input::selected_range(inner, id)) {
+                    for rect in inner.text.rects_for(&key, from, to) {
+                        painter.fill_rect(rect.translated(content.x, content.y), selection.argb, Corners::NONE, &text_clip);
+                    }
+                }
                 painter.draw_text(inner, &key, (content.x, content.y), argb, &text_clip);
             }
         }
@@ -280,18 +291,27 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
         }
         Kind::TextField => {
             let focused = inner.focus.as_ref().filter(|f| f.node == id).cloned();
-            let (key, is_placeholder) = {
+            let (key, is_placeholder, style, decorated) = {
                 let n = &inner.nodes[id];
                 let placeholder = focused.is_none() && n.text.as_deref().map(|t| t.is_empty()).unwrap_or(true);
-                (n.text_key.clone(), placeholder)
+                // a field the chain has already dressed keeps its own colours: the plain
+                // white box below is the look of an undecorated one
+                let background = n.layers.iter().any(|l| matches!(l, Layer::Background { .. }));
+                let border = n.layers.iter().any(|l| matches!(l, Layer::Border { .. }));
+                (n.text_key.clone(), placeholder, n.style, (background, border))
             };
-            painter.fill_rect(content, 0xFFFF_FFFF, FIELD_RADIUS, &own_clip);
-            let (border, width) = if focused.is_some() { (FIELD_BORDER_FOCUS, 2.0) } else { (FIELD_BORDER, 1.0) };
-            painter.stroke_rect(content, border, width, FIELD_RADIUS, &own_clip);
+            if !decorated.0 {
+                painter.fill_rect(content, 0xFFFF_FFFF, FIELD_RADIUS, &own_clip);
+            }
+            if focused.is_some() {
+                painter.stroke_rect(content, FIELD_BORDER_FOCUS, 2.0, FIELD_RADIUS, &own_clip);
+            } else if !decorated.1 {
+                painter.stroke_rect(content, FIELD_BORDER, 1.0, FIELD_RADIUS, &own_clip);
+            }
             let text_origin = (content.x + crate::layout::FIELD_PAD_X, content.y + crate::layout::FIELD_PAD_Y);
             let text_clip = content.intersect(&own_clip);
             if let Some(key) = key {
-                let argb = if is_placeholder { PLACEHOLDER } else { Style::DEFAULT.argb };
+                let argb = if is_placeholder { fade(style.argb) } else { style.argb };
                 painter.draw_text(inner, &key, text_origin, argb, &text_clip);
             }
             if let Some(f) = focused {
@@ -299,14 +319,28 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                 let w = if prefix.is_empty() {
                     0.0
                 } else {
-                    inner.text.measure(&TextKey::new(prefix.into(), Style::DEFAULT, f32::INFINITY)).w
+                    inner.text.measure(&TextKey::new(prefix.into(), style, f32::INFINITY)).w
                 };
-                let line = crate::text::TextSystem::line_height(Style::DEFAULT);
-                painter.fill_rect(Rect::new(text_origin.0 + w, text_origin.1, 1.0, line), Style::DEFAULT.argb, Corners::NONE, &text_clip);
+                let line = crate::text::TextSystem::line_height(style);
+                painter.fill_rect(Rect::new(text_origin.0 + w, text_origin.1, 1.0, line), style.argb, Corners::NONE, &text_clip);
             }
         }
         Kind::Checkbox => {
             let checked = inner.nodes[id].a != 0;
+            // a box the chain has dressed keeps its own colours, the way a text field does:
+            // the white box and grey outline below are what an undressed one looks like
+            let (fill, line) = {
+                let n = &inner.nodes[id];
+                let fill = n.layers.iter().find_map(|l| match l {
+                    Layer::Background { argb, .. } => Some(*argb),
+                    _ => None,
+                });
+                let line = n.layers.iter().find_map(|l| match l {
+                    Layer::Border { argb, .. } => Some(*argb),
+                    _ => None,
+                });
+                (fill.unwrap_or(0xFFFF_FFFF), line.unwrap_or(BUTTON_BORDER))
+            };
             let b = Rect::new(content.x, content.y, crate::layout::CHECKBOX_SIZE, crate::layout::CHECKBOX_SIZE);
             if checked {
                 painter.fill_rect(b, ACCENT, Corners::uniform(4.0), &own_clip);
@@ -314,8 +348,8 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
                 painter.stroke_line((x + s * 0.22, y + s * 0.52), (x + s * 0.42, y + s * 0.72), 0xFFFF_FFFF, 2.0, &own_clip);
                 painter.stroke_line((x + s * 0.42, y + s * 0.72), (x + s * 0.78, y + s * 0.3), 0xFFFF_FFFF, 2.0, &own_clip);
             } else {
-                painter.fill_rect(b, 0xFFFF_FFFF, Corners::uniform(4.0), &own_clip);
-                painter.stroke_rect(b, BUTTON_BORDER, 1.0, Corners::uniform(4.0), &own_clip);
+                painter.fill_rect(b, fill, Corners::uniform(4.0), &own_clip);
+                painter.stroke_rect(b, line, 1.0, Corners::uniform(4.0), &own_clip);
             }
         }
         Kind::Canvas => {

@@ -157,6 +157,20 @@ def input_modifiers() -> str:
     return rt.event_modifiers if rt is not None else ""
 
 
+def selected_text() -> str:
+    """The text the pointer has selected, read from inside an input handler — what a copy
+    command hands to the clipboard. "" when nothing is selected."""
+    rt = _dispatching
+    return rt.core.selected_text() if rt is not None else ""
+
+
+def clear_selection():
+    """Drop the selection, from inside an input handler."""
+    rt = _dispatching
+    if rt is not None:
+        rt.core.clear_selection()
+
+
 def input_position() -> (float, float):
     """Where the pointer was during the input event whose handler is running, in logical
     pixels — where a menu or a tooltip goes. `(0.0, 0.0)` outside a pointer handler."""
@@ -1287,6 +1301,9 @@ protocol NativeCore:
     def resize(self, width: float, height: float, scale: float)
     def take_events(self) -> list[tuple[int, float, float, int, str]]
     def hover_target(self) -> int
+    def cursor_at(self, x: float, y: float) -> int
+    def selected_text(self) -> str
+    def clear_selection(self)
 
 
 final class Runtime:
@@ -1430,20 +1447,26 @@ final class Runtime:
         """Offer a key chord to the registered handlers, deepest scope first (later
         registrations first within a scope); True when one took it. A handler that raises
         is reported through `on_error` and counts as having taken the key."""
+        global _dispatching
         if self.phase == COMPOSING:
             raise CompositionError("a key cannot be dispatched while composing")
         candidates = [scope for scope in self.scopes.values() if scope.alive and scope.key_handlers]
         candidates.sort(key=lambda scope: (-scope.depth, -scope.id))
-        for scope in candidates:
-            for handler in reversed(scope.key_handlers):
-                try:
-                    handled = handler(chord)
-                except BaseException as error:
-                    self.on_error(error, "key")
-                    return True
-                if handled:
-                    return True
-        return False
+        previous = _dispatching
+        _dispatching = self
+        try:
+            for scope in candidates:
+                for handler in reversed(scope.key_handlers):
+                    try:
+                        handled = handler(chord)
+                    except BaseException as error:
+                        self.on_error(error, "key")
+                        return True
+                    if handled:
+                        return True
+            return False
+        finally:
+            _dispatching = previous
 
     def dispatch(self, handler_idx: int, payload: object, modifiers: str = "", position: tuple[float, float] = (0.0, 0.0)):
         """Run an input handler from the handler table (a click, a text change), with the

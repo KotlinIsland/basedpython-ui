@@ -1,6 +1,6 @@
 //! Hit testing, focus, the text field edit buffer, and the event tuples of the protocol.
 
-use crate::tree::{Focus, Inner, NodeId};
+use crate::tree::{Caret, Focus, Inner, NodeId, Selection};
 use crate::types::*;
 
 pub const EV_POINTER_DOWN: i32 = 1;
@@ -58,6 +58,8 @@ pub enum Which {
     Hover,
     /// `draggable` layers only.
     Drag,
+    /// `selectable` layers only.
+    Select,
 }
 
 /// The result of a hit test.
@@ -146,6 +148,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
                 (Which::Secondary, Layer::Secondary { rect, handler }) => Some((rect, *handler)),
                 (Which::Hover, Layer::Hoverable { rect, handler }) => Some((rect, *handler)),
                 (Which::Drag, Layer::Drag { rect, handler }) => Some((rect, *handler)),
+                (Which::Select, Layer::Select { rect, .. }) => Some((rect, 0)),
                 _ => None,
             };
             if let Some((rect, handler)) = found {
@@ -158,6 +161,45 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
     None
 }
 
+/// What the pointer should look like at `(x, y)`: the innermost node under it that asked for
+/// a cursor, and 0 (the platform's own) when nothing did. Popups are consulted first, the way
+/// they are hit first.
+pub fn cursor_at(inner: &Inner, x: f32, y: f32) -> u32 {
+    for popup in inner.live_popups().into_iter().rev() {
+        let Some(node) = inner.nodes.get(popup) else { continue };
+        if !node.abs.contains(x, y) {
+            continue;
+        }
+        let found = cursor_in(inner, popup, x, y);
+        if found != 0 {
+            return found;
+        }
+    }
+    cursor_in(inner, inner.root, x, y)
+}
+
+fn cursor_in(inner: &Inner, id: NodeId, x: f32, y: f32) -> u32 {
+    let Some(node) = inner.nodes.get(id) else { return 0 };
+    for &c in node.children.iter().rev() {
+        let Some(child) = inner.nodes.get(c) else { continue };
+        if child.kind == Kind::Popup {
+            continue;
+        }
+        let inside = child.is_group() || child.abs.contains(x, y);
+        if !inside {
+            continue;
+        }
+        let found = cursor_in(inner, c, x, y);
+        if found != 0 {
+            return found;
+        }
+        if !child.is_group() && child.modifier.cursor != 0 {
+            return child.modifier.cursor;
+        }
+    }
+    0
+}
+
 /// A pointer event (kinds 1, 2, 3, or 9 / 10 for the right button). Pointer down moves focus
 /// to the text field hit, or clears it; every kind records what is under the pointer, for the
 /// hover paint and for the enter / leave events `take_hover_events` hands back.
@@ -166,8 +208,9 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
     // a drag owns the pointer while it lasts, so the press that started it, the moves and
     // the release are the drag's rather than anything else's
     let dragging = !secondary && update_drag(inner, kind, x, y);
+    let selecting = !secondary && !dragging && update_selection(inner, kind, x, y);
     let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
-    if kind == EV_POINTER_DOWN && !dragging {
+    if kind == EV_POINTER_DOWN && !dragging && !selecting {
         match hit.focus {
             Some(field) => focus_field(inner, field),
             None => inner.focus = None,
@@ -177,7 +220,160 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
         inner.hover_node = hit.node;
     }
     update_hover_target(inner, x, y);
-    Event::new(kind, x, y, if dragging { -1 } else { hit.handler }, String::new())
+    Event::new(kind, x, y, if dragging || selecting { -1 } else { hit.handler }, String::new())
+}
+
+/// Whether a point is over a live popup. What a popup does not answer falls through to the
+/// tree below it, which is right for a click — a tooltip must not eat one — but wrong for a
+/// sweep or a drag: pressing a menu item that happens to sit over selectable text is not the
+/// start of a selection.
+fn over_popup(inner: &Inner, x: f32, y: f32) -> bool {
+    inner
+        .live_popups()
+        .into_iter()
+        .any(|p| inner.nodes.get(p).map(|n| n.abs.contains(x, y)).unwrap_or(false))
+}
+
+/// Start, extend or finish a text selection. A press inside a `selectable` node puts the
+/// caret where it landed and takes the pointer, so dragging sweeps text the way it does
+/// anywhere else; a press outside one clears whatever was selected.
+fn update_selection(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
+    match kind {
+        EV_POINTER_DOWN => {
+            if over_popup(inner, x, y) {
+                inner.selection = None;
+                inner.selecting = false;
+                return false;
+            }
+            let hit = hit_for(inner, x, y, Which::Select);
+            let Some(node) = hit.node else {
+                inner.selection = None;
+                inner.selecting = false;
+                return false;
+            };
+            let argb = inner
+                .nodes
+                .get(node)
+                .and_then(|n| n.layers.iter().rev().find_map(|l| match l {
+                    Layer::Select { argb, .. } => Some(*argb),
+                    _ => None,
+                }))
+                .unwrap_or(0x4000_0000);
+            match caret_at(inner, node, x, y) {
+                Some(caret) => {
+                    inner.selection = Some(Selection { anchor: caret, focus: caret, root: node, argb });
+                    inner.selecting = true;
+                    true
+                }
+                None => {
+                    inner.selection = None;
+                    inner.selecting = false;
+                    false
+                }
+            }
+        }
+        EV_POINTER_MOVE if inner.selecting => {
+            let Some(mut selection) = inner.selection else { return false };
+            if let Some(caret) = caret_at(inner, selection.root, x, y) {
+                selection.focus = caret;
+                inner.selection = Some(selection);
+            }
+            true
+        }
+        EV_POINTER_UP if inner.selecting => {
+            inner.selecting = false;
+            // a press that selected nothing is a click, not an empty selection
+            if inner.selection.map(|s| s.anchor == s.focus) == Some(true) {
+                inner.selection = None;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The caret nearest `(x, y)` among the text nodes under `root`: the one the point is inside,
+/// else the nearest by line, so a sweep past the end of the text still selects to there.
+fn caret_at(inner: &mut Inner, root: NodeId, x: f32, y: f32) -> Option<Caret> {
+    let nodes = inner.text_nodes(root);
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut chosen = nodes[0];
+    let mut best = f32::INFINITY;
+    for &node in &nodes {
+        let Some(n) = inner.nodes.get(node) else { continue };
+        let rect = n.abs;
+        let distance = if y < rect.y {
+            rect.y - y
+        } else if y > rect.y + rect.h {
+            y - (rect.y + rect.h)
+        } else {
+            0.0
+        };
+        if distance < best || (distance == best && rect.y <= y) {
+            best = distance;
+            chosen = node;
+        }
+        if distance == 0.0 && rect.contains(x, y) {
+            chosen = node;
+            break;
+        }
+    }
+    let (key, origin) = {
+        let n = inner.nodes.get(chosen)?;
+        (n.text_key.clone()?, (n.abs.x + n.content_origin.0, n.abs.y + n.content_origin.1))
+    };
+    let index = inner.text.index_at(&key, x - origin.0, y - origin.1);
+    Some(Caret { node: chosen, index })
+}
+
+/// The selection in reading order: `(first caret, last caret)`, whichever way it was dragged.
+pub fn ordered_selection(inner: &Inner) -> Option<(Caret, Caret)> {
+    let selection = inner.selection?;
+    let nodes = inner.text_nodes(selection.root);
+    let anchor_at = nodes.iter().position(|&n| n == selection.anchor.node)?;
+    let focus_at = nodes.iter().position(|&n| n == selection.focus.node)?;
+    if (focus_at, selection.focus.index) < (anchor_at, selection.anchor.index) {
+        Some((selection.focus, selection.anchor))
+    } else {
+        Some((selection.anchor, selection.focus))
+    }
+}
+
+/// What is selected in one text node: the byte range of it that lies inside the selection.
+pub fn selected_range(inner: &Inner, node: NodeId) -> Option<(usize, usize)> {
+    let (first, last) = ordered_selection(inner)?;
+    let selection = inner.selection?;
+    let nodes = inner.text_nodes(selection.root);
+    let at = nodes.iter().position(|&n| n == node)?;
+    let first_at = nodes.iter().position(|&n| n == first.node)?;
+    let last_at = nodes.iter().position(|&n| n == last.node)?;
+    if at < first_at || at > last_at {
+        return None;
+    }
+    let text = inner.nodes.get(node)?.text_str();
+    let from = if at == first_at { first.index } else { 0 };
+    let to = if at == last_at { last.index } else { text.len() };
+    if from >= to {
+        None
+    } else {
+        Some((from.min(text.len()), to.min(text.len())))
+    }
+}
+
+/// Everything the selection covers, one text node per line.
+pub fn selected_text(inner: &Inner) -> String {
+    let Some(selection) = inner.selection else { return String::new() };
+    let mut parts = Vec::new();
+    for node in inner.text_nodes(selection.root) {
+        if let Some((from, to)) = selected_range(inner, node) {
+            if let Some(n) = inner.nodes.get(node) {
+                parts.push(n.text_str().get(from..to).unwrap_or("").to_string());
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 /// Start, continue or end a drag. A press over a `draggable` layer takes the pointer: until
@@ -186,6 +382,9 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
 fn update_drag(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
     match kind {
         EV_POINTER_DOWN => {
+            if over_popup(inner, x, y) {
+                return false;
+            }
             let hit = hit_for(inner, x, y, Which::Drag);
             match (hit.node, hit.handler >= 0) {
                 (Some(node), true) => {
@@ -520,6 +719,30 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_is_the_innermost_one_asked_for() {
+        // a column that asks for a hand, holding a spacer that asks for a text bar
+        let ints: Vec<i32> = [
+            [3, 0, -1, 1, -1, 0, 0, 0],  // column, 200x100, cursor 1
+            [10, 0, -1, 2, -1, 0, 0, 0], // spacer, 50x20, cursor 2
+            [0, 0, -1, 0, -1, 0, 0, 0],  // end of the column
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        let mods = vec![(1, vec![2.0, 200.0, 3.0, 100.0, 21.0, 1.0]), (2, vec![2.0, 50.0, 3.0, 20.0, 21.0, 2.0])];
+        let mut inner = Inner::new(400.0, 300.0, 1.0, TextSystem::monospace_only());
+        commit(&mut inner, &ints, &[], &[(0, 0, 3)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        // over the spacer: its own cursor wins over the column's
+        assert_eq!(cursor_at(&inner, 10.0, 10.0), 2);
+        // elsewhere in the column: the column's
+        assert_eq!(cursor_at(&inner, 100.0, 60.0), 1);
+        // outside it: whatever the platform draws
+        assert_eq!(cursor_at(&inner, 300.0, 200.0), 0);
+    }
+
+    #[test]
     fn hit_testing() {
         let inner = build();
         let col = inner.layout_children(inner.root)[0];
@@ -722,6 +945,94 @@ mod tests {
         // afterwards the other strip clicks again
         assert_eq!(pointer(&mut inner, EV_POINTER_DOWN, 150.0, 40.0).handler, 1);
         assert!(take_events(&mut inner).is_empty());
+    }
+
+    #[test]
+    fn text_is_selected_by_sweeping_the_pointer_over_it() {
+        let mut inner = Inner::new(300.0, 200.0, 1.0, TextSystem::monospace_only());
+        // a selectable column of three lines
+        let mods = vec![(1, vec![20.0, 1073741824.0])];
+        let ints: Vec<i32> = [
+            [3, 0, -1, 1, -1, 0, 0, 0],
+            [6, 0, 0, 0, -1, 0, 0, 0],
+            [6, 0, 1, 0, -1, 0, 0, 0],
+            [6, 0, 2, 0, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &["first line", "second line", "third line"], &[(0, 0, 5)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+        let advance = crate::types::Style::DEFAULT.size() * crate::text::FALLBACK_ADVANCE;
+        let line = crate::text::TextSystem::line_height(crate::types::Style::DEFAULT);
+
+        // press in the middle of the first line and sweep down into the second
+        pointer(&mut inner, EV_POINTER_DOWN, advance * 6.0, line * 0.5);
+        assert!(inner.selecting);
+        pointer(&mut inner, EV_POINTER_MOVE, advance * 7.0, line * 1.5);
+        assert_eq!(selected_text(&inner), "line\nsecond ");
+        // and on to the third, which takes the whole second line with it
+        pointer(&mut inner, EV_POINTER_MOVE, advance * 5.0, line * 2.5);
+        assert_eq!(selected_text(&inner), "line\nsecond line\nthird");
+        pointer(&mut inner, EV_POINTER_UP, advance * 5.0, line * 2.5);
+        assert!(!inner.selecting && inner.selection.is_some());
+
+        // sweeping backwards reads the same way round
+        pointer(&mut inner, EV_POINTER_DOWN, advance * 5.0, line * 2.5);
+        pointer(&mut inner, EV_POINTER_MOVE, advance * 6.0, line * 0.5);
+        assert_eq!(selected_text(&inner), "line\nsecond line\nthird");
+
+        // a press that goes nowhere is a click, and clears it
+        pointer(&mut inner, EV_POINTER_DOWN, advance * 2.0, line * 0.5);
+        pointer(&mut inner, EV_POINTER_UP, advance * 2.0, line * 0.5);
+        assert_eq!(selected_text(&inner), "");
+        // as does a press outside the selectable node
+        pointer(&mut inner, EV_POINTER_DOWN, advance * 2.0, line * 0.5);
+        pointer(&mut inner, EV_POINTER_MOVE, advance * 8.0, line * 0.5);
+        assert!(!selected_text(&inner).is_empty());
+        pointer(&mut inner, EV_POINTER_UP, advance * 8.0, line * 0.5);
+        pointer(&mut inner, EV_POINTER_DOWN, 290.0, 190.0);
+        assert_eq!(selected_text(&inner), "");
+    }
+
+    #[test]
+    fn a_press_on_a_popup_is_the_popups_and_not_a_sweep_of_what_is_under_it() {
+        let mut inner = Inner::new(300.0, 200.0, 1.0, TextSystem::monospace_only());
+        // selectable text with a popup over it, the way a menu sits over a diff
+        let mods = vec![(1, vec![20.0, 1073741824.0]), (2, vec![2.0, 40.0, 3.0, 12.0, 9.0, 7.0])];
+        let ints: Vec<i32> = [
+            [3, 0, -1, 1, -1, 0, 0, 0],
+            [6, 0, 0, 0, -1, 0, 0, 0],
+            [6, 0, 1, 0, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+            [14, 0, -1, 0, -1, 0, 0, 0],
+            [10, 0, -1, 2, -1, 0, 0, 0],
+            [0, 0, -1, 0, -1, 0, 0, 0],
+        ]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+        commit(&mut inner, &ints, &["first line", "second line"], &[(0, 0, 7)], &mods, &[]).unwrap();
+        layout_tree(&mut inner, &mut NoHost::default());
+
+        // a press inside the popup answers the popup's own handler and selects nothing
+        let ev = pointer(&mut inner, EV_POINTER_DOWN, 20.0, 6.0);
+        assert_eq!(ev.handler, 7);
+        assert!(!inner.selecting);
+        pointer(&mut inner, EV_POINTER_MOVE, 30.0, 8.0);
+        assert_eq!(selected_text(&inner), "");
+        pointer(&mut inner, EV_POINTER_UP, 30.0, 8.0);
+
+        // beside the popup, the text still sweeps as it did
+        let line = crate::text::TextSystem::line_height(crate::types::Style::DEFAULT);
+        let advance = crate::types::Style::DEFAULT.size() * crate::text::FALLBACK_ADVANCE;
+        pointer(&mut inner, EV_POINTER_DOWN, advance * 6.0, line * 0.5);
+        assert!(inner.selecting);
+        pointer(&mut inner, EV_POINTER_MOVE, advance * 4.0, line * 1.5);
+        assert!(!selected_text(&inner).is_empty());
     }
 
     #[test]

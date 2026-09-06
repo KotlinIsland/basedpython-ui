@@ -339,6 +339,9 @@ fn validate(
                             if r.b != -1 && (r.b < 0 || r.b as usize >= strs_len) {
                                 bad!("record {}: placeholder index {} out of range", i, r.b);
                             }
+                            if r.a < 0 || !style_known(r.a as u32) {
+                                bad!("record {}: unknown style id {}", i, r.a);
+                            }
                         }
                         Kind::Checkbox => {
                             if !(0..=1).contains(&r.a) {
@@ -663,7 +666,7 @@ fn reuse(inner: &mut Inner, id: NodeId, r: &Rec, j: usize, ctx: &mut Ctx) {
         None
     };
     let style = match Kind::from_record(r.kind) {
-        Some(Kind::Text) => Some(resolve_style(inner, r.a)),
+        Some(Kind::Text) | Some(Kind::TextField) => Some(resolve_style(inner, r.a)),
         Some(Kind::Button) => Some(resolve_style(inner, r.c)),
         _ => None,
     };
@@ -762,7 +765,7 @@ fn create(inner: &mut Inner, parent: NodeId, kind: Kind, r: &Rec, j: usize, ctx:
     node.b = r.b;
     node.c = r.c;
     node.style = match kind {
-        Kind::Text => resolve_style(inner, r.a),
+        Kind::Text | Kind::TextField => resolve_style(inner, r.a),
         Kind::Button => resolve_style(inner, r.c),
         _ => Style::DEFAULT,
     };

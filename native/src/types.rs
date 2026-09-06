@@ -254,6 +254,12 @@ pub enum ModOp {
     /// A handler told when the pointer is pressed on the layer and dragged, wherever it
     /// then goes: the core holds the pointer for the duration.
     Drag(i32),
+    /// The text under this layer can be selected with the pointer; the colour is the
+    /// highlight's.
+    Selectable(u32),
+    /// What the pointer looks like over this node: 0 the platform's own, 1 a hand, 2 a text
+    /// bar, 3 a column-resize arrow, 4 a grabbing hand.
+    Cursor(u32),
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -268,6 +274,8 @@ pub struct Modifier {
     pub scrollbar: Option<u32>,
     pub reveal: bool,
     pub clip: bool,
+    /// What the pointer looks like over this node; 0 is the platform's own.
+    pub cursor: u32,
 }
 
 impl Modifier {
@@ -281,6 +289,7 @@ impl Modifier {
         let mut scrollbar = None;
         let mut reveal = false;
         let mut clip = false;
+        let mut cursor = 0u32;
         while i < raw.len() {
             let op = raw[i];
             let take = |n: usize| -> Result<&[f64], String> {
@@ -408,10 +417,25 @@ impl Modifier {
                     ops.push(ModOp::Drag(handler_index(a[0], "draggable")?));
                     i += 2;
                 }
+                x if x == 20.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::Selectable(argb_from_f64(a[0])?));
+                    i += 2;
+                }
+                x if x == 21.0 => {
+                    let a = take(1)?;
+                    let kind = finite(a[0], "cursor")?;
+                    if kind < 0.0 || kind > 4.0 || kind.fract() != 0.0 {
+                        return Err(format!("cursor must be 0..=4, got {}", kind));
+                    }
+                    cursor = kind as u32;
+                    ops.push(ModOp::Cursor(cursor));
+                    i += 2;
+                }
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip })
+        Ok(Modifier { ops, weight, align, hover, scrollbar, reveal, clip, cursor })
     }
 }
 
@@ -500,6 +524,8 @@ pub enum Layer {
     Hoverable { rect: Rect, handler: i32 },
     /// Told when the pointer is pressed here and dragged.
     Drag { rect: Rect, handler: i32 },
+    /// The text inside here can be selected; `argb` is the highlight's colour.
+    Select { rect: Rect, argb: u32 },
 }
 
 /// A retained canvas draw command in the canvas's own coordinates.

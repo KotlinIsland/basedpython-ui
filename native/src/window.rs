@@ -17,7 +17,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Icon, Theme, Window as WinitWindow, WindowId};
+use winit::window::{CursorIcon, Icon, Theme, Window as WinitWindow, WindowId};
 
 use crate::input::{
     self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, EV_SECONDARY_DOWN,
@@ -203,6 +203,7 @@ struct App {
     cursor: (f32, f32),
     modifiers: ModifiersState,
     hover_handler: i32,
+    cursor_kind: u32,
     error: Option<PyErr>,
 }
 
@@ -222,6 +223,7 @@ impl App {
             cursor: (0.0, 0.0),
             modifiers: ModifiersState::empty(),
             hover_handler: -1,
+            cursor_kind: 0,
             error: None,
         }
     }
@@ -244,12 +246,37 @@ impl App {
         }
     }
 
-    /// Queue the hover and drag events the last pointer event produced.
-    fn push_hover(&mut self) {
-        if let Ok(events) = self.with_core(input::take_events) {
-            for ev in events {
-                self.push(ev);
+    /// Queue the hover and drag events the last pointer event produced; true when there
+    /// were any, which is what makes a drag redraw while the pointer is still down.
+    fn push_hover(&mut self) -> bool {
+        match self.with_core(input::take_events) {
+            Ok(events) => {
+                let any = !events.is_empty();
+                for ev in events {
+                    self.push(ev);
+                }
+                any
             }
+            Err(_) => false,
+        }
+    }
+
+    /// Point the pointer at whatever is under it. The core says which of a small set of
+    /// shapes a node asked for; the platform draws it.
+    fn apply_cursor(&mut self, x: f32, y: f32) {
+        let Ok(kind) = self.with_core(|inner| input::cursor_at(inner, x, y)) else { return };
+        if kind == self.cursor_kind {
+            return;
+        }
+        self.cursor_kind = kind;
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor(match kind {
+                1 => CursorIcon::Pointer,
+                2 => CursorIcon::Text,
+                3 => CursorIcon::ColResize,
+                4 => CursorIcon::Grabbing,
+                _ => CursorIcon::Default,
+            });
         }
     }
 
@@ -588,21 +615,30 @@ impl ApplicationHandler<UserEvent> for App {
                     Ok(ev) => {
                         let hover_changed = ev.handler != self.hover_handler;
                         self.hover_handler = ev.handler;
-                        // coalesce runs of moves: only the latest position matters
+                        // coalesce runs of moves: only the latest position matters. the
+                        // hover events the move produced are still taken: a pointer that
+                        // leaves in one quick sweep must say so, or whatever it left stays
+                        // lit until the next click
+                        let mut coalesced = false;
                         if let Some(last) = self.pending.last_mut() {
                             if last.kind == EV_POINTER_MOVE {
-                                *last = ev;
-                                if hover_changed {
-                                    self.request_redraw();
-                                }
-                                return;
+                                *last = ev.clone();
+                                coalesced = true;
                             }
                         }
-                        self.push(ev);
-                        self.push_hover();
-                        if hover_changed {
+                        if !coalesced {
+                            self.push(ev);
+                        }
+                        // a drag step needs a frame of its own: nothing else will ask for
+                        // one, since the handler that moves the layout only runs in it
+                        let queued = self.push_hover();
+                        // a sweep that is picking out text changes what is painted without
+                        // producing an event of its own, so it asks for the frame itself
+                        let sweeping = self.with_core(|inner| inner.selecting).unwrap_or(false);
+                        if hover_changed || queued || sweeping {
                             self.request_redraw();
                         }
+                        self.apply_cursor(x, y);
                     }
                     Err(e) => self.fail(event_loop, e),
                 }

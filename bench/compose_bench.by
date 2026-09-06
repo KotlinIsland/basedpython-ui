@@ -65,6 +65,11 @@ class NullCore:
         return -1
     def take_events(self) -> list[tuple[int, float, float, int, str]]:
         return []
+    def cursor_at(self, x: float, y: float) -> int:
+        return 0
+    def selected_text(self) -> str:
+        return ""
+    def clear_selection(self): ...
     def first_scroll(self) -> tuple[int, float, float, float] | None:
         return None
     def dump(self) -> str:

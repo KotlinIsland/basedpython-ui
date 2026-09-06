@@ -33,6 +33,9 @@ class Core:
     def focused_handler(self) -> int
     def hovered_handler(self) -> int
     def hover_target(self) -> int
+    def cursor_at(self, x: float, y: float) -> int
+    def selected_text(self) -> str
+    def clear_selection(self)
     def take_events(self) -> list[tuple[int, float, float, int, str]]
     def scroll(self, x: float, y: float, dy: float) -> bool
     def scroll_offset(self, node_id: int) -> float | None

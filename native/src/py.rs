@@ -543,9 +543,29 @@ impl Core {
         self.with_state(true, |inner| Ok(input::take_events(inner).iter().map(|e| e.tuple()).collect()))
     }
 
+    /// What the pointer has selected in a `selectable` node, one text per line, or "".
+    fn selected_text(&self) -> PyResult<String> {
+        self.with_state(false, |inner| Ok(input::selected_text(inner)))
+    }
+
+    /// Drop the selection (the app does this when what is shown changes under it).
+    fn clear_selection(&self) -> PyResult<()> {
+        self.with_state(true, |inner| {
+            inner.selection = None;
+            inner.selecting = false;
+            Ok(())
+        })
+    }
+
     /// The `hoverable` handler the pointer is over, or -1.
     fn hover_target(&self) -> PyResult<i32> {
         self.with_state(false, |inner| Ok(input::hover_target(inner)))
+    }
+
+    /// What the pointer should look like at a point: 0 the platform's own, 1 a hand, 2 a
+    /// text bar, 3 a column-resize arrow, 4 a grabbing hand.
+    fn cursor_at(&self, x: f32, y: f32) -> PyResult<u32> {
+        self.with_state(false, |inner| Ok(input::cursor_at(inner, x, y)))
     }
 
     /// Handler index of the focused text field, or -1.

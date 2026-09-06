@@ -292,7 +292,12 @@ fn layout_layer<H: MeasureHost>(
             inner.nodes[id].layers.push(Layer::Drag { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
             s
         }
-        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Scrollbar(_) | ModOp::Reveal | ModOp::Clip => {
+        ModOp::Selectable(argb) => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Select { rect: Rect::new(origin.0, origin.1, s.w, s.h), argb });
+            s
+        }
+        ModOp::Weight(_) | ModOp::Align(_) | ModOp::Hover(_) | ModOp::Scrollbar(_) | ModOp::Reveal | ModOp::Clip | ModOp::Cursor(_) => {
             layout_layer(inner, id, m, i + 1, c, origin, corners, host)
         }
     }
@@ -334,10 +339,10 @@ fn layout_content<H: MeasureHost>(inner: &mut Inner, id: NodeId, c: Constraints,
                     _ => node.placeholder.clone().unwrap_or_else(|| inner.empty_text.clone()),
                 },
             };
-            let key = TextKey::new(shown, Style::DEFAULT, f32::INFINITY);
+            let key = TextKey::new(shown, node.style, f32::INFINITY);
             let s = inner.text.measure(&key);
             inner.nodes[id].text_key = Some(key);
-            let line = crate::text::TextSystem::line_height(Style::DEFAULT);
+            let line = crate::text::TextSystem::line_height(inner.nodes[id].style);
             c.constrain(Size::new(s.w.max(FIELD_MIN_WIDTH) + 2.0 * FIELD_PAD_X, line.max(s.h) + 2.0 * FIELD_PAD_Y))
         }
         Kind::Checkbox => c.constrain(Size::new(CHECKBOX_SIZE, CHECKBOX_SIZE)),

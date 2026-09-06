@@ -59,7 +59,7 @@ not copy it per element beyond one pass). records are fixed width: **8 ints per 
 | 5 | BOX | container; `a` = alignment (0 start, 1 center, 2 end) |
 | 6 | TEXT | `text_idx`; `a` = style id |
 | 7 | BUTTON | `text_idx` = label; `handler_idx` = on_click; `a` = enabled (0/1); `b` = style id |
-| 8 | TEXTFIELD | `text_idx` = value; `b` = placeholder text idx (or -1); `handler_idx` = on_change |
+| 8 | TEXTFIELD | `text_idx` = value; `a` = style id (the caret's colour too, and faded, the placeholder's); `b` = placeholder text idx (or -1); `handler_idx` = on_change |
 | 9 | CHECKBOX | `a` = checked (0/1); `handler_idx` = on_change |
 | 10 | SPACER | |
 | 11 | CANVAS | `a` = first float index, `b` = float count of its draw commands (see floats) |
@@ -231,7 +231,9 @@ can rely on them.
 - `Box`: the single alignment value applies to both axes (0 top-left, 1 centre, 2 bottom-right);
   a child's `align` modifier overrides it. children are measured loosely.
 - `Text` wraps at `max_w`; `Button` is its label plus 12 px / 6 px padding; `TextField` is
-  `max(text width, 120) + 16` by `line height + 12`; `Checkbox` is 18×18; `Spacer` and `Canvas`
+  `max(text width, 120) + 16` by `line height + 12`, and its plain white box and grey border
+  are drawn only where the modifier chain gave it no background or border of its own (the
+  focus ring is always drawn); `Checkbox` is 18×18; `Spacer` and `Canvas`
   take the minimum constraints, so they get their size from modifiers or `weight`.
 - text: sans-serif family Helvetica (macOS) / Segoe UI (windows) / DejaVu Sans (else) with
   cosmic-text's platform fallbacks; line height `ceil(1.25 × size)`; measured sizes are rounded up
@@ -358,6 +360,8 @@ taller, so the second measuring pass is always the last. `dump()` shows `scroll=
 | 17 hoverable | handler index | told when the pointer enters and leaves this layer |
 | 18 scrollbar | argb | the colour of this scroll container's thumb (the default is a translucent black) |
 | 19 draggable | handler index | told when the pointer is pressed here and dragged; the core holds the pointer until it comes up |
+| 20 selectable | argb | the `TEXT` under this node can be selected by sweeping the pointer over it; the colour is the highlight's |
+| 21 cursor | shape | what the pointer looks like over this node: 0 the platform's own, 1 a hand, 2 a text bar, 3 a column-resize arrow, 4 a grabbing hand. the innermost one under the pointer wins (`Core.cursor_at(x, y)`) |
 
 ### style flags
 
@@ -388,6 +392,17 @@ core queues a kind-11 event for the node being left (`text` = "") and one for th
 entered (`text` = "1"), each carrying that node's current hoverable handler and the pointer
 position. `Core.take_events()` drains the queue (the `Window` does this after every pointer event);
 `Core.hover_target()` is the hoverable handler under the pointer, or -1.
+
+### selecting text
+
+a press inside an op-20 node puts a caret where it landed (the byte the glyph under the
+pointer starts at, through cosmic-text's shaped runs) and takes the pointer; every move until
+the release moves the other end, across as many `TEXT` nodes as the sweep covers, in the order
+they read. the highlight is painted under the glyphs, one rectangle per visual line. a press
+that never moves is a click and clears the selection, as is a press outside the node.
+`Core.selected_text()` returns what is covered, one text node per line;
+`Core.clear_selection()` drops it. the press, the moves and the release report handler -1, so
+nothing reads a sweep as a click.
 
 ### dragging
 

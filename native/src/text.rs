@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight, Wrap};
 
-use crate::types::{Size, Style};
+use crate::types::{Rect, Size, Style};
 
 /// Width factor of the monospace estimate used when no font can shape the text.
 pub const FALLBACK_ADVANCE: f32 = 0.6;
@@ -182,6 +182,72 @@ impl TextSystem {
 
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// The byte index in `key`'s text nearest to `(x, y)`, which is where a click lands the
+    /// caret. `(x, y)` are relative to the text's own origin.
+    pub fn index_at(&mut self, key: &TextKey, x: f32, y: f32) -> usize {
+        let text = key.text.clone();
+        let entry = self.entry(key);
+        if entry.fallback {
+            return fallback_index(&text, key.style, x);
+        }
+        let line_height = TextSystem::line_height(key.style);
+        let mut best: Option<usize> = None;
+        let mut last_end = 0usize;
+        for run in entry.buffer.layout_runs() {
+            let top = run.line_top;
+            let on_this_line = y < top + line_height;
+            for glyph in run.glyphs {
+                last_end = glyph.end;
+                if on_this_line && x < glyph.x + glyph.w / 2.0 {
+                    best = Some(glyph.start);
+                    break;
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+            if on_this_line {
+                // past the end of this line: the caret sits after its last glyph
+                return last_end;
+            }
+        }
+        best.unwrap_or(last_end)
+    }
+
+    /// The rectangles covering the bytes `from..to` of `key`'s text, relative to its origin.
+    /// One per visual line, so a wrapped text highlights line by line.
+    pub fn rects_for(&mut self, key: &TextKey, from: usize, to: usize) -> Vec<Rect> {
+        if from >= to {
+            return Vec::new();
+        }
+        let text = key.text.clone();
+        let style = key.style;
+        let entry = self.entry(key);
+        let line_height = TextSystem::line_height(style);
+        if entry.fallback {
+            let advance = style.size() * FALLBACK_ADVANCE;
+            let start = text.get(..from.min(text.len())).map(|s| s.chars().count()).unwrap_or(0) as f32;
+            let end = text.get(..to.min(text.len())).map(|s| s.chars().count()).unwrap_or(0) as f32;
+            return vec![Rect::new(start * advance, 0.0, (end - start).max(0.25) * advance, line_height)];
+        }
+        let mut out = Vec::new();
+        for run in entry.buffer.layout_runs() {
+            let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
+            for glyph in run.glyphs {
+                if glyph.end <= from || glyph.start >= to {
+                    continue;
+                }
+                left = left.min(glyph.x);
+                right = right.max(glyph.x + glyph.w);
+            }
+            if left.is_finite() && right > left {
+                out.push(Rect::new(left, run.line_top, right - left, line_height));
+            }
+        }
+        out
     }
 
     /// Rasterise the glyphs of a shaped text into a premultiplied RGBA8 buffer.
@@ -362,6 +428,13 @@ fn shape(fonts: &mut FontSystem, key: &TextKey, epoch: u64) -> TextEntry {
     TextEntry { buffer, size, fallback, used: epoch }
 }
 
+/// Where a click lands in text nothing could shape: the monospace estimate, by character.
+fn fallback_index(text: &str, style: Style, x: f32) -> usize {
+    let advance = (style.size() * FALLBACK_ADVANCE).max(0.01);
+    let wanted = ((x / advance).round().max(0.0)) as usize;
+    text.char_indices().nth(wanted).map(|(i, _)| i).unwrap_or(text.len())
+}
+
 /// Deterministic estimate for environments without fonts: `0.6 × size` per char,
 /// greedy wrapping at whole characters.
 pub fn monospace_estimate(text: &str, style: Style, max_w: f32) -> Size {
@@ -412,6 +485,20 @@ mod tests {
         let s = ts.measure(&key);
         assert_eq!(s, Size::new(0.0, 18.0));
         assert_eq!(ts.cache_len(), 3);
+    }
+
+    #[test]
+    fn a_click_finds_the_character_under_it_and_a_range_its_rectangle() {
+        let mut ts = TextSystem::monospace_only();
+        let key = TextKey::new(Arc::from("hello world"), Style::DEFAULT, f32::INFINITY);
+        let advance = Style::DEFAULT.size() * FALLBACK_ADVANCE;
+        assert_eq!(ts.index_at(&key, 0.0, 2.0), 0);
+        assert_eq!(ts.index_at(&key, advance * 6.0, 2.0), 6);
+        assert_eq!(ts.index_at(&key, 10_000.0, 2.0), 11, "past the end is the end");
+        let rects = ts.rects_for(&key, 0, 5);
+        assert_eq!(rects.len(), 1);
+        assert!((rects[0].w - advance * 5.0).abs() < 0.01, "{:?}", rects[0]);
+        assert!(ts.rects_for(&key, 3, 3).is_empty());
     }
 
     #[test]

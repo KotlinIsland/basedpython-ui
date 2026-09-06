@@ -146,6 +146,24 @@ impl Node {
     }
 }
 
+/// One end of a text selection: a text node and a byte index into its text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Caret {
+    pub node: NodeId,
+    pub index: usize,
+}
+
+/// A selection dragged out with the pointer. `anchor` is where the press landed and `focus`
+/// where the pointer is now, so either may come first in the tree.
+#[derive(Clone, Copy, Debug)]
+pub struct Selection {
+    pub anchor: Caret,
+    pub focus: Caret,
+    /// The `selectable` node the selection belongs to; a selection never leaves it.
+    pub root: NodeId,
+    pub argb: u32,
+}
+
 /// The text field the core currently edits.
 #[derive(Clone, Debug)]
 pub struct Focus {
@@ -185,6 +203,9 @@ pub struct Inner {
     /// The node a drag started on, while the pointer is still down: until it comes up, every
     /// move belongs to that node however far the pointer travels.
     pub drag_node: Option<NodeId>,
+    /// The text the pointer has selected, and whether it is still being dragged out.
+    pub selection: Option<Selection>,
+    pub selecting: bool,
     /// The enter / leave and drag events not yet taken.
     pub pending_events: Vec<Event>,
     /// commit, layout, paint durations of the last calls, in milliseconds.
@@ -227,6 +248,8 @@ impl Inner {
             hover_node: None,
             hover_target_node: None,
             drag_node: None,
+            selection: None,
+            selecting: false,
             pending_events: Vec::new(),
             timings: [0.0; 3],
             commit_serial: 0,
@@ -361,6 +384,10 @@ impl Inner {
             if self.drag_node == Some(n) {
                 self.drag_node = None;
             }
+            if self.selection.map(|s| s.anchor.node == n || s.focus.node == n || s.root == n) == Some(true) {
+                self.selection = None;
+                self.selecting = false;
+            }
             self.reveal_pending.retain(|&c| c != n);
             if node.kind == Kind::Popup {
                 self.popups.retain(|&c| c != n);
@@ -414,6 +441,27 @@ impl Inner {
             }
         }
         placeholder_hit
+    }
+
+    /// The text nodes under `id`, in the order they read.
+    pub fn text_nodes(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        let mut order = Vec::new();
+        while let Some(n) = stack.pop() {
+            order.push(n);
+            if let Some(node) = self.nodes.get(n) {
+                for &c in node.children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+        for n in order {
+            if self.nodes.get(n).map(|node| node.kind == Kind::Text) == Some(true) {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Nodes in pre-order.

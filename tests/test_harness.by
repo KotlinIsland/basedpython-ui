@@ -4,7 +4,7 @@ layout, hit testing and text editing end to end."""
 from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
-    chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position,
+    chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -532,4 +532,85 @@ def test_the_window_size_is_state_the_layout_can_read():
     events.handle([(5, 900.0, 700.0, -1, "")])
     t.advance()
     assert t.find_text("window 900x700"), t.dump()
+    t.dispose()
+
+
+@composable
+def Fields():
+    let plain = state("")
+    let dressed = state("dark")
+    Column:
+        TextField(plain.value, placeholder="plain"):
+            plain.value = it
+        TextField(
+            dressed.value,
+            Modifier().rounded(8).background(Color(24, 28, 34)).border(1, Color(52, 60, 72)),
+            placeholder="dressed",
+            style=TextStyle(Dp(13.0), Color(230, 233, 239)),
+        ):
+            dressed.value = it
+
+
+def test_a_text_field_takes_a_style_and_its_own_decoration():
+    let t = compose_test(width=400, height=200):
+        Fields()
+    assert t.find_text("plain") and t.find_text("dark"), t.dump()
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    let plain = t.rect_of("plain")
+    let dressed = t.rect_of("dark")
+    # a point inside each field, past its text: the undecorated one keeps the white box the
+    # framework draws, the decorated one is painted in the colours it was given
+    assert at(int(plain[0] + plain[2] - 10.0), int(plain[1] + plain[3] / 2.0)) == (255, 255, 255)
+    assert at(int(dressed[0] + dressed[2] - 10.0), int(dressed[1] + dressed[3] / 2.0)) == (24, 28, 34)
+    t.dispose()
+
+
+@composable
+def Selectable():
+    let copied = state("")
+
+    def keys(chord: str) -> bool:
+        if chord == "cmd+c":
+            copied.value = selected_text()
+            return True
+        return False
+
+    on_key(keys)
+    Column(Modifier().selectable(Color(180, 205, 250))):
+        Text("first line")
+        Text("second line")
+        Text("third line")
+    Text(f"copied {copied.value!r}")
+
+
+def test_text_is_selected_by_sweeping_and_read_from_a_key_handler():
+    let t = compose_test(width=300, height=200):
+        Selectable()
+    assert t.selected_text() == ""
+    assert t.select("first line", "second line") == "first line\nsecond line"
+    # a handler reads what is selected, which is how a copy command gets it
+    assert t.press("cmd+c")
+    t.advance()
+    assert t.find_text("copied 'first line\\nsecond line'"), t.dump()
+    # a click elsewhere in the same text clears it
+    t.click_at(1.0, 1.0)
+    assert t.selected_text() == ""
+    t.dispose()
+
+
+def test_a_node_says_what_the_pointer_should_look_like_over_it():
+    let t = compose_test(width=200, height=100):
+        Column(Modifier().fill_max_size().cursor(CursorShape.Hand)):
+            Text("grab me", Modifier().cursor(CursorShape.ColumnResize))
+    let where = t.rect_of("grab me")
+    assert t.cursor_at(where.0 + 1.0, where.1 + 1.0) == 3, "the text's own shape"
+    assert t.cursor_at(190.0, 90.0) == 1, "the column's, everywhere else"
     t.dispose()

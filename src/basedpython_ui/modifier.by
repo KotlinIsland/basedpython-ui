@@ -27,6 +27,28 @@ let DEFAULT_TEXT_STYLE = TextStyle()
 let SHADOW_COLOR = Color(0, 0, 0, 40)
 
 
+enum class CursorShape:
+    """What the pointer looks like: the platform's own arrow, the hand it shows over
+    something to click, the bar it shows over text, the arrow it shows over a column edge
+    that can be dragged, or the closed hand of something being dragged."""
+
+    case Default, Hand, Text, ColumnResize, Grabbing
+
+
+def cursor_code(shape: CursorShape) -> int:
+    match shape:
+        case CursorShape.Default:
+            return 0
+        case CursorShape.Hand:
+            return 1
+        case CursorShape.Text:
+            return 2
+        case CursorShape.ColumnResize:
+            return 3
+        case CursorShape.Grabbing:
+            return 4
+
+
 enum class ModOp:
     case Padding(left: Dp, top: Dp, right: Dp, bottom: Dp)
     case Width(value: Dp)
@@ -56,6 +78,10 @@ enum class ModOp:
     case Scrollbar(color: Color)
     # told when the pointer is pressed here and dragged, wherever it then goes
     case Drag(on_drag: (str) -> None)
+    # the text under here can be swept over with the pointer; the colour is the highlight's
+    case Selectable(color: Color)
+    # what the pointer looks like over this node
+    case Cursor(shape: CursorShape)
 
 
 frozen data class Modifier:
@@ -138,6 +164,17 @@ frozen data class Modifier:
     def scrollbar(self, color: Color) -> Modifier:
         """The colour of this `Scroll`'s thumb, for a theme the default does not suit."""
         return self.then(ModOp.Scrollbar(color))
+
+    def cursor(self, shape: CursorShape) -> Modifier:
+        """What the pointer looks like over this node. The innermost one under the pointer
+        wins, so a row can set a shape and a widget inside it can override it."""
+        return self.then(ModOp.Cursor(shape))
+
+    def selectable(self, highlight: Color) -> Modifier:
+        """The `Text` inside this node can be selected by sweeping the pointer across it,
+        across as many of them as the sweep covers. `selected_text()` reads what was picked
+        out; a press that selects nothing clears it."""
+        return self.then(ModOp.Selectable(highlight))
 
     def draggable(self, on_drag: (str) -> None) -> Modifier:
         """Called with "start", then "move" for every step, then "end". The pointer belongs
