@@ -317,6 +317,12 @@ fn paint_node(inner: &mut Inner, id: NodeId, painter: &mut Painter, clip: &Rect)
             if let Some(key) = key {
                 // a single-line text is cut off at its own edge rather than spilling over
                 let text_clip = if nowrap { content.intersect(&own_clip) } else { own_clip };
+                // what changed inside the line, under the glyphs and under the selection
+                for (from, to, argb) in inner.nodes[id].modifier.marks.clone() {
+                    for rect in inner.text.rects_for(&key, from, to) {
+                        painter.fill_rect(rect.translated(content.x, content.y), argb, Corners::NONE, &text_clip);
+                    }
+                }
                 // the highlight goes under the glyphs
                 if let (Some(selection), Some((from, to))) = (inner.selection, crate::input::selected_range(inner, id)) {
                     for rect in inner.text.rects_for(&key, from, to) {
@@ -542,6 +548,23 @@ fn paint_canvas_cmd(inner: &mut Inner, painter: &mut Painter, cmd: &CanvasCmd, o
         CanvasCmd::Circle { cx, cy, r, argb } => painter.fill_circle((origin.0 + cx, origin.1 + cy), *r, *argb, clip),
         CanvasCmd::Line { x1, y1, x2, y2, argb, stroke } => {
             painter.stroke_line((origin.0 + x1, origin.1 + y1), (origin.0 + x2, origin.1 + y2), *argb, *stroke, clip)
+        }
+        CanvasCmd::Path { points, argb, stroke } => {
+            if points.len() >= 2 {
+                let mut pb = PathBuilder::new();
+                pb.move_to((origin.0 + points[0].0) * painter.scale, (origin.1 + points[0].1) * painter.scale);
+                for p in &points[1..] {
+                    pb.line_to((origin.0 + p.0) * painter.scale, (origin.1 + p.1) * painter.scale);
+                }
+                pb.close();
+                if let Some(path) = pb.finish() {
+                    if *stroke > 0.0 {
+                        painter.stroke_path(&path, *argb, *stroke, clip);
+                    } else {
+                        painter.fill_path(&path, *argb, clip);
+                    }
+                }
+            }
         }
         CanvasCmd::Curve { x1, y1, cx, cy, x2, y2, argb, stroke } => painter.stroke_curve(
             (origin.0 + x1, origin.1 + y1),

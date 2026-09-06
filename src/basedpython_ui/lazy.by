@@ -1,0 +1,46 @@
+"""a list that only composes the rows you can see.
+
+`Scroll` composes every child, which is why a client built on this framework grows constants
+like "draw at most twelve hundred lines and then stop". a lazy column asks the scroll
+container where it is and how tall its viewport is, and emits the rows in that window with a
+spacer standing in for the rest — so a hundred thousand rows cost the same as thirty"""
+
+from .geometry import Dp, ZERO_DP
+from .modifier import Modifier, Alignment, NONE
+from .runtime import composable, state, keyed
+from .widgets import Column, ColumnScope, Scroll, Spacer
+
+
+# how many rows above and below the viewport are composed anyway, so a scroll of one row
+# does not have to wait for a recomposition to have something to show
+let OVERSCAN = 4
+
+
+@composable
+def LazyColumn(
+    count: int,
+    row_height: Dp,
+    modifier: Modifier = NONE,
+    alignment: Alignment = Alignment.Start,
+    gap: Dp = ZERO_DP,
+    wide: bool = False,
+    once row: ColumnScope.(int) -> None,
+):
+    """`count` rows of `row_height` each, of which only the ones in view are composed. the
+    row block is called with the index it is drawing"""
+    let seen = state((0.0, 0.0))
+    let step = row_height.value + gap.value
+    let offset = seen.value[0]
+    let viewport = seen.value[1]
+    let first = max(0, int(offset / step) - OVERSCAN) if step > 0.0 else 0
+    let visible = (int(viewport / step) + 2 * OVERSCAN + 2) if step > 0.0 else count
+    let last = min(count, first + max(visible, 1))
+    Scroll(modifier, alignment, wide, lambda at, height: seen.set((at, height))):
+        if first > 0:
+            Spacer(Modifier().height(Dp(float(first) * step)))
+        Column(Modifier().fill_max_width().gap(gap)):
+            let scope = self
+            keyed(tuple(range(first, last))).each(key=lambda index: index):
+                row(scope, it)
+        if last < count:
+            Spacer(Modifier().height(Dp(float(count - last) * step)))

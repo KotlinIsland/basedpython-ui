@@ -28,6 +28,14 @@ pub const EV_DRAG: i32 = 12;
 pub const EV_DISMISS: i32 = 13;
 /// A drag passing over, or let go on, a `drop_target`: "over", "leave" or "drop".
 pub const EV_DROP: i32 = 14;
+/// A scroll container moved: `x` is its offset and `y` the height of its viewport, so a
+/// list can compose only the rows that are in it.
+pub const EV_SCROLLED: i32 = 15;
+/// How far the pointer must travel with the button down before a press becomes a drag. Under
+/// it the press is a click, so a row can be both dragged and clicked.
+pub const DRAG_THRESHOLD: f32 = 4.0;
+/// A press landed inside a `focus_region`: the keyboard belongs to that part now.
+pub const EV_FOCUS: i32 = 16;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;
@@ -66,6 +74,8 @@ pub enum Which {
     Select,
     /// `drop_target` layers only — where something being dragged may be let go.
     Drop,
+    /// `focus_region` layers only — the part of the window a press gives the keyboard to.
+    Focus,
 }
 
 /// The result of a hit test.
@@ -123,6 +133,21 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
         if !child.abs.contains(x, y) {
             continue;
         }
+        // a container that clips what it draws clips what it can be pressed on too:
+        // painting already stopped at the viewport, and a thing you cannot see is not a
+        // thing you can click
+        let clips = child.kind == Kind::Scroll || child.modifier.clip;
+        if clips {
+            let content = Rect::new(
+                child.abs.x + child.content_origin.0,
+                child.abs.y + child.content_origin.1,
+                child.content_size.w,
+                child.content_size.h,
+            );
+            if !content.contains(x, y) {
+                continue;
+            }
+        }
         if let Some(h) = hit_children(inner, c, x, y, which) {
             return Some(h);
         }
@@ -156,6 +181,7 @@ fn hit_children(inner: &Inner, id: NodeId, x: f32, y: f32, which: Which) -> Opti
                 (Which::Drag, Layer::Drag { rect, handler }) => Some((rect, *handler)),
                 (Which::Select, Layer::Select { rect, .. }) => Some((rect, 0)),
                 (Which::Drop, Layer::Drop { rect, handler }) => Some((rect, *handler)),
+                (Which::Focus, Layer::Focus { rect, handler }) => Some((rect, *handler)),
                 _ => None,
             };
             if let Some((rect, handler)) = found {
@@ -220,6 +246,14 @@ pub fn pointer(inner: &mut Inner, kind: i32, x: f32, y: f32) -> Event {
         dismiss_outside(inner, x, y);
     }
     let hit = hit_for(inner, x, y, if secondary { Which::Secondary } else { Which::Primary });
+    if kind == EV_POINTER_DOWN {
+        // whichever part of the window the press landed in now owns the keyboard
+        let region = hit_for(inner, x, y, Which::Focus).handler;
+        if region >= 0 && region != inner.focus_region {
+            inner.focus_region = region;
+            inner.pending_events.push(Event::new(EV_FOCUS, x, y, region, String::new()));
+        }
+    }
     if kind == EV_POINTER_DOWN && !dragging && !selecting {
         match hit.focus {
             Some(field) => focus_field_at(inner, field, x, y),
@@ -293,6 +327,14 @@ fn update_selection(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
     match kind {
         EV_POINTER_DOWN => {
             if over_popup(inner, x, y) {
+                inner.selection = None;
+                inner.selecting = false;
+                return false;
+            }
+            // a press on something that can be clicked is that click, not the start of a
+            // sweep: a control inside selectable text has to be reachable, and text inside a
+            // control is not what anybody is trying to copy
+            if hit_for(inner, x, y, Which::Primary).handler >= 0 {
                 inner.selection = None;
                 inner.selecting = false;
                 return false;
@@ -440,32 +482,37 @@ fn update_drag(inner: &mut Inner, kind: i32, x: f32, y: f32) -> bool {
             let hit = hit_for(inner, x, y, Which::Drag);
             match (hit.node, hit.handler >= 0) {
                 (Some(node), true) => {
-                    inner.drag_node = Some(node);
-                    inner.pending_events.push(Event::new(EV_DRAG, x, y, hit.handler, "start".to_string()));
-                    true
+                    // armed, not started: a press that never travels is a click, and a row
+                    // that can be dragged is usually a row that can be clicked as well
+                    inner.drag_armed = Some((node, x, y));
+                    false
                 }
                 _ => false,
             }
         }
+        EV_POINTER_MOVE if inner.drag_node.is_none() => {
+            let Some((node, ox, oy)) = inner.drag_armed else { return false };
+            if (x - ox).abs() < DRAG_THRESHOLD && (y - oy).abs() < DRAG_THRESHOLD {
+                return false;
+            }
+            inner.drag_armed = None;
+            inner.drag_node = Some(node);
+            let Some(handler) = dragging_handler(inner) else { return false };
+            inner.pending_events.push(Event::new(EV_DRAG, ox, oy, handler, "start".to_string()));
+            inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "move".to_string()));
+            announce_drop(inner, x, y);
+            true
+        }
         EV_POINTER_MOVE => match dragging_handler(inner) {
             Some(handler) => {
                 inner.pending_events.push(Event::new(EV_DRAG, x, y, handler, "move".to_string()));
-                // and what it is currently over, so the thing it would land on can say so
-                let over = hit_for(inner, x, y, Which::Drop).handler;
-                if over != inner.drop_node {
-                    if inner.drop_node >= 0 {
-                        inner.pending_events.push(Event::new(EV_DROP, x, y, inner.drop_node, "leave".to_string()));
-                    }
-                    if over >= 0 {
-                        inner.pending_events.push(Event::new(EV_DROP, x, y, over, "over".to_string()));
-                    }
-                    inner.drop_node = over;
-                }
+                announce_drop(inner, x, y);
                 true
             }
             None => false,
         },
         EV_POINTER_UP => {
+            inner.drag_armed = None;
             let handler = dragging_handler(inner);
             let dragging = inner.drag_node.is_some();
             if dragging {
@@ -592,10 +639,43 @@ pub fn scroll_by(inner: &mut Inner, x: f32, y: f32, dx: f32, dy: f32) -> bool {
     if !moved {
         return false;
     }
+    announce_scroll(inner, root, x, y);
     crate::layout::assign_abs(inner);
     inner.hover_node = hit_test(inner, x, y).node;
     update_hover_target(inner, x, y);
     true
+}
+
+/// Tell a scroll container that asked how far it has moved and how tall its viewport is —
+/// which is everything a list needs to draw only the rows that are in view.
+pub fn announce_scroll(inner: &mut Inner, root: NodeId, x: f32, y: f32) {
+    let mut found: Vec<(i32, f32, f32)> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let Some(node) = inner.nodes.get(id) else { continue };
+        if node.kind == Kind::Scroll && node.handler >= 0 {
+            found.push((node.handler, node.scroll, node.content_size.h));
+        }
+        stack.extend(node.children.iter().copied());
+    }
+    for (handler, offset, height) in found {
+        inner.pending_events.push(Event::new(EV_SCROLLED, offset, height, handler, String::new()));
+    }
+}
+
+/// What a drag is over, so the thing it would land on can say so before it lands.
+fn announce_drop(inner: &mut Inner, x: f32, y: f32) {
+    let over = hit_for(inner, x, y, Which::Drop).handler;
+    if over == inner.drop_node {
+        return;
+    }
+    if inner.drop_node >= 0 {
+        inner.pending_events.push(Event::new(EV_DROP, x, y, inner.drop_node, "leave".to_string()));
+    }
+    if over >= 0 {
+        inner.pending_events.push(Event::new(EV_DROP, x, y, over, "over".to_string()));
+    }
+    inner.drop_node = over;
 }
 
 /// The deepest SCROLL node under the point that can still move sideways.
@@ -1290,18 +1370,16 @@ mod tests {
         commit(&mut inner, &ints, &[], &[(0, 0, 4)], &mods, &[]).unwrap();
         layout_tree(&mut inner, &mut NoHost::default());
 
-        // pressing the strip starts a drag rather than a click
-        let down = pointer(&mut inner, EV_POINTER_DOWN, 10.0, 100.0);
-        assert_eq!(down.handler, -1, "the press belongs to the drag, not to a click");
-        let events = take_events(&mut inner);
-        assert_eq!(events.len(), 1);
-        assert_eq!((events[0].kind, events[0].handler, events[0].text.as_str()), (EV_DRAG, 7, "start"));
+        // pressing the strip arms a drag; until the pointer travels it is still a press
+        pointer(&mut inner, EV_POINTER_DOWN, 10.0, 100.0);
+        assert!(take_events(&mut inner).is_empty(), "nothing has been dragged yet");
 
-        // the pointer moves far away, over the other strip: the drag still owns it
+        // the pointer moves far away, over the other strip: the drag starts and owns it
         pointer(&mut inner, EV_POINTER_MOVE, 150.0, 40.0);
         let events = take_events(&mut inner);
-        assert_eq!(events.len(), 1);
-        assert_eq!((events[0].handler, events[0].text.as_str(), events[0].x), (7, "move", 150.0));
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].kind, events[0].handler, events[0].text.as_str()), (EV_DRAG, 7, "start"));
+        assert_eq!((events[1].handler, events[1].text.as_str(), events[1].x), (7, "move", 150.0));
 
         // and releasing ends it, without clicking what is under the pointer
         let up = pointer(&mut inner, EV_POINTER_UP, 150.0, 40.0);

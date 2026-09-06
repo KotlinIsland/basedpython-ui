@@ -852,6 +852,25 @@ pub fn parse_canvas(inner: &Inner, floats: &[f64], strs: &[&str]) -> Result<Vec<
                 stroke: fin(a[7], "stroke", i)?.max(0.0),
             });
             i += 9;
+        } else if op == 6.0 {
+            // a polygon: how many points, then the pairs, then the colour and the stroke
+            let head = need(1)?;
+            let n = head[0];
+            if !n.is_finite() || n < 2.0 || n.fract() != 0.0 || n > 4096.0 {
+                bad!("canvas path op at {}: {} points is not between 2 and 4096", i, n);
+            }
+            let n = n as usize;
+            let a = need(1 + n * 2 + 2)?;
+            let mut points = Vec::with_capacity(n);
+            for p in 0..n {
+                points.push((fin(a[1 + p * 2], "x", i)?, fin(a[2 + p * 2], "y", i)?));
+            }
+            out.push(CanvasCmd::Path {
+                points,
+                argb: argb_from_f64(a[1 + n * 2]).map_err(InputError)?,
+                stroke: fin(a[2 + n * 2], "stroke", i)?.max(0.0),
+            });
+            i += 2 + n * 2 + 2;
         } else if op == 4.0 {
             let a = need(4)?;
             let ti = a[2];

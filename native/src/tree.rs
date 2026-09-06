@@ -297,6 +297,10 @@ pub struct Inner {
     pub pressed_node: Option<NodeId>,
     /// The `drop_target` handler a drag is currently over, or -1.
     pub drop_node: i32,
+    /// A press on a draggable layer that has not travelled far enough to be a drag yet.
+    pub drag_armed: Option<(NodeId, f32, f32)>,
+    /// The `focus_region` handler a press last landed in, or -1.
+    pub focus_region: i32,
     /// The text the pointer has selected, and whether it is still being dragged out.
     pub selection: Option<Selection>,
     pub selecting: bool,
@@ -376,6 +380,8 @@ impl Inner {
             drag_node: None,
             pressed_node: None,
             drop_node: -1,
+            drag_armed: None,
+            focus_region: -1,
             selection: None,
             selecting: false,
             pending_events: Vec::new(),
@@ -580,11 +586,17 @@ impl Inner {
         let mut stack = vec![id];
         let mut order = Vec::new();
         while let Some(n) = stack.pop() {
-            order.push(n);
             if let Some(node) = self.nodes.get(n) {
+                // a subtree left out of a sweep takes its children with it
+                if node.modifier.unselectable && n != id {
+                    continue;
+                }
+                order.push(n);
                 for &c in node.children.iter().rev() {
                     stack.push(c);
                 }
+            } else {
+                order.push(n);
             }
         }
         for n in order {

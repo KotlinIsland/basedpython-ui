@@ -8,9 +8,9 @@ from array import array
 
 from . import modifier as _modifier
 from . import runtime as _runtime
-from .geometry import Dp, Size, Constraints, Color, ONE_DP
+from .geometry import Dp, Size, Constraints, Color, ONE_DP, ZERO_DP
 from .modifier import Modifier, ModOp, Alignment, Arrangement, CursorShape, TextStyle, cursor_code
-from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError, builder
+from .runtime import Runtime, NativeCore, CanvasRecorder, CompositionError, builder, input_position
 
 # imports are lazy proxies; the values used on every builder call are bound
 # to the real objects once, here, so a record never carries a proxy
@@ -75,6 +75,17 @@ class DrawScope:
     def curve(self, x1: float, y1: float, cx: float, cy: float, x2: float, y2: float, color: Color, stroke: Dp = ONE_DP):
         """A quadratic curve from `(x1, y1)` to `(x2, y2)`, bending towards `(cx, cy)`."""
         self.recorder.floats.extend((5.0, x1, y1, cx, cy, x2, y2, float(color.argb()), stroke.value))
+
+    def path(self, points: tuple[tuple[float, float], ...], color: Color, stroke: Dp = ZERO_DP):
+        """An arbitrary closed polygon: filled when `stroke` is zero, outlined otherwise.
+        What a mark that is not a circle, a line or a box is drawn with."""
+        if len(points) < 2:
+            return
+        self.recorder.floats.append(6.0)
+        self.recorder.floats.append(float(len(points)))
+        for point in points:
+            self.recorder.floats.extend((point[0], point[1]))
+        self.recorder.floats.extend((float(color.argb()), stroke.value))
 
     def text(self, text: str, x: float, y: float, style: TextStyle = DEFAULT_TEXT_STYLE):
         idx = len(self.recorder.strs)
@@ -155,6 +166,12 @@ private def encode_modifier(modifier: object, rt: Runtime) -> list[float]:
                 ops.extend((25.0, float(color.argb())))
             case ModOp.DropTarget(on_drop):
                 ops.extend((26.0, float(rt.handler(on_drop))))
+            case ModOp.FocusRegion(on_focus):
+                ops.extend((27.0, float(rt.handler(lambda: on_focus()))))
+            case ModOp.Unselectable:
+                ops.append(28.0)
+            case ModOp.Mark(start, end, color):
+                ops.extend((29.0, float(start), float(end), float(color.argb())))
     return ops
 
 
@@ -307,8 +324,20 @@ def Box(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, once 
     rt.ints.extend(_END_RECORD)
 
 
+private def report_scroll(on_scroll: ((float, float) -> None) | None):
+    if on_scroll is not None:
+        let at = input_position()
+        on_scroll(at[0], at[1])
+
+
 @builder
-def Scroll(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, wide: bool = False, once content: ColumnScope.() -> None) raises ...:
+def Scroll(
+    modifier: Modifier = NONE,
+    alignment: Alignment = Alignment.Start,
+    wide: bool = False,
+    on_scroll: ((float, float) -> None) | None = None,
+    once content: ColumnScope.() -> None,
+) raises ...:
     """A vertically scrolling column: the content may be taller than the node, which takes
     the height its constraints give it (`fill_max_height` / `weight` make it the viewport).
     The wheel scrolls it; a child with `Modifier().reveal()` is scrolled into view. Once the
@@ -319,7 +348,10 @@ def Scroll(modifier: Modifier = NONE, alignment: Alignment = Alignment.Start, wi
     of the viewport, and pans sideways — which is where a line wider than the window goes."""
     rt = composing()
     flags, k = key_flags(rt)
-    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), -1, 1 if wide else 0, k, alignment_code(alignment)))
+    # the offset and the viewport's height ride in the event's position, which is what
+    # `input_position()` hands back inside the handler
+    let scrolled = -1 if on_scroll is None else rt.handler(lambda: report_scroll(on_scroll))
+    rt.ints.extend((R_SCROLL, flags, -1, optional_modifier(rt, modifier), scrolled, 1 if wide else 0, k, alignment_code(alignment)))
     rt.depth += 1
     content(_COLUMN_SCOPE)
     rt.depth -= 1

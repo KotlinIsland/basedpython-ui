@@ -269,6 +269,9 @@ pub enum ModOp {
     /// A handler told what a drag is over and where it was let go: without it a drag knows
     /// where the pointer is and nothing about what is under it.
     DropTarget(i32),
+    /// A handler told when a press lands inside this node, so a key can mean one thing in
+    /// one part of a window and something else in another.
+    FocusRegion(i32),
 }
 
 /// An interned modifier chain. `weight` / `align` / `hover` / `reveal` / `clip` are read by
@@ -290,9 +293,15 @@ pub struct Modifier {
     pub cursor: u32,
     /// A text field that takes more than one line.
     pub multiline: bool,
+    /// Left out of a sweep of the pointer: a line number beside a diff is not part of the
+    /// text, and copying it with the text is not what anybody meant.
+    pub unselectable: bool,
     /// Space a `Row` or `Column` puts between its children, so a container spaces itself
     /// instead of every caller placing a spacer by hand.
     pub gap: f32,
+    /// Runs of this node's own text painted with a colour behind them, as byte offsets into
+    /// it: what says *these* words of the line are the ones that changed.
+    pub marks: Vec<(usize, usize, u32)>,
 }
 
 impl Modifier {
@@ -309,7 +318,9 @@ impl Modifier {
         let mut cursor = 0u32;
         let mut gap = 0.0f32;
         let mut pressed = None;
+        let mut unselectable = false;
         let mut multiline = false;
+        let mut marks: Vec<(usize, usize, u32)> = Vec::new();
         while i < raw.len() {
             let op = raw[i];
             let take = |n: usize| -> Result<&[f64], String> {
@@ -467,6 +478,24 @@ impl Modifier {
                     ops.push(ModOp::DropTarget(handler_index(a[0], "drop_target")?));
                     i += 2;
                 }
+                x if x == 27.0 => {
+                    let a = take(1)?;
+                    ops.push(ModOp::FocusRegion(handler_index(a[0], "focus_region")?));
+                    i += 2;
+                }
+                x if x == 28.0 => {
+                    unselectable = true;
+                    i += 1;
+                }
+                x if x == 29.0 => {
+                    let a = take(3)?;
+                    let from = non_negative(a[0], "mark")? as usize;
+                    let to = non_negative(a[1], "mark")? as usize;
+                    if to > from {
+                        marks.push((from, to, argb_from_f64(a[2])?));
+                    }
+                    i += 4;
+                }
                 x if x == 21.0 => {
                     let a = take(1)?;
                     let kind = finite(a[0], "cursor")?;
@@ -480,7 +509,7 @@ impl Modifier {
                 _ => return Err(format!("unknown modifier op {} at {}", op, i)),
             }
         }
-        Ok(Modifier { ops, weight, align, hover, pressed, scrollbar, reveal, clip, cursor, multiline, gap })
+        Ok(Modifier { ops, weight, align, hover, pressed, scrollbar, reveal, clip, cursor, multiline, unselectable, gap, marks })
     }
 }
 
@@ -565,6 +594,8 @@ pub enum Layer {
     Click { rect: Rect, handler: i32, hover: Option<u32>, pressed: Option<u32>, corners: Corners },
     /// Where something being dragged may be let go.
     Drop { rect: Rect, handler: i32 },
+    /// A part of the window a press gives the keyboard to.
+    Focus { rect: Rect, handler: i32 },
     /// The right button over this rect.
     Secondary { rect: Rect, handler: i32 },
     /// Told when the pointer enters and leaves this rect.
@@ -587,6 +618,9 @@ pub enum CanvasCmd {
     /// A quadratic curve from one point to another, bending towards `(cx, cy)`.
     Curve { x1: f32, y1: f32, cx: f32, cy: f32, x2: f32, y2: f32, argb: u32, stroke: f32 },
     Text { x: f32, y: f32, text: Arc<str>, style: Style },
+    /// An arbitrary polygon: filled when `stroke` is 0, outlined otherwise. The points are
+    /// pairs, in order, and the shape is closed.
+    Path { points: Vec<(f32, f32)>, argb: u32, stroke: f32 },
 }
 
 /// Malformed input from Python: becomes a `ValueError`. The tree is untouched when raised.

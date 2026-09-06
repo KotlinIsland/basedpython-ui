@@ -5,7 +5,7 @@ from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
     chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
-    State,
+    State, LazyColumn,
 )
 import time
 
@@ -759,6 +759,7 @@ def test_a_drag_says_what_it_was_let_go_on():
     let there = t.rect_of("there")
     _ = t.core.pointer(1, handle.0 + 5.0, handle.1 + 5.0)
     t._deliver()
+    # a press that has not travelled is still a press: the drag starts once it moves
     _ = t.core.pointer(3, here.0 + 5.0, here.1 + 5.0)
     t._deliver()
     _ = t.core.pointer(3, there.0 + 5.0, there.1 + 5.0)
@@ -770,6 +771,101 @@ def test_a_drag_says_what_it_was_let_go_on():
     t.dispose()
 
 
+def test_a_lazy_list_composes_only_the_rows_in_view():
+    """`Scroll` composes every child, which is why a client on this framework grows constants
+    like *draw twelve hundred lines and then stop*. a lazy column emits the window it can see
+    and a spacer standing in for the rest"""
+    let t = compose_test(width=200, height=100):
+        LazyColumn(1000, Dp(20.0), Modifier().fill_max_size()):
+            let index = it
+            Text(f"row {index}", Modifier().fill_max_width().height(Dp(20.0)))
+    t.advance()
+    let shown = [line for line in t.all_text() if line.startswith("row ")]
+    assert len(shown) < 40, f"only what is in view, not a thousand rows: {len(shown)}"
+    assert "row 0" in shown, shown[:4]
+    assert "row 900" not in shown
+
+    # scrolling down composes a different window of them, and the list is still a thousand tall
+    _ = t.core.scroll(100.0, 50.0, 4000.0)
+    t._deliver()
+    t.advance()
+    t.advance()
+    let later = [line for line in t.all_text() if line.startswith("row ")]
+    assert later and later != shown, (shown[:3], later[:3])
+    assert "row 0" not in later, later[:4]
+    t.dispose()
+
+
+def test_a_press_says_which_part_of_the_window_the_keyboard_belongs_to():
+    """`on_key` offers a chord to the deepest scope first, which is not the same as knowing
+    where you are. a focus region is told when a press lands in it, so `j` can move a list on
+    one side and do something else on the other"""
+    said: list[str] = []
+    let t = compose_test(width=200, height=200):
+        Column(Modifier().fill_max_size()):
+            Text("left", Modifier().fill_max_width().height(Dp(60.0)).focus_region(lambda: note(said, "left")))
+            Text("right", Modifier().fill_max_width().height(Dp(60.0)).focus_region(lambda: note(said, "right")))
+    def press_on(label: str):
+        let box = t.rect_of(label)
+        _ = t.core.pointer(1, box.0 + 5.0, box.1 + 5.0)
+        t._deliver()
+        _ = t.core.pointer(2, box.0 + 5.0, box.1 + 5.0)
+        t._deliver()
+
+    press_on("left")
+    t.advance()
+    press_on("right")
+    t.advance()
+    # and pressing the same one again says nothing: it already had the keyboard
+    press_on("right")
+    t.advance()
+    assert said == ["left", "right"], said
+    t.dispose()
+
+
+def test_a_canvas_draws_an_arbitrary_shape():
+    """circles, lines and boxes are three shapes. anything else — an arrow, a chevron, a
+    mark of any kind — needed a path, and there was not one"""
+    let t = compose_test(width=100, height=100):
+        Canvas(Modifier().fill_max_size()):
+            path(((10.0, 10.0), (90.0, 10.0), (50.0, 90.0)), Color(255, 0, 0))
+            path(((20.0, 20.0), (80.0, 20.0), (50.0, 70.0)), Color(0, 0, 255), stroke=Dp(2.0))
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    let scale = width // 100
+    # inside the filled triangle, and outside every shape
+    let inside = at(50 * scale, 30 * scale)
+    let outside = at(5 * scale, 95 * scale)
+    assert inside != outside, (inside, outside)
+    assert outside[0] > 200 and outside[1] > 200, outside
+    t.dispose()
+
+
+def test_a_thing_you_cannot_see_is_not_a_thing_you_can_click():
+    """painting stopped at a scroll container's edge and hit testing did not, so a button
+    scrolled out of view was invisible and still answered a press"""
+    clicked: list[str] = []
+    let t = compose_test(width=200, height=100):
+        Scroll(Modifier().fill_max_size()):
+            Text("near", Modifier().fill_max_width().height(Dp(60.0)).clickable(lambda: note(clicked, "near")))
+            Text("far", Modifier().fill_max_width().height(Dp(60.0)).clickable(lambda: note(clicked, "far")))
+            Text("further", Modifier().fill_max_width().height(Dp(60.0)).clickable(lambda: note(clicked, "further")))
+    let out_of_view = t.rect_of("further")
+    assert out_of_view.1 > 100.0, f"it is below the viewport: {out_of_view}"
+    assert t.core.hit_test(out_of_view.0 + 5.0, out_of_view.1 + 5.0) < 0, "and nothing there answers"
+    t.click("near")
+    t.advance()
+    assert clicked == ["near"], clicked
+    t.dispose()
+
+
 def test_a_node_says_what_the_pointer_should_look_like_over_it():
     let t = compose_test(width=200, height=100):
         Column(Modifier().fill_max_size().cursor(CursorShape.Hand)):
@@ -777,4 +873,34 @@ def test_a_node_says_what_the_pointer_should_look_like_over_it():
     let where = t.rect_of("grab me")
     assert t.cursor_at(where.0 + 1.0, where.1 + 1.0) == 3, "the text's own shape"
     assert t.cursor_at(190.0, 90.0) == 1, "the column's, everywhere else"
+    t.dispose()
+
+
+def test_a_run_of_a_line_can_be_painted_behind_without_splitting_it_up():
+    """word-level highlighting inside a diff line. splitting the line into a text node per
+    word would paint it, and would also make a sweep of the pointer copy one word a line, so
+    the run is a property of the one node instead"""
+    let t = compose_test(width=300, height=80):
+        Column(Modifier().fill_max_size().background(Color(255, 255, 255))):
+            Text(
+                "aaaaaaaaaabbbbbbbbbb",
+                Modifier().mark(10, 20, Color(255, 0, 0)),
+                style=TextStyle(Dp(13.0), Color(0, 0, 0), False, True),
+            )
+    let core: dynamic = t.core
+    core.paint()
+    width, height = core.pixel_size()
+    let pixels: bytes = core.pixels()
+
+    def at(x: int, y: int) -> tuple[int, int, int]:
+        let offset = (y * width + x) * 4
+        return (pixels[offset], pixels[offset + 1], pixels[offset + 2])
+
+    let line = t.rect_of("aaaaaaaaaabbbbbbbbbb")
+    let middle = int(line.1 + line.3 / 2.0)
+    # the second half is behind the mark and the first half is not: monospace, so the
+    # halves are the same width
+    assert at(int(line.0 + line.2 * 0.75), middle)[0] == 255
+    assert at(int(line.0 + line.2 * 0.75), middle)[1] == 0
+    assert at(int(line.0 + line.2 * 0.25), middle)[1] == 255, "the untouched half is still white"
     t.dispose()

@@ -401,6 +401,14 @@ impl Pane {
             let core = self.core.clone_ref(py);
             self.on_frame.call1(py, (core,))?.is_truthy(py)
         })?;
+        // what composing and laying out produced — a child asking to be revealed scrolls
+        // its container, and the container is told. taken now, it goes out at the top of
+        // the next frame against the handler table this one built; left in the core it
+        // would wait for the next pointer event and be answered by whatever had taken its
+        // index by then
+        if self.push_hover() {
+            self.request_redraw();
+        }
         self.blit()?;
         // what the core says it still has to animate, asked once a frame rather than once a
         // turn of the loop: crossing into python to find out is not free

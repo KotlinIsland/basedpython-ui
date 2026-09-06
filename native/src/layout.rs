@@ -135,6 +135,10 @@ fn layout_popups<H: MeasureHost>(inner: &mut Inner, host: &mut H) {
 
 /// Scroll the nearest scroll container of every node that asked to be revealed this commit.
 fn apply_reveals(inner: &mut Inner) {
+    // a list that draws only what is in view is told where the view is, every time the tree
+    // is laid out — the content it was measuring against may have changed under it
+    let root = inner.root;
+    crate::input::announce_scroll(inner, root, 0.0, 0.0);
     let pending = std::mem::take(&mut inner.reveal_pending);
     let mut changed = false;
     for id in pending {
@@ -269,6 +273,11 @@ fn layout_layer<H: MeasureHost>(
         ModOp::DropTarget(handler) => {
             let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
             inner.nodes[id].layers.push(Layer::Drop { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
+            s
+        }
+        ModOp::FocusRegion(handler) => {
+            let s = layout_layer(inner, id, m, i + 1, c, origin, corners, host);
+            inner.nodes[id].layers.push(Layer::Focus { rect: Rect::new(origin.0, origin.1, s.w, s.h), handler });
             s
         }
         ModOp::Rounded(r) => layout_layer(inner, id, m, i + 1, c, origin, r, host),

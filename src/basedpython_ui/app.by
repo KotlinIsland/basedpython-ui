@@ -116,6 +116,12 @@ class WindowEvents:
                 case 14:
                     # a drag over a drop target: "over", "leave" or "drop"
                     runtime.dispatch(handler_idx, text, "", (x, y))
+                case 15:
+                    # a scroll container moved: its offset and its viewport's height
+                    runtime.dispatch(handler_idx, None, "", (x, y))
+                case 16:
+                    # a press landed in a part of the window: the keyboard is its now
+                    runtime.dispatch(handler_idx, None, "", (x, y))
                 case _:
                     pass
 
@@ -211,6 +217,11 @@ class TestComposition:
         (or `steps` frames), letting queued tasks make progress in between."""
         for _ in range(steps):
             self.runtime.frame(self.measure)
+            # what the frame itself produced — a child asking to be revealed scrolls its
+            # container, and the container is told — goes out against the handler table this
+            # frame just built. left until the next pointer event it would be answered by
+            # whatever had taken its index by then
+            self._deliver()
             self.loop.run_until_complete(asyncio.sleep(0))
             if self.runtime.is_idle():
                 return
@@ -264,7 +275,9 @@ class TestComposition:
         """Dispatch what the last pointer event produced: hover enters and leaves, the steps
         of a drag, and the presses that landed outside a `dismiss` layer."""
         for kind, x, y, handler_idx, text in self.core.take_events():
-            payload: object = None if kind == 13 else (text == "1" if kind == 11 else text)
+            # 13 is a dismiss and 15 a scroll: neither carries a payload, and a scroll's
+            # position is its offset and the height of its viewport
+            payload: object = None if kind in (13, 15, 16) else (text == "1" if kind == 11 else text)
             self.runtime.dispatch(handler_idx, payload, "", (x, y))
 
     def drag(self, label: str, dx: float, dy: float, steps: int = 2):

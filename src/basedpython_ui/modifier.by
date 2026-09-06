@@ -92,6 +92,12 @@ enum class ModOp:
     case Pressed(color: Color)
     # told when a drag passes over this node, leaves it, or is let go on it
     case DropTarget(on_drop: (str) -> None)
+    # told when a press lands inside this node, so the keyboard can belong to a part
+    case FocusRegion(on_focus: () -> None)
+    # left out of a sweep of the pointer, along with everything inside it
+    case Unselectable
+    # a run of this node's own text painted with a colour behind it
+    case Mark(start: int, end: int, color: Color)
 
 
 frozen data class Modifier:
@@ -197,6 +203,24 @@ frozen data class Modifier:
         again, and "drop" when it is let go here. `draggable` says where the pointer is;
         this says what is under it, which is what a drag that moves a thing needs."""
         return self.then(ModOp.DropTarget(on_drop))
+
+    def focus_region(self, on_focus: () -> None) -> Modifier:
+        """Called when a press lands anywhere inside this node. `on_key` offers a chord to
+        the deepest scope first, which is not the same as knowing where you are: with this,
+        a key can mean one thing in one part of a window and something else in another."""
+        return self.then(ModOp.FocusRegion(on_focus))
+
+    def unselectable(self) -> Modifier:
+        """Leaves this node and everything in it out of a sweep of the pointer. A line number
+        beside a diff is not part of the text, and copying it with the text is not what
+        anybody meant."""
+        return self.then(ModOp.Unselectable)
+
+    def mark(self, start: int, end: int, color: Color) -> Modifier:
+        """Paints `color` behind the bytes `start..end` of this node's own `Text`, wrapping
+        with it. A line of a diff is one text node so that a sweep of the pointer copies it
+        as a line; this is how the words inside it that changed can still be picked out."""
+        return self.then(ModOp.Mark(start, end, color))
 
     def multiline(self) -> Modifier:
         """A `TextField` that takes more than one line: it wraps inside the width it is
