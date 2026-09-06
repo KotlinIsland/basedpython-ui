@@ -222,7 +222,9 @@ impl TextSystem {
         }
         for run in entry.buffer.layout_runs() {
             for glyph in run.glyphs {
-                let phys = glyph.physical((origin.0, origin.1 + run.line_y), scale);
+                // `physical` scales the glyph's own position but adds the offset as given, so
+                // the origin has to be handed over in physical pixels
+                let phys = glyph.physical((origin.0 * scale, (origin.1 + run.line_y) * scale), scale);
                 let Some(image) = swash.get_image(&mut fonts, phys.cache_key) else { continue };
                 let x0 = phys.x + image.placement.left;
                 let y0 = phys.y - image.placement.top;
@@ -428,6 +430,11 @@ mod tests {
         let mut buf = vec![0u8; 200 * 40 * 4];
         ts.draw(&key, (2.0, 2.0), 1.0, 0xFF000000, &mut buf, 200, 40, Some((150, 0, 200, 40)));
         assert!(buf.iter().all(|&b| b == 0));
+        // at scale 2 a logical origin of (50, 2) lands at physical x >= 100: nothing to its left
+        let mut buf = vec![0u8; 300 * 60 * 4];
+        ts.draw(&key, (50.0, 2.0), 2.0, 0xFF000000, &mut buf, 300, 60, None);
+        let ink_x: Vec<usize> = (0..300).filter(|&x| (0..60).any(|y| buf[(y * 300 + x) * 4 + 3] != 0)).collect();
+        assert!(!ink_x.is_empty() && *ink_x.iter().min().unwrap() >= 98, "{:?}", ink_x.iter().min());
         // a monospace, no-wrap style shapes on one line
         let mono = TextKey::new(Arc::from("0123456789 0123456789 0123456789"), Style::with_flags(14.0, 0xFF000000, STYLE_MONO | STYLE_NOWRAP), 40.0);
         let sm = ts.measure(&mono);

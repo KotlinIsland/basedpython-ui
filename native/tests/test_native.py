@@ -406,3 +406,19 @@ def test_style_flags_and_decorated_layers():
         commit(core, records, ["mono bold nowrap"], styles=[(2, 14.0, 0.0, 8)])
     with pytest.raises(ValueError):
         commit(core, records, ["x"], mods=[(9, [10.0, -1.0])])
+
+
+def test_text_is_painted_at_the_scaled_position():
+    core = Core(200.0, 60.0, 2.0)
+    mods = [(1, [1.0, 60.0, 10.0, 0.0, 0.0])]  # padding: left 60, top 10
+    commit(core, [rec(COLUMN, modifier=1), rec(TEXT, text=0), END], ["hello"], mods=mods)
+    core.layout()
+    core.paint()
+    assert core.find_text("hello")[1:3] == (60.0, 10.0), "logical position"
+    px = core.pixels()
+    pw, ph = core.pixel_size()
+    assert (pw, ph) == (400, 120)
+    ink = [x for x in range(pw) if any(pixel(px, pw, x, y) != (255, 255, 255, 255) for y in range(ph))]
+    assert ink and min(ink) >= 118, f"ink starts at physical x={min(ink) if ink else None}, expected >= 120"
+    rows = [y for y in range(ph) if any(pixel(px, pw, x, y) != (255, 255, 255, 255) for x in range(pw))]
+    assert min(rows) >= 18, f"ink starts at physical y={min(rows)}, expected >= 20"

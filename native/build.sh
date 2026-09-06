@@ -10,11 +10,15 @@ cargo build --release
 suffix="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 dest="../src/basedpython_ui/_native${suffix}"
 if [ -f target/release/lib_native.dylib ]; then
-    cp target/release/lib_native.dylib "$dest"
+    built=target/release/lib_native.dylib
 elif [ -f target/release/lib_native.so ]; then
-    cp target/release/lib_native.so "$dest"
+    built=target/release/lib_native.so
 else
     echo "build.sh: no lib_native artefact in target/release" >&2
     exit 1
 fi
+# install under a fresh inode: overwriting a module in place while a running app has it
+# mapped makes macOS kill every later process that maps the file (code signature invalid)
+cp "$built" "$dest.new"
+mv -f "$dest.new" "$dest"
 echo "built $dest"

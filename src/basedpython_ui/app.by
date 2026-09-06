@@ -5,7 +5,13 @@ import threading
 from array import array
 from collections.abc import Coroutine
 
-from .runtime import Runtime, NativeCore, Task, Recomposition
+from .runtime import Runtime, NativeCore, Task, State, Recomposition
+
+
+# the appearance the window follows, "light" or "dark": set by `run_app` when the window
+# opens and whenever the system changes it; a composition that reads it recomposes. headless
+# compositions leave it at "light" unless a test sets it
+let system_theme: State[str] = State("light")
 
 
 private def load_native() -> dynamic raises ImportError:
@@ -55,29 +61,30 @@ private def measure_dispatcher(rt: Runtime, core: NativeCore) -> object:
 
     return measure
 
-def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, trace: bool = True, root: () -> None) raises ...:
-    """Open a window, compose `root` into it and drive frames until the
-    window closes. Owns the main thread (the window system requires it).
-    `trace=False` turns the recomposition trace off for this runtime."""
-    native = load_native()
-    window = native.Window(title, float(width), float(height))
-    tasks = _TaskThread()
-    rt: Runtime? = None
-    measure: object = None
-    pressed: list[int] = [-1]
+class WindowEvents:
+    """Turns the window's event tuples into runtime dispatches. The window delivers its
+    first events (the size, the appearance) before the first frame creates the runtime, so
+    what does not need one is handled regardless."""
 
-    def on_events(events: list[(int, float, float, int, str)]):
-        runtime = rt
-        if runtime is None:
-            return
+    init(self):
+        self.runtime: Runtime | None = None
+        self.pressed: int = -1
+
+    def handle(self, events: list[tuple[int, float, float, int, str]]):
+        runtime = self.runtime
         for kind, x, y, handler_idx, text in events:
+            if kind == 8:
+                system_theme.value = text
+                continue
+            if runtime is None:
+                continue
             match kind:
                 case 1:
-                    pressed[0] = handler_idx
+                    self.pressed = handler_idx
                 case 2:
-                    if handler_idx >= 0 and handler_idx == pressed[0]:
+                    if handler_idx >= 0 and handler_idx == self.pressed:
                         runtime.dispatch(handler_idx, None, text)
-                    pressed[0] = -1
+                    self.pressed = -1
                 case 4:
                     if handler_idx >= 0:
                         runtime.dispatch(handler_idx, text)
@@ -88,20 +95,33 @@ def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, 
                 case _:
                     pass
 
+
+def run_app(title: str = "basedpython-ui", width: int = 800, height: int = 600, trace: bool = True, root: () -> None) raises ...:
+    """Open a window, compose `root` into it and drive frames until the
+    window closes. Owns the main thread (the window system requires it).
+    `trace=False` turns the recomposition trace off for this runtime."""
+    native = load_native()
+    window = native.Window(title, float(width), float(height))
+    tasks = _TaskThread()
+    events = WindowEvents()
+    measure: object = None
+
     def on_frame(core: NativeCore) -> bool:
-        nonlocal rt, measure
+        nonlocal measure
+        rt = events.runtime
         if rt is None:
             rt = Runtime(core, trace=trace)
             rt.task_runner = tasks.run
             rt.wake = window.request_frame
             measure = measure_dispatcher(rt, core)
             rt.set_root(root)
+            events.runtime = rt
         rt.frame(measure)
         core.paint()
         return not rt.is_idle()
 
     try:
-        window.run(on_frame, on_events)
+        window.run(on_frame, events.handle)
     finally:
         tasks.stop()
 

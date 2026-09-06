@@ -11,6 +11,9 @@ pub const EV_RESIZE: i32 = 5;
 pub const EV_CLOSE: i32 = 6;
 /// A key chord for the application (`text` is e.g. "cmd+x", "shift+up", "pagedown").
 pub const EV_KEY_CHORD: i32 = 7;
+/// The system appearance the window follows (`text` is "light" or "dark"); sent when the
+/// window opens and whenever it changes.
+pub const EV_THEME: i32 = 8;
 
 /// Lines of a mouse-wheel tick, in logical pixels.
 pub const WHEEL_LINE: f32 = 40.0;

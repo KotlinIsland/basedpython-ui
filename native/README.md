@@ -14,6 +14,10 @@ needs the nightly toolchain (`cargo 1.97`) and `python3.14` on the path (`PYO3_P
 it; `.cargo/config.toml` sets the default and the macOS link flags). the module imports as
 `basedpython_ui._native`; the `.so` is gitignored.
 
+quit any app running from this checkout's `out/` before rebuilding: `build.sh` installs the
+module under a fresh inode, but `by build` copies it into `out/` in place, and macOS kills every
+process that maps a code file whose contents changed while another process had it mapped.
+
 ## test
 
 ```sh

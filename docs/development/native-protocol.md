@@ -370,6 +370,9 @@ the `Window` clears it when the cursor leaves the window.
   turns the unfocused kind-4 texts into chord names (`chord_of_text`).
 - pointer events (kinds 1, 2, 3) carry the held modifiers in `text` ("", "shift",
   "shift+cmd", …) so a click handler can read them (`input_modifiers()`).
+- kind **8 THEME**: `(8, 0, 0, -1, "light" | "dark")`, the appearance the window follows,
+  sent when the window opens (when the platform reports one) and on every change; the
+  python side keeps it in `basedpython_ui.app.system_theme`, a `State[str]`.
 
 ### extra `Core` methods
 

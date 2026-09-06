@@ -17,9 +17,9 @@ use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window as WinitWindow, WindowId};
+use winit::window::{Theme, Window as WinitWindow, WindowId};
 
-use crate::input::{self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, WHEEL_LINE};
+use crate::input::{self, Event, EV_CLOSE, EV_KEY_CHORD, EV_POINTER_DOWN, EV_POINTER_MOVE, EV_POINTER_UP, EV_RESIZE, EV_THEME, WHEEL_LINE};
 use crate::py::Core;
 use crate::text::TextSystem;
 use crate::tree::Inner;
@@ -118,6 +118,13 @@ impl Window {
                 let _ = proxy.send_event(UserEvent::Close);
             }
         }
+    }
+}
+
+fn theme_name(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "dark",
+        Theme::Light => "light",
     }
 }
 
@@ -435,6 +442,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.surface = Some(surface);
         self.core = Some(core);
         self.push(Event::new(EV_RESIZE, lw as f32, lh as f32, -1, String::new()));
+        if let Some(theme) = window.theme() {
+            self.push(Event::new(EV_THEME, 0.0, 0.0, -1, theme_name(theme).to_string()));
+        }
         window.request_redraw();
     }
 
@@ -536,6 +546,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Err(e) => self.fail(event_loop, e),
                 }
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                self.push(Event::new(EV_THEME, 0.0, 0.0, -1, theme_name(theme).to_string()));
+                self.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.keyboard(event_loop, event),

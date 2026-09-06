@@ -51,4 +51,4 @@ from .widgets export (
     Canvas,
     Layout,
 )
-from .app export run_app, compose_test, TestComposition, chord_of_text
+from .app export run_app, compose_test, TestComposition, WindowEvents, chord_of_text, system_theme

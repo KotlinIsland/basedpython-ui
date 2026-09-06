@@ -4,7 +4,7 @@ layout, hit testing and text editing end to end."""
 from basedpython_ui import (
     composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, MeasureScope, Constraints, Size, compose_test,
-    chord_of_text,
+    chord_of_text, system_theme, WindowEvents,
 )
 from basedpython_ui.geometry import Dp, Color
 from basedpython_ui.runtime import live_runtimes
@@ -293,4 +293,59 @@ def test_a_key_covers_the_group_not_what_is_nested_in_it():
     assert t.all_text() == ("c", "d", "a", "b", "swap"), t.dump()
     assert t.rect_of("c")[:2] == first_row_before[:2], "the rows were reconciled by key"
     assert "key=1" in t.dump() and "key=2" in t.dump()
+    t.dispose()
+
+
+@composable
+def Appearance():
+    Text(f"appearance {system_theme.value}")
+
+
+def test_the_system_theme_is_a_state_a_composition_follows():
+    let t = compose_test:
+        Appearance()
+    assert t.find_text("appearance light")
+    system_theme.value = "dark"
+    t.advance()
+    assert t.find_text("appearance dark"), t.dump()
+    system_theme.value = "light"
+    t.advance()
+    assert t.find_text("appearance light")
+    t.dispose()
+
+
+@composable
+def Clicky():
+    let hits = state(0)
+    let last = state("")
+
+    def handle(chord: str) -> bool:
+        last.value = chord
+        return True
+
+    on_key(handle)
+    Column:
+        Text(f"hits {hits.value} last {last.value!r}")
+        Button("hit"):
+            hits.value += 1
+
+
+def test_window_events_reach_the_runtime_and_the_appearance_needs_none():
+    let events = WindowEvents()
+    events.handle([(8, 0.0, 0.0, -1, "dark"), (5, 800.0, 600.0, -1, "")])
+    assert system_theme.value == "dark", "the appearance arrives before the first frame"
+    system_theme.value = "light"
+    let t = compose_test:
+        Clicky()
+    events.runtime = t.runtime
+    let handler = t.core.find_text("hit")
+    assert handler is not None
+    let idx = t.core.pointer(2, handler[1] + 1.0, handler[2] + 1.0)[3]
+    events.handle([(1, 0.0, 0.0, idx, ""), (2, 0.0, 0.0, idx, "")])
+    events.handle([(1, 0.0, 0.0, idx, ""), (2, 0.0, 0.0, -1, "")])
+    events.handle([(7, 0.0, 0.0, -1, "cmd+k"), (4, 0.0, 0.0, -1, "\x1b"), (8, 0.0, 0.0, -1, "dark")])
+    t.advance()
+    assert t.find_text("hits 1 last 'escape'"), t.dump()
+    assert system_theme.value == "dark"
+    system_theme.value = "light"
     t.dispose()
