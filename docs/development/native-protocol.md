@@ -26,10 +26,16 @@ class Core:
     def last_frame_ms(self) -> tuple[float, float, float]    # commit, layout, paint
 
 class Window:
-    def __new__(cls, title: str, width: float, height: float, icon: bytes | None = None) -> Window
+    def __new__(cls, title: str, width: float, height: float, icon: bytes | None = None,
+                name: str | None = None) -> Window
         # `icon` is an 8-bit rgba png. it becomes the window's icon where the platform has
         # one, and on macos the *application's* icon (what the dock shows), which is set
-        # through AppKit because it does not belong to a window at all
+        # through AppKit because it does not belong to a window at all.
+        # `name` is what the application is called — the menu bar, launch services — where
+        # `title` is only what this window is showing
+    def open(self, title: str, width: float, height: float, on_frame, on_events) -> None
+        # another window of the same application, made on the loop's next turn: one process,
+        # one event loop, one icon. closing the last window is what ends the loop
     def run(self, on_frame, on_events) -> None
         # runs the winit event loop on the calling (main) thread.
         # on_events(events: list[tuple]) is called with pending input events before a frame;

@@ -1325,6 +1325,10 @@ final class Runtime:
         self.tracker: Tracker? = None
         self.root: Scope? = None
         self.scopes: dict[int, Scope] = {}
+        # the ids of the scopes holding an `on_key` handler. a chord is offered to the
+        # deepest first, and finding them by walking every scope in the composition would
+        # make a keystroke cost the size of the tree
+        self.key_scopes: set[int] = set()
         self.dirty_heap: list[(int, int)] = []
         self.key_stack: list[object] = []
         # the container depth each key was opened at: a key applies to the records emitted
@@ -1351,6 +1355,10 @@ final class Runtime:
         self.posted: deque[() -> None] = deque()
         self.event_modifiers: str = ""
         self.event_position: (float, float) = (0.0, 0.0)
+        # the size of the surface this composition is drawn into, in logical pixels: the
+        # window sets it when it opens and on every resize. one per runtime, because
+        # `open_window` means two windows of different sizes at once
+        self.window_size: State[(float, float)] = State((0.0, 0.0))
         self.ui_thread: int = threading.get_ident()
         self.on_error: (BaseException, str) -> None = on_error if on_error is not None else default_on_error
         self.recompositions: dict[str, int] = {}
@@ -1460,6 +1468,7 @@ final class Runtime:
         if scope is None or self.phase != COMPOSING:
             raise CompositionError("on_key only runs while a composable is composing")
         scope.key_handlers.append(handler)
+        self.key_scopes.add(scope.id)
 
     def dispatch_key(self, chord: str) -> bool raises CompositionError:
         """Offer a key chord to the registered handlers, deepest scope first (later
@@ -1468,7 +1477,13 @@ final class Runtime:
         global _dispatching
         if self.phase == COMPOSING:
             raise CompositionError("a key cannot be dispatched while composing")
-        candidates = [scope for scope in self.scopes.values() if scope.alive and scope.key_handlers]
+        var candidates: list[Scope] = []
+        for sid in tuple(self.key_scopes):
+            scope = self.scopes.get(sid)
+            if scope is None or not scope.alive or not scope.key_handlers:
+                self.key_scopes.discard(sid)
+                continue
+            candidates.append(scope)
         candidates.sort(key=lambda scope: (-scope.depth, -scope.id))
         previous = _dispatching
         _dispatching = self
@@ -1498,6 +1513,11 @@ final class Runtime:
         if handler is None:
             return
         previous = _dispatching
+        # a handler may dispatch another — a click that closes a menu and answers what was
+        # under it — and the outer one goes on running afterwards, so what it was told about
+        # its own event is put back rather than cleared
+        outer_modifiers = self.event_modifiers
+        outer_position = self.event_position
         _dispatching = self
         self.event_modifiers = modifiers
         self.event_position = position
@@ -1509,8 +1529,8 @@ final class Runtime:
         except BaseException as error:
             self.on_error(error, "handler")
         finally:
-            self.event_modifiers = ""
-            self.event_position = (0.0, 0.0)
+            self.event_modifiers = outer_modifiers
+            self.event_position = outer_position
             _dispatching = previous
 
     def set_provided(self, cell: ProvidedCell, provided: object) raises TypeError:
@@ -1700,6 +1720,7 @@ final class Runtime:
             self.release_handler(h)
         scope.handlers = []
         scope.key_handlers = []
+        self.key_scopes.discard(scope.id)
         start = len(self.ints)
         float_start = len(self.floats)
         scope.start = start
@@ -1845,6 +1866,7 @@ final class Runtime:
             self.release_handler(h)
         scope.handlers = []
         scope.key_handlers = []
+        self.key_scopes.discard(scope.id)
         self.scopes.pop(scope.id, None)
         trace = self.trace
         if trace is not None:

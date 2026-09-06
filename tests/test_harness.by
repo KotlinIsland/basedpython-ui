@@ -2,7 +2,8 @@
 layout, hit testing and text editing end to end."""
 
 from basedpython_ui import (
-    composable, state, state_list, derived, keyed, on_key, input_modifiers, Column, Row, Text, Button, TextField,
+    composable, state, state_list, derived, keyed, on_key, input_modifiers, disposable_effect,
+    Column, Row, Text, Button, TextField,
     Checkbox, Modifier, Canvas, Layout, Scroll, TextStyle, Alignment, MeasureScope, Constraints, Size, compose_test,
     chord_of_text, system_theme, window_size, WindowEvents, Popup, Spacer, input_position, selected_text, CursorShape,
     State, LazyColumn, Image, load_image, remember, Side,
@@ -644,8 +645,17 @@ def test_a_drag_follows_the_pointer_and_reports_its_steps():
 
 
 @composable
+def Watching(stopped: State[str]):
+    """a composition holding something that has to be let go of — a subscription, a watcher —
+    which is what a window closing has to run the cleanup of"""
+    disposable_effect(0):
+        it.on_dispose(lambda: stopped.set("stopped"))
+    Text("watching")
+
+
+@composable
 def Sized():
-    let size = window_size.value
+    let size = window_size().value
     Text(f"window {int(size.0)}x{int(size.1)}")
 
 
@@ -659,6 +669,42 @@ def test_the_window_size_is_state_the_layout_can_read():
     t.advance()
     assert t.find_text("window 900x700"), t.dump()
     t.dispose()
+
+
+def test_each_window_has_a_size_of_its_own():
+    """`open_window` opens a second window of its own size in the same process. a pane in one
+    of them must not reflow because the other was dragged wider, so the size is one state per
+    composition rather than one per process"""
+    let one = compose_test(width=640, height=480):
+        Sized()
+    let two = compose_test(width=300, height=200):
+        Sized()
+    assert one.find_text("window 640x480") and two.find_text("window 300x200"), two.dump()
+
+    let events = WindowEvents()
+    events.runtime = two.runtime
+    events.handle([(5, 900.0, 700.0, -1, "")])
+    one.advance()
+    two.advance()
+    assert two.find_text("window 900x700"), two.dump()
+    assert one.find_text("window 640x480"), f"the other window did not move:\n{one.dump()}"
+    one.dispose()
+    two.dispose()
+
+
+def test_a_window_that_closes_disposes_its_composition():
+    """closing a second window ends its composition: the cleanups of every
+    `disposable_effect` in it run, rather than waiting for the process to end"""
+    let stopped = State("running")
+    let t = compose_test(width=200, height=100):
+        Watching(stopped)
+    assert any(runtime === t.runtime for runtime in live_runtimes)
+    let events = WindowEvents()
+    events.runtime = t.runtime
+    events.handle([(6, 0.0, 0.0, -1, "")])
+    assert stopped.value == "stopped", f"the effect's cleanup ran: {stopped.value}"
+    assert events.runtime is None, "and the window let go of the runtime"
+    assert all(runtime !== t.runtime for runtime in live_runtimes)
 
 
 @composable
